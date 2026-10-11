@@ -1,0 +1,46 @@
+﻿# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+ImageStudio.exe
+
+# Model weights and checkpoints (never commit model files!)
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.onnx
+*.gguf
+*.pth
+
+# Image and media outputs/caches
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+
+# Runtime logs & data
+*.log
+presets.json
+config.json
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.gemini/
+scratch/
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store

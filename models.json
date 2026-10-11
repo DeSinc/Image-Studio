@@ -1,0 +1,38 @@
+{
+  "active_profile": "qwen_2.1_int8",
+  "profiles": [
+    {
+      "id": "qwen_2.1_int8",
+      "name": "Qwen Image 2.1 (Multi-Ref)",
+      "description": "High-fidelity inpainting & multi-reference editing with 8B multimodal vision encoder.",
+      "recommended_vram_gb": 12,
+      "default_steps": 25,
+      "default_cfg": 1.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "qwen_image_2.1_int8_convrot.safetensors",
+          "size_bytes": 7256783064,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_8b_int8_convrot.safetensors",
+          "size_bytes": 9350798360,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+        },
+        {
+          "category": "vae",
+          "filename": "qwen_image_2.1_vae_bf16.safetensors",
+          "size_bytes": 675509688,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/vae/qwen_image_2.1_vae_bf16.safetensors"
+        }
+      ]
+    }
+  ]
+}
