@@ -63,6 +63,11 @@ struct Item {
     height: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct QueuedItem {
+    pub prompt: String,
+}
+
 #[derive(Clone)]
 pub struct HistoryNode {
     pub id: usize,
@@ -225,6 +230,7 @@ pub struct App {
     canvas_pan: Vec2,
     show_setup: bool,
     loading: usize,
+    queue: Vec<QueuedItem>,
 }
 
 fn rand_u64() -> u64 {
@@ -346,6 +352,7 @@ impl App {
             canvas_pan: vec2(0.0, 0.0),
             show_setup: false,
             loading: 0,
+            queue: Vec::new(),
         }
     }
 
@@ -379,21 +386,26 @@ impl App {
     }
 
     fn select_node(&mut self, id: usize) {
-        // Save currently typed prompt into the active node before switching away
-        if let Some(curr_id) = self.active_node_id {
-            if curr_id != id {
-                if let Some(curr_node) = self.nodes.iter_mut().find(|n| n.id == curr_id) {
-                    curr_node.prompt = self.prompt.clone();
+        if !self.generating {
+            if let Some(curr_id) = self.active_node_id {
+                if curr_id != id {
+                    if let Some(curr_node) = self.nodes.iter_mut().find(|n| n.id == curr_id) {
+                        curr_node.prompt = self.prompt.clone();
+                    }
                 }
             }
         }
 
         self.active_node_id = Some(id);
         self.compare_mode = false;
-        if let Some(node) = self.find_node(id) {
-            self.prompt = node.prompt.clone();
+        if !self.generating {
+            if let Some(node) = self.find_node(id) {
+                if !node.prompt.is_empty() {
+                    self.prompt = node.prompt.clone();
+                    self.focus_prompt = true;
+                }
+            }
         }
-        self.focus_prompt = true;
         self.update_dimensions_from_active_node();
     }
 
@@ -668,7 +680,13 @@ impl App {
         });
     }
 
-    fn start_generation(&mut self, ctx: &egui::Context) {
+        fn start_generation(&mut self, ctx: &egui::Context) {
+        let p = self.prompt.trim().to_string();
+        self.prompt.clear();
+        self.start_generation_with_prompt(ctx, p);
+    }
+
+    fn start_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
         let base_png = match self.active_node() {
             Some(n) => n.png.clone(),
             None => {
@@ -681,7 +699,7 @@ impl App {
         self.status = "Uploading images...".into();
         self.error = None;
         self.generating_parent_id = self.active_node_id;
-        self.generating_prompt = self.prompt.trim().to_string();
+        self.generating_prompt = prompt.trim().to_string();
 
         // Save the prompt on the parent node that created this generation
         if let Some(pid) = self.active_node_id {
@@ -689,7 +707,6 @@ impl App {
                 parent.prompt = self.generating_prompt.clone();
             }
         }
-        self.prompt.clear();
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = cancel.clone();
@@ -897,7 +914,6 @@ impl App {
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
                     self.compare_mode = false;
-                    self.prompt.clear();
 
                     // Maintain newly generated resolution while resetting scale slider to 100% (1.0x) in the middle
                     self.custom_w = out_w as u32;
@@ -906,11 +922,18 @@ impl App {
 
                     self.update_dimensions_from_active_node();
                     self.split = 0.5;
+
+                    // Sequentially process next queued prompt in the chain
+                    if !self.queue.is_empty() {
+                        let next = self.queue.remove(0);
+                        self.start_generation_with_prompt(ctx, next.prompt);
+                    }
                 }
                 Ev::GenErr(e) => {
                     self.generating = false;
                     self.progress = None;
                     self.preview_tex = None;
+                    self.queue.clear();
                     if e != "Cancelled" {
                         self.error = Some(e);
                     }
@@ -928,10 +951,42 @@ impl App {
             self.load(ctx, t, Src::Path(p));
         }
         let paste = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
-        if paste && !ctx.egui_wants_keyboard_input() {
-            if let Ok(img) = arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
-                let t = if self.active_node().is_none() { Target::Base } else { Target::Ref };
-                self.load(ctx, t, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
+        if paste {
+            let mut pasted_image = false;
+            for _ in 0..3 {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if let Ok(img) = cb.get_image() {
+                        let t = if self.active_node().is_none() { Target::Base } else { Target::Ref };
+                        self.load(ctx, t, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
+                        pasted_image = true;
+                        break;
+                    } else if let Ok(text) = cb.get_text() {
+                        let trimmed = text.trim().trim_matches('"');
+                        let path = PathBuf::from(trimmed);
+                        if path.is_file() {
+                            if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
+                                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif") {
+                                    let t = if self.active_node().is_none() { Target::Base } else { Target::Ref };
+                                    self.load(ctx, t, Src::Path(path));
+                                    pasted_image = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            if pasted_image {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if let Ok(text) = cb.get_text() {
+                        let t = text.trim();
+                        if self.prompt.ends_with(t) {
+                            let new_len = self.prompt.len() - t.len();
+                            self.prompt.truncate(new_len);
+                        }
+                    }
+                }
             }
         }
 
@@ -2129,14 +2184,6 @@ impl App {
                         state.store(ctx, prompt_id);
                     }
 
-                    if text_resp.changed() {
-                        if let Some(curr_id) = self.active_node_id {
-                            if let Some(curr_node) = self.nodes.iter_mut().find(|n| n.id == curr_id) {
-                                curr_node.prompt = self.prompt.clone();
-                            }
-                        }
-                    }
-
                     // Submit on Enter (without Shift)
                     let enter_submit = text_resp.has_focus()
                         && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -2144,23 +2191,90 @@ impl App {
                         while self.prompt.ends_with('\n') || self.prompt.ends_with('\r') {
                             self.prompt.pop();
                         }
-                        if self.can_generate().is_ok() {
-                            self.start_generation(ctx);
+                        let p_text = self.prompt.trim().to_string();
+                        if !p_text.is_empty() && self.can_generate().is_ok() {
+                            if self.generating {
+                                self.queue.push(QueuedItem { prompt: p_text });
+                                self.prompt.clear();
+                            } else {
+                                self.start_generation(ctx);
+                            }
                         }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can = self.can_generate();
+                        let is_ok = can.is_ok();
+                        let btn_text = if self.generating {
+                            if is_ok { "Queue" } else { "Generating..." }
+                        } else {
+                            "Generate"
+                        };
+
+                        let send_btn = egui::Button::new(
+                            RichText::new(btn_text)
+                                .size(13.5)
+                                .strong()
+                                .color(if is_ok { Color32::WHITE } else { DIM }),
+                        )
+                        .fill(if is_ok { ACCENT } else { CARD })
+                        .stroke(Stroke::new(1.0, if is_ok { ACCENT_GLOW } else { LINE }))
+                        .corner_radius(8)
+                        .min_size(vec2(100.0, 36.0));
+
+                        let resp = ui.add_enabled(is_ok, send_btn);
+                        if resp.clicked() {
+                            let p_text = self.prompt.trim().to_string();
+                            if !p_text.is_empty() {
+                                if self.generating {
+                                    self.queue.push(QueuedItem { prompt: p_text });
+                                    self.prompt.clear();
+                                } else {
+                                    self.start_generation(ctx);
+                                }
+                            }
+                        }
+                        if let Err(why) = can {
+                            if !self.generating {
+                                resp.on_hover_text(why);
+                            }
+                        }
+
                         if self.generating {
+                            ui.add_space(6.0);
                             let cancel_btn = egui::Button::new(RichText::new("Cancel").size(13.0).strong().color(RED))
                                 .fill(CARD)
                                 .stroke(Stroke::new(1.0, RED.linear_multiply(0.4)))
                                 .corner_radius(8)
-                                .min_size(vec2(85.0, 36.0));
+                                .min_size(vec2(75.0, 36.0));
                             if ui.add(cancel_btn).clicked() {
                                 self.cancel.store(true, Ordering::SeqCst);
+                                self.queue.clear();
                                 self.status = "Cancelling...".into();
                             }
                             ui.add_space(4.0);
+
+                            if !self.queue.is_empty() {
+                                let queue_btn = egui::Button::new(
+                                    RichText::new(format!("{} queued", self.queue.len()))
+                                        .size(11.5)
+                                        .color(AMBER)
+                                        .strong(),
+                                )
+                                .fill(CARD)
+                                .stroke(Stroke::new(1.0, AMBER.linear_multiply(0.4)))
+                                .corner_radius(6);
+                                let mut tip = String::from("Queued in chain:\n");
+                                for (idx, q) in self.queue.iter().enumerate() {
+                                    tip.push_str(&format!("{}. {}\n", idx + 1, q.prompt));
+                                }
+                                tip.push_str("\nClick to clear queue");
+                                if ui.add(queue_btn).on_hover_text(tip).clicked() {
+                                    self.queue.clear();
+                                }
+                                ui.add_space(4.0);
+                            }
+
                             let status_txt = if let Some((v, max)) = self.progress {
                                 format!("{}/{} ({})", v, max, self.status)
                             } else {
@@ -2168,27 +2282,6 @@ impl App {
                             };
                             ui.label(RichText::new(status_txt).size(11.5).color(DIM));
                             ui.spinner();
-                        } else {
-                            let can = self.can_generate();
-                            let is_ok = can.is_ok();
-                            let send_btn = egui::Button::new(
-                                RichText::new("Generate")
-                                    .size(13.5)
-                                    .strong()
-                                    .color(if is_ok { Color32::WHITE } else { DIM }),
-                            )
-                            .fill(if is_ok { ACCENT } else { CARD })
-                            .stroke(Stroke::new(1.0, if is_ok { ACCENT_GLOW } else { LINE }))
-                            .corner_radius(8)
-                            .min_size(vec2(100.0, 36.0));
-
-                            let resp = ui.add_enabled(is_ok, send_btn);
-                            if resp.clicked() {
-                                self.start_generation(ctx);
-                            }
-                            if let Err(why) = can {
-                                resp.on_hover_text(why);
-                            }
                         }
                     });
                 });
