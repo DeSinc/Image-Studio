@@ -28,7 +28,8 @@ Requires Rust 1.85+:
 cargo build --release
 ```
 
-## License
+## License & Third-Party Engines
 
 This project is licensed under the [MIT License](LICENSE).
-Model weights referenced in `models.json` are open-weights under their respective licenses (e.g. Apache 2.0). No model weights or proprietary assets are bundled in this repository.
+
+Image Studio is an independent desktop application that communicates with local AI engines (such as ComfyUI) strictly as an external client via standard local IPC/APIs. No third-party execution engines, Python packages, or model weights are bundled or redistributed within this software. Users run local engines and retrieve open-weights models independently on their own hardware.
