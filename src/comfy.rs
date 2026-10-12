@@ -51,7 +51,7 @@ fn workflow(p: &Params, names: &[String]) -> Value {
     let (w, h) = p.custom.unwrap_or((1024, 1024));
     g["5"] = json!({"class_type": "TextEncodeQwenImage21", "inputs": te});
     g["6"] = json!({"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}});
-    g["7"] = json!({"class_type": "ComfySwitchNode", "inputs": {"switch": p.custom.is_some(), "on_false": ["5", 2], "on_true": ["6", 0]}});
+    g["7"] = json!({"class_type": "ComfySwitchNode", "inputs": {"switch": p.custom.is_some() || names.is_empty() || names.is_empty(), "on_false": ["5", 2], "on_true": ["6", 0]}});
     g["8"] = json!({"class_type": "KSampler", "inputs": {
         "model": ["4", 0], "positive": ["5", 0], "negative": ["5", 1], "latent_image": ["7", 0],
         "seed": p.seed, "steps": p.steps, "cfg": p.cfg,

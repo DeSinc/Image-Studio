@@ -231,6 +231,7 @@ pub struct App {
     show_setup: bool,
     loading: usize,
     queue: Vec<QueuedItem>,
+    last_ctrl_v_down: bool,
 }
 
 fn rand_u64() -> u64 {
@@ -353,6 +354,7 @@ impl App {
             show_setup: false,
             loading: 0,
             queue: Vec::new(),
+            last_ctrl_v_down: false,
         }
     }
 
@@ -687,16 +689,11 @@ impl App {
     }
 
     fn start_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
-        let base_png = match self.active_node() {
-            Some(n) => n.png.clone(),
-            None => {
-                self.error = Some("Base image is required".into());
-                return;
-            }
-        };
+        let base_png_opt = self.active_node().map(|n| n.png.clone());
+        let is_t2i = base_png_opt.is_none();
 
         self.generating = true;
-        self.status = "Uploading images...".into();
+        self.status = if is_t2i { "Generating image...".into() } else { "Uploading images...".into() };
         self.error = None;
         self.generating_parent_id = self.active_node_id;
         self.generating_prompt = prompt.trim().to_string();
@@ -713,7 +710,10 @@ impl App {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
 
-        let mut pngs = vec![base_png];
+        let mut pngs = Vec::new();
+        if let Some(base_png) = base_png_opt {
+            pngs.push(base_png);
+        }
         for r in &self.refs {
             pngs.push(r.png.clone());
         }
@@ -724,8 +724,8 @@ impl App {
         }
 
         let custom = match self.size_preset {
-            SizePreset::Original => None,
-            _ => Some((self.custom_w, self.custom_h)),
+            SizePreset::Original if !is_t2i => None,
+            _ => Some((self.custom_w.max(64), self.custom_h.max(64))),
         };
 
         let params = comfy::Params {
@@ -882,8 +882,9 @@ impl App {
 
                     let parent_id = self.generating_parent_id;
                     let parent_step = parent_id.and_then(|pid| self.find_node(pid)).map(|n| n.step_num).unwrap_or(0);
+                    let step_num = if parent_id.is_some() { parent_step + 1 } else { 0 };
                     let prompt_label = if self.generating_prompt.is_empty() {
-                        format!("Edit {}", id)
+                        format!("Image {}", id)
                     } else {
                         let p = &self.generating_prompt;
                         if p.chars().count() > 22 {
@@ -909,7 +910,7 @@ impl App {
                         tex,
                         width: out_w as u32,
                         height: out_h as u32,
-                        step_num: parent_step + 1,
+                        step_num,
                     };
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
@@ -977,6 +978,61 @@ fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max
     best
 }
 
+    
+#[cfg(target_os = "windows")]
+fn is_win_ctrl_v() -> bool {
+    unsafe extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+        fn GetForegroundWindow() -> isize;
+        fn GetCurrentProcessId() -> u32;
+        fn GetWindowThreadProcessId(h_wnd: isize, lpdw_process_id: *mut u32) -> u32;
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    if fg == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, &mut pid as *mut u32) };
+    let my_pid = unsafe { GetCurrentProcessId() };
+    if pid != my_pid {
+        return false;
+    }
+
+    let ctrl = unsafe { (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0 };
+    let v = unsafe { (GetAsyncKeyState(0x56) as u16 & 0x8000) != 0 };
+    ctrl && v
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_win_ctrl_v() -> bool {
+    false
+}
+
+    
+    fn paste_from_clipboard(&mut self, ctx: &egui::Context) -> bool {
+        for _ in 0..3 {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                if let Ok(img) = cb.get_image() {
+                    self.load(ctx, Target::Base, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
+                    return true;
+                } else if let Ok(text) = cb.get_text() {
+                    let trimmed = text.trim().trim_matches('"');
+                    let path = PathBuf::from(trimmed);
+                    if path.is_file() {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
+                            if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif") {
+                                self.load(ctx, Target::Base, Src::Path(path));
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        false
+    }
+
     fn handle_input(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let mut need_base = self.active_node().is_none();
@@ -985,41 +1041,18 @@ fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max
             need_base = false;
             self.load(ctx, t, Src::Path(p));
         }
-        let paste = ctx.input(|i| {
-            let raw_v = i.raw.events.iter().any(|e| match e {
-                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } => {
-                    modifiers.ctrl || modifiers.command
-                }
-                egui::Event::Paste(_) => true,
-                _ => false,
-            });
-            raw_v || (i.modifiers.command && i.key_pressed(egui::Key::V))
+        let win_down = Self::is_win_ctrl_v();
+        let win_paste = win_down && !self.last_ctrl_v_down;
+        self.last_ctrl_v_down = win_down;
+
+        let egui_paste = ctx.input(|i| {
+            i.raw.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+                || (i.modifiers.command && i.key_pressed(egui::Key::V))
         });
-        if paste {
-            let mut pasted_image = false;
-            for _ in 0..3 {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    if let Ok(img) = cb.get_image() {
-                        self.load(ctx, Target::Base, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
-                        pasted_image = true;
-                        break;
-                    } else if let Ok(text) = cb.get_text() {
-                        let trimmed = text.trim().trim_matches('"');
-                        let path = PathBuf::from(trimmed);
-                        if path.is_file() {
-                            if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
-                                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif") {
-                                    self.load(ctx, Target::Base, Src::Path(path));
-                                    pasted_image = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            if pasted_image {
+
+        if win_paste || egui_paste {
+            let pasted = self.paste_from_clipboard(ctx);
+            if pasted {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(text) = cb.get_text() {
                         let t = text.trim().trim_matches('"');
@@ -1077,7 +1110,7 @@ fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max
             return Err("Generating...");
         }
         if self.prompt.trim().is_empty() {
-            return Err("Type an edit instruction");
+            return Err("Type a prompt to generate or edit");
         }
         self.can_queue()
     }
@@ -2177,24 +2210,29 @@ fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max
 
                 let c = rect.center();
                 p.text(
-                    c - vec2(0.0, 14.0),
+                    c - vec2(0.0, 36.0),
                     egui::Align2::CENTER_CENTER,
-                    if self.loading > 0 { "Loading image..." } else { "Drop an image here to start editing" },
-                    egui::FontId::proportional(18.0),
+                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
+                    egui::FontId::proportional(19.0),
                     TEXT,
                 );
                 p.text(
-                    c + vec2(0.0, 14.0),
+                    c - vec2(0.0, 10.0),
                     egui::Align2::CENTER_CENTER,
-                    "Click to browse | Ctrl+V to paste from clipboard",
+                    "Or simply enter a prompt below to generate an image from scratch!",
                     egui::FontId::proportional(13.0),
-                    DIM,
+                    ACCENT_GLOW,
                 );
 
-                if hover {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if resp.clicked() {
+                let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(270.0, 34.0));
+                let paste_hover = btn_rect.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or_default()));
+                p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
+                p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
+                p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, "📋 Paste Image from Clipboard (Ctrl+V)", egui::FontId::proportional(12.5), Color32::WHITE);
+
+                if paste_hover && ui.ctx().input(|i| i.pointer.any_pressed()) {
+                    let _ = self.paste_from_clipboard(ctx);
+                } else if resp.clicked() {
                     self.pick_images(ctx, Target::Base, false);
                 }
             }
@@ -2225,12 +2263,27 @@ fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max
             .inner_margin(egui::Margin::symmetric(12, 7))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let paste_icon_btn = egui::Button::new(RichText::new("📋 Paste").size(12.0).color(TEXT))
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .min_size(vec2(64.0, 36.0));
+                    if ui.add(paste_icon_btn).on_hover_text("Paste image from clipboard (Ctrl+V)").clicked() {
+                        let _ = self.paste_from_clipboard(ctx);
+                    }
+                    ui.add_space(4.0);
+
                     let prompt_id = egui::Id::new("main_prompt_text_edit");
+                    let hint = if self.active_node().is_some() {
+                        "Describe your edit instructions... Enter to generate, Shift+Enter for newline"
+                    } else {
+                        "Describe an image to generate from scratch, or paste/drop an image..."
+                    };
                     let text_edit = egui::TextEdit::multiline(&mut self.prompt)
                         .id(prompt_id)
                         .desired_rows(2)
-                        .desired_width((ui.available_width() - 250.0).max(180.0))
-                        .hint_text("Describe your edit instructions... Enter to generate, Shift+Enter for newline");
+                        .desired_width((ui.available_width() - 320.0).max(180.0))
+                        .hint_text(hint);
                     let text_resp = ui.add(text_edit);
 
                     if self.focus_prompt {
