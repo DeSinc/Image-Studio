@@ -2,9 +2,6 @@
 
 Fast, native desktop app for image editing using open-weights diffusion models (Qwen Image 2.1 Multi-Ref) powered by ComfyUI running in the background.
 
-<p align="center">
-  <img src="assets/icon.png" width="128" height="128" alt="Image Studio Logo" />
-</p>
 
 ## Demos
 
