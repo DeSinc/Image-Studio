@@ -1,5 +1,7 @@
 # Image Studio
 
+## One-Click AI Image Editing on your GPU
+
 Fast, native desktop app for image editing using open-weights diffusion models (Qwen Image 2.1 Multi-Ref) powered by ComfyUI running in the background.
 
 
