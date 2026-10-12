@@ -36,7 +36,7 @@ $versionJsonObj = @{
 }
 $versionJson = $versionJsonObj | ConvertTo-Json
 $versionJsonPath = "target/version.json"
-$versionJson | Set-Content $versionJsonPath -Encoding utf8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText((Join-Path (Get-Location) $versionJsonPath), $versionJson, $utf8NoBom)
 Write-Host "Generated ${versionJsonPath}:" -ForegroundColor DarkGray
 Write-Host $versionJson -ForegroundColor DarkGray
 
