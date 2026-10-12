@@ -33,6 +33,11 @@ fn upload(c: &Client, png: Vec<u8>, name: &str) -> Result<String, String> {
     let part = multipart::Part::bytes(png).file_name(name.to_string()).mime_str("image/png").map_err(|e| e.to_string())?;
     let form = multipart::Form::new().part("image", part).text("type", "temp").text("overwrite", "true");
     let r = c.post(format!("{}/upload/image", base_url())).multipart(form).send().map_err(|e| format!("upload: {e}"))?;
+    let status = r.status();
+    if !status.is_success() {
+        let err_body = r.text().unwrap_or_default();
+        return Err(format!("upload error ({status}): {err_body}"));
+    }
     let v: Value = r.json().map_err(|e| format!("upload reply: {e}"))?;
     let n = v["name"].as_str().ok_or("upload: no name in reply")?;
     Ok(format!("{n} [temp]"))

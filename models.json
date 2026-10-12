@@ -2,9 +2,42 @@
   "active_profile": "qwen_2.1_int8",
   "profiles": [
     {
+      "id": "qwen_2.1_8gb",
+      "name": "Qwen Image 2.1 (8GB VRAM - W4A8 Quant)",
+      "description": "Optimized 4-bit quantized text encoder designed specifically for 8GB GPUs to prevent CUDA OOM.",
+      "recommended_vram_gb": 8,
+      "default_steps": 25,
+      "default_cfg": 1.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "qwen_image_2.1_int8_convrot.safetensors",
+          "size_bytes": 7256783064,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_8b_w4a8.safetensors",
+          "size_bytes": 6312105364,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_w4a8.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/text_encoders/qwen3vl_8b_w4a8.safetensors"
+        },
+        {
+          "category": "vae",
+          "filename": "qwen_image_2.1_vae_bf16.safetensors",
+          "size_bytes": 675509688,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/vae/qwen_image_2.1_vae_bf16.safetensors"
+        }
+      ]
+    },
+    {
       "id": "qwen_2.1_int8",
-      "name": "Qwen Image 2.1 (Multi-Ref)",
-      "description": "High-fidelity inpainting & multi-reference editing with 8B multimodal vision encoder.",
+      "name": "Qwen Image 2.1 (12GB+ VRAM - Standard INT8)",
+      "description": "High-fidelity inpainting & multi-reference editing with standard 8-bit multimodal vision encoder.",
       "recommended_vram_gb": 12,
       "default_steps": 25,
       "default_cfg": 1.0,
@@ -24,6 +57,39 @@
           "size_bytes": 9350798360,
           "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
           "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+        },
+        {
+          "category": "vae",
+          "filename": "qwen_image_2.1_vae_bf16.safetensors",
+          "size_bytes": 675509688,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/vae/qwen_image_2.1_vae_bf16.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "qwen_2.1_turbo_8gb",
+      "name": "Qwen Image 2.1 Turbo (Fast 8-Step - 8GB VRAM)",
+      "description": "Fast 8-step inference with W4A8 text encoder for 8GB GPUs.",
+      "recommended_vram_gb": 8,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "qwen_image_2.1_turbo_int8_convrot.safetensors",
+          "size_bytes": 7256783064,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_8b_w4a8.safetensors",
+          "size_bytes": 6312105364,
+          "hf_url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_w4a8.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/text_encoders/qwen3vl_8b_w4a8.safetensors"
         },
         {
           "category": "vae",

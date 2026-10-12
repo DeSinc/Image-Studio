@@ -726,7 +726,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let res = (|| -> Result<(String, Vec<u8>, ColorImage, u32, u32), String> {
-                let (name, dyn_img) = match src {
+                let (name, mut dyn_img) = match src {
                     Src::Path(p) => {
                         let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("image").to_string();
                         let bytes = std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
@@ -738,11 +738,27 @@ impl App {
                         ("clipboard".to_string(), image::DynamicImage::ImageRgba8(buf))
                     }
                 };
+
+                // Clamp dimensions to prevent excessive GPU texture allocations, upload payload limits (413), and CUDA OOM:
+                // Reference images: max 2048px (the multimodal vision encoder processes image patches; >2048px causes extreme token load & OOM)
+                // Base images: max 4096px (diffusion model ceiling and OpenGL texture limits)
+                let max_dim = match target {
+                    Target::Ref => 2048u32,
+                    Target::Base => 4096u32,
+                };
+                if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
+                    dyn_img = dyn_img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3);
+                }
+
                 let w = dyn_img.width();
                 let h = dyn_img.height();
                 let rgba = dyn_img.to_rgba8();
                 let mut png = Vec::new();
-                let enc = image::codecs::png::PngEncoder::new(&mut png);
+                let enc = image::codecs::png::PngEncoder::new_with_quality(
+                    &mut png,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::NoFilter,
+                );
                 image::ImageEncoder::write_image(
                     enc,
                     rgba.as_raw(),
@@ -1065,6 +1081,12 @@ impl App {
                 }
             }
         }
+
+        let is_ready = matches!(*self.sh.state.lock().unwrap(), EngState::Ready { .. });
+        if is_ready && !self.generating && !self.queue.is_empty() {
+            let next = self.queue.remove(0);
+            self.start_generation_with_prompt(ctx, next.prompt);
+        }
     }
 
     
@@ -1211,13 +1233,11 @@ fn is_win_ctrl_v() -> bool {
     fn can_queue(&self) -> Result<(), &'static str> {
         let st = self.sh.state.lock().unwrap().clone();
         match st {
-            EngState::Ready { .. } => {}
+            EngState::Ready { .. } | EngState::Starting { .. } | EngState::Detecting => {}
             EngState::DownloadingEngine { .. } => return Err("Downloading engine..."),
             EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
             EngState::DownloadingModels { .. } => return Err("Downloading models..."),
             EngState::RepairingEngine { .. } => return Err("Repairing engine..."),
-            EngState::Starting { .. } => return Err("Starting engine..."),
-            EngState::Detecting => return Err("Detecting engine..."),
             EngState::Failed(_) => return Err("Engine setup failed (see Setup)"),
         }
         if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
@@ -1232,6 +1252,10 @@ fn is_win_ctrl_v() -> bool {
         }
         if self.prompt.trim().is_empty() {
             return Err("Type a prompt to generate or edit");
+        }
+        let st = self.sh.state.lock().unwrap().clone();
+        if !matches!(st, EngState::Ready { .. }) {
+            return Err("Engine starting - prompt will be queued");
         }
         self.can_queue()
     }
@@ -2458,7 +2482,15 @@ fn is_win_ctrl_v() -> bool {
         } else {
             let (rect, resp) = ui.allocate_exact_size(max_size, Sense::click());
             let st = self.sh.state.lock().unwrap().clone();
-            if !matches!(st, EngState::Ready { .. }) {
+            let is_setup_in_progress = matches!(
+                st,
+                EngState::DownloadingEngine { .. }
+                    | EngState::ExtractingEngine { .. }
+                    | EngState::DownloadingModels { .. }
+                    | EngState::RepairingEngine { .. }
+                    | EngState::Failed(_)
+            );
+            if is_setup_in_progress {
                 self.render_setup_card(ui, rect, &st);
             } else {
                 let hover = resp.hovered();
@@ -2514,6 +2546,27 @@ fn is_win_ctrl_v() -> bool {
             ui.add_space(2.0);
         }
 
+        let st = self.sh.state.lock().unwrap().clone();
+        let is_starting = matches!(st, EngState::Starting { .. } | EngState::Detecting);
+        if is_starting && !self.queue.is_empty() {
+            let attempt_str = match st {
+                EngState::Starting { since, attempt } => {
+                    format!("Starting engine in background (attempt {}, {}s)...", attempt + 1, since.elapsed().as_secs())
+                }
+                _ => "Starting background engine...".to_string(),
+            };
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(attempt_str).size(11.5).color(AMBER));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{} prompt queued", self.queue.len())).size(11.0).color(GREEN).strong());
+                    });
+                });
+            });
+            ui.add_space(3.0);
+        }
+
         egui::Frame::new()
             .fill(CARD_HI)
             .stroke(Stroke::new(1.0, LINE))
@@ -2557,6 +2610,9 @@ fn is_win_ctrl_v() -> bool {
                         state.store(ctx, prompt_id);
                     }
 
+                    let st = self.sh.state.lock().unwrap().clone();
+                    let is_starting = matches!(st, EngState::Starting { .. } | EngState::Detecting);
+
                     // Submit on Enter (without Shift)
                     let enter_submit = text_resp.has_focus()
                         && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -2566,10 +2622,13 @@ fn is_win_ctrl_v() -> bool {
                         }
                         let p_text = self.prompt.trim().to_string();
                         if !p_text.is_empty() {
-                            if self.generating {
+                            if self.generating || is_starting {
                                 if self.can_queue().is_ok() {
                                     self.queue.push(QueuedItem { prompt: p_text });
                                     self.prompt.clear();
+                                    if is_starting {
+                                        self.status = "Queued (starting engine...)".into();
+                                    }
                                 }
                             } else if self.can_generate().is_ok() {
                                 self.start_generation(ctx);
@@ -2582,6 +2641,9 @@ fn is_win_ctrl_v() -> bool {
                             let q_can = self.can_queue();
                             let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
                             (ok, "Queue", q_can.err())
+                        } else if is_starting {
+                            let ok = !self.prompt.trim().is_empty() && self.can_queue().is_ok();
+                            (ok, "Generate", Some("Engine is starting; your prompt will be queued and will generate immediately."))
                         } else {
                             let g_can = self.can_generate();
                             let ok = g_can.is_ok() && !self.prompt.trim().is_empty();
@@ -2603,10 +2665,13 @@ fn is_win_ctrl_v() -> bool {
                         if resp.clicked() {
                             let p_text = self.prompt.trim().to_string();
                             if !p_text.is_empty() {
-                                if self.generating {
+                                if self.generating || is_starting {
                                     if self.can_queue().is_ok() {
                                         self.queue.push(QueuedItem { prompt: p_text });
                                         self.prompt.clear();
+                                        if is_starting {
+                                            self.status = "Queued (starting engine...)".into();
+                                        }
                                     }
                                 } else if self.can_generate().is_ok() {
                                     self.start_generation(ctx);
@@ -2716,6 +2781,49 @@ fn is_win_ctrl_v() -> bool {
                     EngState::Failed(m) => format!("Failed: {m}"),
                 };
                 ui.label(RichText::new(st).strong());
+                ui.separator();
+                heading(ui, "HARDWARE & MODEL PROFILE");
+                let vram_detected = engine::detect_gpu_vram_gb();
+                ui.horizontal(|ui| {
+                    ui.label("Detected GPU VRAM:");
+                    if let Some(vram) = vram_detected {
+                        ui.label(RichText::new(format!("~{vram} GB")).strong().color(GREEN));
+                        if vram <= 8 {
+                            ui.label(RichText::new("(8GB GPU detected - 8GB W4A8 profile recommended)").size(11.0).color(AMBER));
+                        }
+                    } else {
+                        ui.label(RichText::new("Auto-detecting...").color(DIM));
+                    }
+                });
+
+                let all_profiles = engine::Profile::all();
+                let cur_profile_id = self.profile.id.clone();
+                for p in all_profiles {
+                    let active = p.id == cur_profile_id;
+                    ui.horizontal(|ui| {
+                        let b = egui::Button::new(
+                            RichText::new(&p.name).size(12.0).color(if active { Color32::WHITE } else { TEXT })
+                        )
+                        .fill(if active { ACCENT } else { CARD_HI })
+                        .stroke(Stroke::new(1.0, if active { ACCENT_GLOW } else { LINE }))
+                        .corner_radius(4);
+
+                        if ui.add(b).clicked() && !active {
+                            let mut cfg = self.sh.cfg.lock().unwrap();
+                            cfg.active_profile = Some(p.id.clone());
+                            cfg.save();
+                            *self.sh.active_profile.lock().unwrap() = p.clone();
+                            self.profile = p.clone();
+                            self.sh.retry.store(true, Ordering::SeqCst);
+                        }
+                        ui.label(RichText::new(format!("(Rec: {}GB VRAM)", p.recommended_vram_gb)).size(11.0).color(DIM));
+                    });
+                    ui.label(RichText::new(&p.description).size(10.5).color(DIM));
+                    ui.add_space(2.0);
+                }
+
+                ui.separator();
+                heading(ui, "DIRECTORIES & PATHS");
                 egui::Grid::new("paths").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
                     ui.label("ComfyUI");
                     ui.label(RichText::new(paths.comfy.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
@@ -2938,5 +3046,24 @@ impl eframe::App for App {
             };
             painter.text(r.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(22.0), TEXT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_large_image_dimension_clamping() {
+        let img = image::DynamicImage::new_rgb8(4200, 3000);
+        let max_ref = 2048u32;
+        let resized_ref = img.resize(max_ref, max_ref, image::imageops::FilterType::Triangle);
+        assert!(resized_ref.width() <= 2048);
+        assert!(resized_ref.height() <= 2048);
+        assert_eq!(resized_ref.width(), 2048);
+
+        let max_base = 4096u32;
+        let resized_base = img.resize(max_base, max_base, image::imageops::FilterType::Triangle);
+        assert!(resized_base.width() <= 4096);
+        assert!(resized_base.height() <= 4096);
+        assert_eq!(resized_base.width(), 4096);
     }
 }
