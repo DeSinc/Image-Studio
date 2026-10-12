@@ -3,15 +3,18 @@
 Fast, native desktop app for image editing using open-weights diffusion models (Qwen Image 2.1 Multi-Ref) powered by ComfyUI running in the background.
 
 
-### "Alpha transparency cut-out of the guy in the picture"
+### Alpha Transparency & Background Cutouts
+"Alpha transparency cut-out of the guy in the picture"
 
 ![Alpha Transparency Cutout](assets/demo_cutout_alpha.gif)
 
-### "Make the sky a galaxy with bright stars"
+### Generative Inpainting & Scene Alteration
+"Make the sky a galaxy with bright stars"
 
 ![Sky Inpainting](assets/demo_sky_inpaint.gif)
 
-### "Make the leather jacket a jeans jacket"
+### Material & Style Transfer
+"Make the leather jacket a jeans jacket"
 
 ![Material Transformation](assets/demo_material_transform.gif)
 
