@@ -6,6 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub struct GenResult {
+    pub png: Vec<u8>,
+    pub output_filename: String,
+    pub output_subfolder: String,
+    pub temp_files: Vec<String>,
+}
+
 pub struct Params {
     pub prompt: String,
     pub negative: String,
@@ -179,16 +186,19 @@ pub fn run(
     status: &dyn Fn(String),
     progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
     preview: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
-) -> Result<Vec<u8>, String> {
+) -> Result<GenResult, String> {
     let ws_stop = Arc::new(AtomicBool::new(false));
     spawn_ws_progress(ws_stop.clone(), progress, preview);
 
     let c = Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
     let tag = p.seed % 100000;
     let mut names = vec![];
+    let mut temp_files = vec![];
     for (i, png) in imgs.into_iter().enumerate() {
         status(format!("Uploading image {}...", i + 1));
-        names.push(upload(&c, png, &format!("studio_{tag}_{i}.png"))?);
+        let filename = format!("studio_{tag}_{i}.png");
+        names.push(upload(&c, png, &filename)?);
+        temp_files.push(filename);
     }
     status("Queueing...".into());
     let body = json!({"prompt": workflow(p, &names), "client_id": "image-studio"});
@@ -227,19 +237,26 @@ pub fn run(
                 return Err("Generation failed".into());
             }
             if let Some(img) = e["outputs"]["11"]["images"][0].as_object() {
+                let out_fn = img["filename"].as_str().unwrap_or("").to_string();
+                let out_sub = img["subfolder"].as_str().unwrap_or("").to_string();
                 let url = format!("{}/view", base_url());
                 let bytes = c
                     .get(url)
                     .query(&[
-                        ("filename", img["filename"].as_str().unwrap_or("")),
-                        ("subfolder", img["subfolder"].as_str().unwrap_or("")),
-                        ("type", img["type"].as_str().unwrap_or("output")),
+                        ("filename", out_fn.as_str()),
+                        ("subfolder", out_sub.as_str()),
+                        ("type", "output"),
                     ])
                     .send()
                     .and_then(|r| r.bytes())
                     .map_err(|e| format!("fetch result: {e}"))?;
                 ws_stop.store(true, Ordering::SeqCst);
-                return Ok(bytes.to_vec());
+                return Ok(GenResult {
+                    png: bytes.to_vec(),
+                    output_filename: out_fn,
+                    output_subfolder: out_sub,
+                    temp_files,
+                });
             }
             if st["completed"] == true {
                 ws_stop.store(true, Ordering::SeqCst);
