@@ -1649,10 +1649,11 @@ impl App {
         let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
         card_ui.vertical_centered(|ui| {
             match state {
-                EngState::DownloadingEngine { step: _, progress, bytes_done, bytes_total, speed_mb } => {
+                EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
                     ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new("Downloading AI Image Engine").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(step).size(12.0).color(DIM));
                     ui.label(RichText::new(format!("Step 1 of 2: Portable ComfyUI environment • {:.1} MB/s", speed_mb)).size(12.0).color(DIM));
                     ui.add_space(14.0);
 

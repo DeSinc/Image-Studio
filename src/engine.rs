@@ -174,6 +174,7 @@ pub struct Shared {
     pub models_found: Mutex<Vec<(String, bool)>>,
     pub restart: AtomicBool,
     pub retry: AtomicBool,
+    pub clean_engine: AtomicBool,
     pub cancel: AtomicBool,
     pub cfg: Mutex<Config>,
 }
@@ -186,6 +187,7 @@ impl Shared {
             models_found: Mutex::new(vec![]),
             restart: AtomicBool::new(false),
             retry: AtomicBool::new(false),
+            clean_engine: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             cfg: Mutex::new(Config::load()),
         })
@@ -194,14 +196,12 @@ impl Shared {
 
 pub fn reset_to_clean_engine(sh: &Shared) {
     let mut cfg = sh.cfg.lock().unwrap();
-    if let Some(cd) = &sh.paths.lock().unwrap().comfy {
-        if !cfg.ignore_paths.contains(cd) {
-            cfg.ignore_paths.push(cd.clone());
-        }
+    let paths = sh.paths.lock().unwrap();
+    if cfg.models_dir.is_none() && paths.models.is_dir() {
+        cfg.models_dir = Some(paths.models.clone());
     }
-    cfg.comfy_dir = None;
     cfg.save();
-    sh.retry.store(true, Ordering::SeqCst);
+    sh.clean_engine.store(true, Ordering::SeqCst);
     log("reset to clean managed engine requested");
 }
 
@@ -322,7 +322,7 @@ pub fn find_comfy(cfg: &Config) -> Option<PathBuf> {
 fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
     let parent = comfy.parent().map(Path::to_path_buf).unwrap_or_default();
     let grand = parent.parent().map(Path::to_path_buf).unwrap_or_default();
-    [
+    let mut candidates: Vec<PathBuf> = [
         comfy.join(".venv/Scripts/python.exe"),
         comfy.join("venv/Scripts/python.exe"),
         parent.join(".venv/Scripts/python.exe"),
@@ -332,7 +332,16 @@ fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
     ]
     .into_iter()
     .filter(|p| p.exists())
-    .collect()
+    .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let python = dir.join("python.exe");
+            if python.is_file() && !candidates.contains(&python) {
+                candidates.push(python);
+            }
+        }
+    }
+    candidates
 }
 
 pub fn find_models(cfg: &Config, comfy: &Path) -> PathBuf {
@@ -418,9 +427,8 @@ where
         0
     };
 
-    if expected_size > 0 && existing_len >= expected_size {
-        let _ = std::fs::rename(&part_path, dest);
-        return Ok(());
+    if expected_size > 0 && existing_len > expected_size {
+        existing_len = 0;
     }
 
     let mut req = client.get(url);
@@ -432,6 +440,14 @@ where
     let status = resp.status();
 
     let (mut file, total_bytes) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let range_start = resp.headers().get(reqwest::header::CONTENT_RANGE)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("bytes "))
+            .and_then(|s| s.split_once('-'))
+            .and_then(|(start, _)| start.parse::<u64>().ok());
+        if range_start != Some(existing_len) {
+            return Err("Server returned an unexpected download range.".into());
+        }
         let content_len = resp.content_length().unwrap_or(0);
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -451,8 +467,17 @@ where
         let tot = if expected_size > 0 { expected_size } else { content_len };
         (file, tot)
     } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        let _ = std::fs::rename(&part_path, dest);
-        return Ok(());
+        let remote_size = resp.headers().get(reqwest::header::CONTENT_RANGE)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("bytes */"))
+            .and_then(|s| s.parse::<u64>().ok());
+        if existing_len > 0 && remote_size == Some(existing_len)
+            && (expected_size == 0 || expected_size == existing_len) {
+            std::fs::rename(&part_path, dest).map_err(|e| format!("rename error: {e}"))?;
+            on_progress(existing_len, existing_len, 0.0);
+            return Ok(());
+        }
+        return Err("Download resume size does not match the server; remove the partial download and retry.".into());
     } else {
         return Err(format!("server returned HTTP status {status}"));
     };
@@ -493,6 +518,9 @@ where
             ctx.request_repaint();
         }
     }
+    if total_bytes > 0 && downloaded != total_bytes {
+        return Err(format!("Incomplete download: received {downloaded} of {total_bytes} bytes."));
+    }
     file.flush().map_err(|e| format!("flush error: {e}"))?;
     drop(file);
 
@@ -509,32 +537,26 @@ fn bootstrap_engine(
     sh: &Shared,
     ctx: &eframe::egui::Context,
     dl_client: &reqwest::blocking::Client,
+    recovering: bool,
 ) -> Result<PathBuf, String> {
-    let engine_dir = data_dir().join("engine");
-    let _ = std::fs::create_dir_all(&engine_dir);
-    let archive_path = data_dir().join("comfyui_portable.7z");
+    let engine_dir = fresh_engine_dir(&data_dir().join("engine"))?;
 
     let (comfy_url, vendor_name) = get_comfy_portable_url();
+    let archive_path = data_dir().join(format!("comfyui_portable_{vendor_name}.7z"));
     log(&format!("bootstrap: downloading {vendor_name} portable from {comfy_url}"));
 
-    let mut downloaded_archive = false;
-    if archive_path.exists() {
-        if let Ok(meta) = std::fs::metadata(&archive_path) {
-            if meta.len() > 1_500_000_000 {
-                downloaded_archive = true;
-            }
-        }
-    }
-
-    if !downloaded_archive {
-        let archive_size = 2_003_629_308u64;
-        let step_desc = format!("Downloading ComfyUI Portable ({vendor_name})...");
+    {
+        let step_desc = if recovering {
+            format!("Existing engine failed; creating an isolated {vendor_name} instance...")
+        } else {
+            format!("Downloading ComfyUI Portable ({vendor_name})...")
+        };
         let step_clone = step_desc.clone();
         let res = download_file(
             dl_client,
             comfy_url,
             &archive_path,
-            archive_size,
+            0,
             |done, total, speed| {
                 let prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
                 *sh.state.lock().unwrap() = EngState::DownloadingEngine {
@@ -559,18 +581,33 @@ fn bootstrap_engine(
     ctx.request_repaint();
     log("bootstrap: extracting 7z archive into engine directory");
 
-    sevenz_rust2::decompress_file(&archive_path, &engine_dir)
-        .map_err(|e| format!("Failed to extract ComfyUI 7z archive: {e}"))?;
-
+    let extraction = sevenz_rust2::decompress_file(&archive_path, &engine_dir);
     let _ = std::fs::remove_file(&archive_path);
+    extraction.map_err(|e| format!("Failed to extract ComfyUI 7z archive: {e}"))?;
+
     log("bootstrap: extracted successfully");
 
-    let cfg = sh.cfg.lock().unwrap().clone();
-    if let Some(c) = find_comfy(&cfg) {
+    if let Some(c) = [engine_dir.join("ComfyUI_windows_portable/ComfyUI"), engine_dir.join("ComfyUI")]
+        .into_iter().find(|c| c.join("main.py").is_file()) {
         Ok(c)
     } else {
         Err("Extraction finished but main.py was not found in extracted directory.".into())
     }
+}
+
+fn fresh_engine_dir(root: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("Cannot create engine directory: {e}"))?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_nanos();
+    for n in 0..100 {
+        let dir = root.join(format!("isolated-{stamp}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Cannot create isolated engine: {e}")),
+        }
+    }
+    Err("Cannot allocate an isolated engine directory.".into())
 }
 
 fn bootstrap_models(
@@ -683,29 +720,36 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
         let mut attempt = 0usize;
         let mut started = Instant::now();
         let mut failed = false;
+        let mut isolated_attempted = false;
 
         loop {
-            if sh.retry.swap(false, Ordering::SeqCst) || sh.restart.swap(false, Ordering::SeqCst) {
+            let clean_requested = sh.clean_engine.swap(false, Ordering::SeqCst);
+            let retry_requested = sh.retry.swap(false, Ordering::SeqCst);
+            let restart_requested = sh.restart.swap(false, Ordering::SeqCst);
+            if clean_requested || retry_requested || restart_requested {
                 if let Some(c) = child.as_mut() {
                     kill_tree(c);
                 }
                 child = None;
                 attempt = 0;
                 failed = false;
+                sh.cancel.store(false, Ordering::SeqCst);
                 log("retry/restart supervisor cycle");
             }
 
-            let cfg = sh.cfg.lock().unwrap().clone();
-            let mut comfy = find_comfy(&cfg);
+            let mut cfg = sh.cfg.lock().unwrap().clone();
+            let mut comfy = if clean_requested { None } else { find_comfy(&cfg) };
 
             // 1. Is ComfyUI already running and responding?
-            if let Some(gpu) = ping(&ping_client) {
+            if let Some(gpu) = (!clean_requested).then(|| ping(&ping_client)).flatten() {
                 attempt = 0;
                 failed = false;
                 *sh.state.lock().unwrap() = EngState::Ready { ours: child.is_some(), gpu };
                 let models = comfy.as_ref().map(|c| find_models(&cfg, c)).unwrap_or_default();
                 let pys = comfy.as_ref().map(|c| find_pythons(c)).unwrap_or_default();
-                *sh.paths.lock().unwrap() = Paths { comfy: comfy.clone(), python: pys.first().cloned(), models: models.clone() };
+                if child.is_none() {
+                    *sh.paths.lock().unwrap() = Paths { comfy: comfy.clone(), python: pys.first().cloned(), models: models.clone() };
+                }
                 *sh.models_found.lock().unwrap() = profile
                     .models
                     .iter()
@@ -724,11 +768,13 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
 
             // 2. ComfyUI missing? Bootstrap automatically!
             if comfy.is_none() {
-                match bootstrap_engine(&sh, &ctx, &dl_client) {
+                isolated_attempted = true;
+                match bootstrap_engine(&sh, &ctx, &dl_client, clean_requested) {
                     Ok(c) => {
                         comfy = Some(c.clone());
-                        sh.cfg.lock().unwrap().comfy_dir = Some(c);
-                        sh.cfg.lock().unwrap().save();
+                        cfg.comfy_dir = Some(c);
+                        cfg.save();
+                        *sh.cfg.lock().unwrap() = cfg.clone();
                     }
                     Err(e) => {
                         failed = true;
@@ -742,7 +788,7 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
 
             let cd = comfy.as_ref().unwrap();
             let models = find_models(&cfg, cd);
-            {
+            if child.is_none() {
                 let pys = find_pythons(cd);
                 *sh.paths.lock().unwrap() = Paths { comfy: Some(cd.clone()), python: pys.first().cloned(), models: models.clone() };
             }
@@ -768,15 +814,33 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
             // 4. Launch ComfyUI process
             if child.is_none() {
                 let pys = find_pythons(cd);
-                if pys.is_empty() {
-                    failed = true;
-                    *sh.state.lock().unwrap() = EngState::Failed("No Python environment found inside ComfyUI directory.".into());
-                } else if attempt > pys.len() {
-                    failed = true;
+                if attempt >= pys.len() {
                     let t = tail(&data_dir().join("comfyui.log"), 14);
-                    *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start.\n{t}"));
+                    if !isolated_attempted {
+                        isolated_attempted = true;
+                        log(&format!("all Python candidates failed in {}; creating isolated engine\n{t}", cd.display()));
+                        match bootstrap_engine(&sh, &ctx, &dl_client, true) {
+                            Ok(c) => {
+                                cfg.comfy_dir = Some(c);
+                                if cfg.models_dir.is_none() {
+                                    cfg.models_dir = Some(models.clone());
+                                }
+                                cfg.save();
+                                *sh.cfg.lock().unwrap() = cfg;
+                                attempt = 0;
+                            }
+                            Err(e) => {
+                                failed = true;
+                                *sh.state.lock().unwrap() = EngState::Failed(format!("Existing engine failed and isolated setup failed: {e}"));
+                            }
+                        }
+                    } else {
+                        failed = true;
+                        *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start after trying all Python environments and an isolated engine.\n{t}"));
+                    }
                 } else {
-                    let py = &pys[attempt % pys.len()];
+                    let py = &pys[attempt];
+                    sh.paths.lock().unwrap().python = Some(py.clone());
                     log(&format!("launching {} (attempt {attempt})", py.display()));
                     match spawn(py, cd, &models) {
                         Ok(c) => {
@@ -785,8 +849,8 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
                             *sh.state.lock().unwrap() = EngState::Starting { since: started, attempt };
                         }
                         Err(e) => {
-                            failed = true;
-                            *sh.state.lock().unwrap() = EngState::Failed(e);
+                            log(&e);
+                            attempt += 1;
                         }
                     }
                 }
@@ -834,5 +898,108 @@ pub fn adopt_into_kill_job() {
         );
         let ok2 = AssignProcessToJobObject(job, GetCurrentProcess());
         log(&format!("kill-on-close job: set={ok1} assign={ok2}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn sandbox() -> PathBuf {
+        fresh_engine_dir(&std::env::temp_dir().join("image-studio-tests")).unwrap()
+    }
+
+    fn serve(response: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/archive", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        url
+    }
+
+    fn download(url: &str, dest: &Path, expected: u64) -> Result<(), String> {
+        let client = reqwest::blocking::Client::builder().no_proxy()
+            .timeout(Duration::from_secs(5)).build().unwrap();
+        download_file(&client, url, dest, expected, |_, _, _| {},
+            &AtomicBool::new(false), &eframe::egui::Context::default())
+    }
+
+    #[test]
+    fn isolated_install_does_not_reuse_existing_directory() {
+        let root = sandbox();
+        let old = root.join("ComfyUI");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("main.py"), "existing install").unwrap();
+        let first = fresh_engine_dir(&root).unwrap();
+        let second = fresh_engine_dir(&root).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, old);
+        assert!(first.starts_with(&root));
+        assert_eq!(std::fs::read_to_string(old.join("main.py")).unwrap(), "existing install");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_download_preserves_existing_file() {
+        let dir = sandbox();
+        let dest = dir.join("engine.7z");
+        std::fs::write(&dest, "existing").unwrap();
+        let url = serve("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc");
+        assert!(download(&url, &dest, 10).is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "existing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn server_ignoring_resume_restarts_download() {
+        let dir = sandbox();
+        let dest = dir.join("engine.7z");
+        std::fs::write(dest.with_extension("7z.part"), "old").unwrap();
+        let url = serve("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef");
+        download(&url, &dest, 6).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "abcdef");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_download_resumes_at_correct_offset() {
+        let dir = sandbox();
+        let dest = dir.join("engine.7z");
+        std::fs::write(dest.with_extension("7z.part"), "abc").unwrap();
+        let url = serve("HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 3-5/6\r\nConnection: close\r\n\r\ndef");
+        download(&url, &dest, 6).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "abcdef");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mismatched_resume_range_is_not_appended() {
+        let dir = sandbox();
+        let dest = dir.join("engine.7z");
+        let partial = dest.with_extension("7z.part");
+        std::fs::write(&partial, "abc").unwrap();
+        let url = serve("HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/6\r\nConnection: close\r\n\r\ndef");
+        assert!(download(&url, &dest, 6).is_err());
+        assert_eq!(std::fs::read_to_string(&partial).unwrap(), "abc");
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unsatisfiable_range_does_not_promote_wrong_sized_file() {
+        let dir = sandbox();
+        let dest = dir.join("engine.7z");
+        std::fs::write(dest.with_extension("7z.part"), "abc").unwrap();
+        let url = serve("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */6\r\nConnection: close\r\n\r\n");
+        assert!(download(&url, &dest, 6).is_err());
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
