@@ -244,6 +244,7 @@ pub struct App {
     loading: usize,
     queue: Vec<QueuedItem>,
     last_ctrl_v_down: bool,
+    pub updater: Arc<std::sync::Mutex<crate::updater::UpdaterState>>,
 }
 
 fn rand_u64() -> u64 {
@@ -315,6 +316,8 @@ impl App {
         let profile = Profile::load();
         engine::start_supervisor(sh.clone(), profile.clone(), ctx.clone());
         let (tx, rx) = mpsc::channel();
+        let updater = Arc::new(std::sync::Mutex::new(crate::updater::UpdaterState::default()));
+        crate::updater::check_for_updates(updater.clone(), ctx.clone());
         let presets = load_presets();
         let default_idx = presets
             .iter()
@@ -370,6 +373,7 @@ impl App {
             loading: 0,
             queue: Vec::new(),
             last_ctrl_v_down: false,
+            updater,
         }
     }
 
@@ -1254,8 +1258,19 @@ fn is_win_ctrl_v() -> bool {
 
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Setup").clicked() {
+                        let setup_resp = ui.button("Setup");
+                        if setup_resp.clicked() {
                             self.show_setup = !self.show_setup;
+                        }
+                        if self.updater.lock().unwrap().update_available {
+                            let badge_pos = setup_resp.rect.right_top() + vec2(-3.0, 3.0);
+                            let p = ui.painter();
+                            p.circle_filled(badge_pos, 4.0, Color32::from_rgb(35, 165, 90));
+                            p.circle_stroke(badge_pos, 4.0, Stroke::new(1.0, Color32::from_rgb(18, 21, 29)));
+                        }
+
+                        if ui.button("Outputs").on_hover_text("Open Image Studio output folder in Windows File Explorer").clicked() {
+                            engine::open_output_folder(&self.sh);
                         }
                         let (txt, col) = match &*self.sh.state.lock().unwrap() {
                             EngState::Detecting => ("Detecting engine...".to_string(), AMBER),
@@ -1679,6 +1694,9 @@ fn is_win_ctrl_v() -> bool {
         ui.horizontal(|ui| {
             heading(ui, "HISTORY");
             ui.label(RichText::new(format!("({})", self.nodes.len())).color(DIM).size(11.0));
+            if ui.small_button("Outputs").on_hover_text("Open generated outputs folder in Windows File Explorer").clicked() {
+                engine::open_output_folder(&self.sh);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.history_dock != HistoryDock::Floating {
                     let drag_resp = ui.add(
@@ -2002,6 +2020,30 @@ fn is_win_ctrl_v() -> bool {
                         .fill(ACCENT.linear_multiply(0.6))
                         .text(format!("Total Download Progress: {:.0}%", overall_progress * 100.0));
                     ui.add_sized([card_w - 44.0, 10.0], ov_bar);
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let cur_loc = self.sh.pending_models_dir.lock().unwrap().clone()
+                            .unwrap_or_else(|| self.sh.paths.lock().unwrap().models.clone());
+                        ui.label(RichText::new("Storage:").size(11.0).color(DIM));
+                        let display_str = cur_loc.display().to_string();
+                        let truncated = if display_str.len() > 36 {
+                            format!("...{}", &display_str[display_str.len() - 33..])
+                        } else {
+                            display_str
+                        };
+                        ui.label(RichText::new(truncated).size(11.0).color(TEXT));
+                        if ui.small_button("Change Location...").on_hover_text("Change install/model location to another drive (e.g. D:\\ImageStudio). Finished files will automatically move to this location.").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                let target_models = folder.join("models");
+                                *self.sh.pending_models_dir.lock().unwrap() = Some(target_models.clone());
+                                let mut cfg = self.sh.cfg.lock().unwrap();
+                                cfg.models_dir = Some(target_models.clone());
+                                cfg.save();
+                                self.sh.paths.lock().unwrap().models = target_models;
+                            }
+                        }
+                    });
                 }
                 EngState::Starting { since, attempt } => {
                     ui.label(RichText::new("INITIALIZING BACKEND").size(11.0).color(AMBER).strong());
@@ -2347,6 +2389,46 @@ fn is_win_ctrl_v() -> bool {
             } else if let Some(ref a_tex) = active_tex_opt {
                 p.image(a_tex.id(), image_rect, FULL_UV, Color32::WHITE);
                 p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(20)), StrokeKind::Outside);
+
+                let (target_w, target_h) = match self.size_preset {
+                    SizePreset::Original => (active_w, active_h),
+                    _ => (self.custom_w, self.custom_h),
+                };
+
+                // Live visual aspect ratio box showing relative output width and height
+                if target_w != active_w || target_h != active_h {
+                    let pw = image_rect.width() * (target_w as f32 / active_w.max(1) as f32);
+                    let ph = image_rect.height() * (target_h as f32 / active_h.max(1) as f32);
+                    let preview_rect = Rect::from_center_size(image_rect.center(), vec2(pw, ph));
+
+                    p.rect_stroke(
+                        preview_rect,
+                        2,
+                        Stroke::new(1.5, Color32::from_rgba_premultiplied(139, 92, 246, 200)),
+                        StrokeKind::Outside,
+                    );
+
+                    let b_len = 16.0f32.min(preview_rect.width() * 0.25).min(preview_rect.height() * 0.25);
+                    let b_stroke = Stroke::new(2.5, ACCENT);
+                    p.line_segment([preview_rect.left_top(), preview_rect.left_top() + vec2(b_len, 0.0)], b_stroke);
+                    p.line_segment([preview_rect.left_top(), preview_rect.left_top() + vec2(0.0, b_len)], b_stroke);
+                    p.line_segment([preview_rect.right_top(), preview_rect.right_top() + vec2(-b_len, 0.0)], b_stroke);
+                    p.line_segment([preview_rect.right_top(), preview_rect.right_top() + vec2(0.0, b_len)], b_stroke);
+                    p.line_segment([preview_rect.left_bottom(), preview_rect.left_bottom() + vec2(b_len, 0.0)], b_stroke);
+                    p.line_segment([preview_rect.left_bottom(), preview_rect.left_bottom() + vec2(0.0, -b_len)], b_stroke);
+                    p.line_segment([preview_rect.right_bottom(), preview_rect.right_bottom() + vec2(-b_len, 0.0)], b_stroke);
+                    p.line_segment([preview_rect.right_bottom(), preview_rect.right_bottom() + vec2(0.0, -b_len)], b_stroke);
+
+                    fn gcd(a: u32, b: u32) -> u32 { if b == 0 { a } else { gcd(b, a % b) } }
+                    let d = gcd(target_w, target_h).max(1);
+                    let tag_text = format!("Target: {}x{} ({}:{})", target_w, target_h, target_w / d, target_h / d);
+                    let g = p.layout_no_wrap(tag_text, egui::FontId::proportional(11.0), Color32::WHITE);
+                    let badge_pos = preview_rect.center_bottom() + vec2(0.0, 10.0);
+                    let r = egui::Align2::CENTER_TOP.anchor_size(badge_pos, g.size()).expand2(vec2(8.0, 3.5));
+                    p.rect_filled(r, 4, Color32::from_black_alpha(200));
+                    p.rect_stroke(r, 4, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                    p.galley(r.shrink2(vec2(8.0, 3.5)).min, g, Color32::WHITE);
+                }
             }
 
             match action {
@@ -2715,6 +2797,67 @@ fn is_win_ctrl_v() -> bool {
                         );
                     });
 
+                ui.separator();
+                heading(ui, "STORAGE & DATA LOCATION");
+                if let Some(ref msg) = *self.sh.migration_status.lock().unwrap() {
+                    ui.label(RichText::new(msg).color(AMBER).size(12.0));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Migrate Models to Another Drive...").on_hover_text("Move models (~17GB) to another drive/partition (e.g. D:\\ImageStudio\\models)").clicked() {
+                        if let Some(target) = rfd::FileDialog::new().pick_folder() {
+                            let src = self.sh.paths.lock().unwrap().models.clone();
+                            engine::migrate_storage(self.sh.clone(), src, target.join("models"), true, ctx.clone());
+                        }
+                    }
+                    if ui.button("Open Outputs Folder").on_hover_text("Open Image Studio output images folder in Windows File Explorer").clicked() {
+                        engine::open_output_folder(&self.sh);
+                    }
+                });
+
+                ui.separator();
+                heading(ui, "SOFTWARE UPDATES");
+                let cur_ver = env!("CARGO_PKG_VERSION");
+                let (up_avail, latest, is_dl, dl_prog, applied, err) = {
+                    let st = self.updater.lock().unwrap();
+                    (st.update_available, st.latest_version.clone(), st.downloading, st.download_progress, st.update_applied, st.error.clone())
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Installed version: v{cur_ver}")).size(12.0).color(TEXT));
+                    if up_avail {
+                        ui.label(RichText::new(format!("* Update available: v{latest}")).size(12.0).color(GREEN).strong());
+                    } else if !latest.is_empty() {
+                        ui.label(RichText::new("(Up to date)").size(12.0).color(DIM));
+                    }
+                });
+
+                if let Some(ref e) = err {
+                    ui.label(RichText::new(format!("Update check: {e}")).size(11.5).color(RED));
+                }
+
+                if applied {
+                    ui.label(RichText::new("Update installed successfully! Restart Image Studio to use the new version.").color(GREEN).strong());
+                    if ui.button("Restart Image Studio Now").clicked() {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).spawn();
+                            std::process::exit(0);
+                        }
+                    }
+                } else if is_dl {
+                    ui.label(RichText::new(format!("Downloading update: {:.0}%", dl_prog * 100.0)).size(12.0).color(ACCENT));
+                    let bar = egui::ProgressBar::new(dl_prog).show_percentage().fill(ACCENT);
+                    ui.add_sized([ui.available_width() - 20.0, 14.0], bar);
+                } else if up_avail {
+                    let btn = egui::Button::new("Download & Install Update").fill(ACCENT); if ui.add(btn).clicked() {
+                        crate::updater::download_and_install_update(self.updater.clone(), ctx.clone());
+                    }
+                } else {
+                    if ui.button("Check for Updates").clicked() {
+                        crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
+                    }
+                }
+
+                ui.add_space(4.0);
                 ui.label(RichText::new(format!("Logs folder: {}", engine::data_dir().display())).size(12.0).color(DIM));
             });
         self.show_setup = open;

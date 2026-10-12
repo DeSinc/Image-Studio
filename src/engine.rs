@@ -177,6 +177,8 @@ pub struct Shared {
     pub clean_engine: AtomicBool,
     pub cancel: AtomicBool,
     pub cfg: Mutex<Config>,
+    pub pending_models_dir: Mutex<Option<PathBuf>>,
+    pub migration_status: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -190,8 +192,95 @@ impl Shared {
             clean_engine: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             cfg: Mutex::new(Config::load()),
+            pending_models_dir: Mutex::new(None),
+            migration_status: Mutex::new(None),
         })
     }
+}
+
+
+pub fn move_file_robust(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(p) = to.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to).map_err(|e| format!("Copy failed: {e}"))?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+pub fn migrate_storage(
+    sh: Arc<Shared>,
+    from_models: PathBuf,
+    to_models: PathBuf,
+    move_files: bool,
+    ctx: eframe::egui::Context,
+) {
+    std::thread::spawn(move || {
+        *sh.migration_status.lock().unwrap() = Some(format!("Preparing migration to {}...", to_models.display()));
+        ctx.request_repaint();
+
+        if move_files && from_models.exists() {
+            let mut files_to_move = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&from_models) {
+                for cat in entries.flatten() {
+                    let cat_path = cat.path();
+                    if cat_path.is_dir() {
+                        if let Ok(files) = std::fs::read_dir(&cat_path) {
+                            for f in files.flatten() {
+                                let fp = f.path();
+                                if fp.is_file() {
+                                    let rel = fp.strip_prefix(&from_models).unwrap_or(&fp);
+                                    files_to_move.push((fp.clone(), to_models.join(rel)));
+                                }
+                            }
+                        }
+                    } else if cat_path.is_file() {
+                        let rel = cat_path.strip_prefix(&from_models).unwrap_or(&cat_path);
+                        files_to_move.push((cat_path.clone(), to_models.join(rel)));
+                    }
+                }
+            }
+
+            let total = files_to_move.len();
+            for (idx, (src, dst)) in files_to_move.into_iter().enumerate() {
+                let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+                *sh.migration_status.lock().unwrap() = Some(format!("Moving file {}/{} ({name})...", idx + 1, total));
+                ctx.request_repaint();
+                if let Err(e) = move_file_robust(&src, &dst) {
+                    *sh.migration_status.lock().unwrap() = Some(format!("Migration warning: {e}"));
+                }
+            }
+        }
+
+        {
+            let mut cfg = sh.cfg.lock().unwrap();
+            cfg.models_dir = Some(to_models.clone());
+            cfg.save();
+        }
+        sh.paths.lock().unwrap().models = to_models.clone();
+        *sh.pending_models_dir.lock().unwrap() = Some(to_models);
+        *sh.migration_status.lock().unwrap() = Some("Storage migration completed successfully.".into());
+        ctx.request_repaint();
+    });
+}
+
+pub fn open_output_folder(sh: &Shared) {
+    let p = {
+        let paths = sh.paths.lock().unwrap();
+        if let Some(ref c) = paths.comfy {
+            c.join("output").join("ImageStudio")
+        } else {
+            data_dir().join("output")
+        }
+    };
+    let _ = std::fs::create_dir_all(&p);
+    let _ = Command::new("explorer.exe")
+        .arg(&p)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 pub fn reset_to_clean_engine(sh: &Shared) {
@@ -388,12 +477,15 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
         "--disable-auto-launch",
         "--preview-method",
         "auto",
+        "--reserve-vram",
+        "1.5",
         "--models-directory",
     ])
     .arg(models)
     .current_dir(comfy)
     .env("PYTHONUNBUFFERED", "1")
     .env("PYTHONIOENCODING", "utf-8")
+    .env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     .stdin(Stdio::null())
     .stdout(out)
     .stderr(err)
@@ -617,10 +709,16 @@ fn bootstrap_models(
     models_dir: &Path,
     profile: &Profile,
 ) -> Result<(), String> {
+    let mut current_models_dir = if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
+        p
+    } else {
+        models_dir.to_path_buf()
+    };
+
     let missing: Vec<_> = profile
         .models
         .iter()
-        .filter(|m| !models_dir.join(&m.category).join(&m.filename).exists())
+        .filter(|m| !current_models_dir.join(&m.category).join(&m.filename).exists())
         .cloned()
         .collect();
 
@@ -632,7 +730,10 @@ fn bootstrap_models(
     let mut completed_bytes: u64 = 0;
 
     for (idx, m) in missing.iter().enumerate() {
-        let dest = models_dir.join(&m.category).join(&m.filename);
+        if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
+            current_models_dir = p;
+        }
+        let dest = current_models_dir.join(&m.category).join(&m.filename);
         log(&format!("bootstrap: downloading model {} -> {}", m.filename, dest.display()));
 
         let cur_file = m.filename.clone();
@@ -701,6 +802,15 @@ fn bootstrap_models(
             return Err(format!("Failed to download {}: {e}", m.filename));
         }
 
+        if let Some(target) = sh.pending_models_dir.lock().unwrap().clone() {
+            if target != current_models_dir {
+                let target_dest = target.join(&m.category).join(&m.filename);
+                log(&format!("bootstrap: moving finished model file to new storage: {} -> {}", dest.display(), target_dest.display()));
+                let _ = move_file_robust(&dest, &target_dest);
+                current_models_dir = target;
+            }
+        }
+
         completed_bytes += file_expected;
     }
 
@@ -721,6 +831,8 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
         let mut started = Instant::now();
         let mut failed = false;
         let mut isolated_attempted = false;
+        let mut ever_ready = false;
+        let mut consecutive_crashes = 0usize;
 
         loop {
             let clean_requested = sh.clean_engine.swap(false, Ordering::SeqCst);
@@ -732,6 +844,7 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
                 }
                 child = None;
                 attempt = 0;
+                consecutive_crashes = 0;
                 failed = false;
                 sh.cancel.store(false, Ordering::SeqCst);
                 log("retry/restart supervisor cycle");
@@ -744,6 +857,8 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
             if let Some(gpu) = (!clean_requested).then(|| ping(&ping_client)).flatten() {
                 attempt = 0;
                 failed = false;
+                ever_ready = true;
+                consecutive_crashes = 0;
                 *sh.state.lock().unwrap() = EngState::Ready { ours: child.is_some(), gpu };
                 let models = comfy.as_ref().map(|c| find_models(&cfg, c)).unwrap_or_default();
                 let pys = comfy.as_ref().map(|c| find_pythons(c)).unwrap_or_default();
@@ -816,7 +931,8 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
                 let pys = find_pythons(cd);
                 if attempt >= pys.len() {
                     let t = tail(&data_dir().join("comfyui.log"), 14);
-                    if !isolated_attempted {
+                    let is_managed = cd.starts_with(data_dir());
+                    if !isolated_attempted && !is_managed {
                         isolated_attempted = true;
                         log(&format!("all Python candidates failed in {}; creating isolated engine\n{t}", cd.display()));
                         match bootstrap_engine(&sh, &ctx, &dl_client, true) {
@@ -836,7 +952,7 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
                         }
                     } else {
                         failed = true;
-                        *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start after trying all Python environments and an isolated engine.\n{t}"));
+                        *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start.\n{t}"));
                     }
                 } else {
                     let py = &pys[attempt];
@@ -858,12 +974,26 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
                 if let Some(c) = child.as_mut() {
                     let exited = matches!(c.try_wait(), Ok(Some(_)));
                     if exited || started.elapsed() > Duration::from_secs(180) {
-                        log(&format!("comfyui attempt {attempt} ended (exited={exited})"));
+                        log(&format!("comfyui attempt {attempt} ended (exited={exited}, ever_ready={ever_ready})"));
                         if !exited {
                             kill_tree(c);
                         }
                         child = None;
-                        attempt += 1;
+                        if ever_ready {
+                            consecutive_crashes += 1;
+                            log(&format!("comfyui process exited after reaching Ready (crash #{consecutive_crashes}/5) - relaunching existing engine"));
+                            if consecutive_crashes <= 5 {
+                                std::thread::sleep(Duration::from_millis(1000));
+                                continue;
+                            } else {
+                                failed = true;
+                                let t = tail(&data_dir().join("comfyui.log"), 16);
+                                *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI crashed repeatedly (likely CUDA Out Of Memory or driver reset).\n{t}"));
+                                continue;
+                            }
+                        } else {
+                            attempt += 1;
+                        }
                     } else {
                         *sh.state.lock().unwrap() = EngState::Starting { since: started, attempt };
                     }
