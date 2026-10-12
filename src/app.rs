@@ -942,6 +942,41 @@ impl App {
         }
     }
 
+    
+fn fit_single_line_middle(p: &egui::Painter, text: &str, font: egui::FontId, max_w: f32) -> String {
+    let g = p.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE);
+    if g.size().x <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    if total <= 6 {
+        return text.to_string();
+    }
+    let mut low = 3;
+    let mut high = total - 1;
+    let mut best = format!("{}...", &chars[0..2].iter().collect::<String>());
+    while low <= high {
+        let keep = (low + high) / 2;
+        let front_len = keep / 2;
+        let back_len = keep - front_len;
+        let candidate = format!(
+            "{}...{}",
+            chars[0..front_len].iter().collect::<String>(),
+            chars[total - back_len..total].iter().collect::<String>()
+        );
+        let g = p.layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE);
+        if g.size().x <= max_w {
+            best = candidate;
+            low = keep + 1;
+        } else {
+            if keep == 0 { break; }
+            high = keep - 1;
+        }
+    }
+    best
+}
+
     fn handle_input(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let mut need_base = self.active_node().is_none();
@@ -950,14 +985,22 @@ impl App {
             need_base = false;
             self.load(ctx, t, Src::Path(p));
         }
-        let paste = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
+        let paste = ctx.input(|i| {
+            let raw_v = i.raw.events.iter().any(|e| match e {
+                egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } => {
+                    modifiers.ctrl || modifiers.command
+                }
+                egui::Event::Paste(_) => true,
+                _ => false,
+            });
+            raw_v || (i.modifiers.command && i.key_pressed(egui::Key::V))
+        });
         if paste {
             let mut pasted_image = false;
             for _ in 0..3 {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(img) = cb.get_image() {
-                        let t = if self.active_node().is_none() { Target::Base } else { Target::Ref };
-                        self.load(ctx, t, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
+                        self.load(ctx, Target::Base, Src::Rgba(img.width, img.height, img.bytes.into_owned()));
                         pasted_image = true;
                         break;
                     } else if let Ok(text) = cb.get_text() {
@@ -966,8 +1009,7 @@ impl App {
                         if path.is_file() {
                             if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
                                 if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif") {
-                                    let t = if self.active_node().is_none() { Target::Base } else { Target::Ref };
-                                    self.load(ctx, t, Src::Path(path));
+                                    self.load(ctx, Target::Base, Src::Path(path));
                                     pasted_image = true;
                                     break;
                                 }
@@ -980,12 +1022,15 @@ impl App {
             if pasted_image {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(text) = cb.get_text() {
-                        let t = text.trim();
-                        if self.prompt.ends_with(t) {
+                        let t = text.trim().trim_matches('"');
+                        if !t.is_empty() && self.prompt.ends_with(t) {
                             let new_len = self.prompt.len() - t.len();
                             self.prompt.truncate(new_len);
                         }
                     }
+                }
+                while self.prompt.ends_with('\n') || self.prompt.ends_with('\r') {
+                    self.prompt.pop();
                 }
             }
         }
@@ -1006,10 +1051,7 @@ impl App {
         matches!(*self.sh.state.lock().unwrap(), EngState::Ready { .. })
     }
 
-    fn can_generate(&self) -> Result<(), &'static str> {
-        if self.generating {
-            return Err("Generating...");
-        }
+    fn can_queue(&self) -> Result<(), &'static str> {
         let st = self.sh.state.lock().unwrap().clone();
         match st {
             EngState::Ready { .. } => {}
@@ -1027,10 +1069,17 @@ impl App {
         if self.active_node().is_none() {
             return Err("Drop or select a base image first");
         }
+        Ok(())
+    }
+
+    fn can_generate(&self) -> Result<(), &'static str> {
+        if self.generating {
+            return Err("Generating...");
+        }
         if self.prompt.trim().is_empty() {
             return Err("Type an edit instruction");
         }
-        Ok(())
+        self.can_queue()
     }
 
     fn pick_images(&mut self, ctx: &egui::Context, target: Target, multi: bool) {
@@ -1052,31 +1101,7 @@ impl App {
                     ui.label(RichText::new("Image Studio").size(17.0).strong());
                     ui.label(RichText::new(&self.profile.name).color(DIM).size(12.0));
 
-                    ui.add_space(8.0);
-                    let hist_txt = match self.history_dock {
-                        HistoryDock::Left => format!("History ({}) | Left", self.nodes.len()),
-                        HistoryDock::Right => format!("History ({}) | Right", self.nodes.len()),
-                        HistoryDock::Floating => format!("History ({}) | Float", self.nodes.len()),
-                    };
-                    let hist_btn = egui::Button::new(
-                        RichText::new(hist_txt)
-                            .size(11.5)
-                            .color(if self.show_history_window { ACCENT_GLOW } else { TEXT })
-                    )
-                    .fill(CARD)
-                    .stroke(Stroke::new(1.0, LINE))
-                    .corner_radius(4);
-                    if ui.add(hist_btn).clicked() {
-                        if self.history_dock == HistoryDock::Floating {
-                            self.show_history_window = !self.show_history_window;
-                        } else {
-                            self.history_dock = match self.history_dock {
-                                HistoryDock::Left => HistoryDock::Right,
-                                HistoryDock::Right => HistoryDock::Floating,
-                                HistoryDock::Floating => HistoryDock::Left,
-                            };
-                        }
-                    }
+
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Setup").clicked() {
@@ -1499,25 +1524,20 @@ impl App {
     fn render_history_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             heading(ui, "HISTORY");
+            ui.label(RichText::new(format!("({})", self.nodes.len())).color(DIM).size(11.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let is_float = self.history_dock == HistoryDock::Floating;
-                let is_right = self.history_dock == HistoryDock::Right;
-                let is_left = self.history_dock == HistoryDock::Left;
-
-                let float_btn = ui.selectable_label(is_float, "Float").on_hover_text("Float as separate window");
-                if float_btn.clicked() {
-                    self.history_dock = HistoryDock::Floating;
-                    self.show_history_window = true;
-                }
-
-                let right_btn = ui.selectable_label(is_right, "Right").on_hover_text("Dock to right panel");
-                if right_btn.clicked() {
-                    self.history_dock = HistoryDock::Right;
-                }
-
-                let left_btn = ui.selectable_label(is_left, "Left").on_hover_text("Dock to left panel");
-                if left_btn.clicked() {
-                    self.history_dock = HistoryDock::Left;
+                if self.history_dock != HistoryDock::Floating {
+                    let drag_resp = ui.add(
+                        egui::Label::new(RichText::new("⠿ Drag to undock").size(10.5).color(DIM))
+                            .sense(egui::Sense::drag())
+                    );
+                    if drag_resp.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    }
+                    if drag_resp.drag_started() {
+                        self.history_dock = HistoryDock::Floating;
+                        self.show_history_window = true;
+                    }
                 }
             });
         });
@@ -1632,22 +1652,24 @@ impl App {
                         } else {
                             node.label.clone()
                         };
-                        let title_galley = p.layout(
-                            title,
-                            egui::FontId::proportional(11.0),
+                        let font_title = egui::FontId::proportional(11.0);
+                        let fitted_title = Self::fit_single_line_middle(&p, &title, font_title.clone(), text_max_w);
+                        let title_galley = p.layout_no_wrap(
+                            fitted_title,
+                            font_title,
                             if is_active { Color32::WHITE } else { TEXT },
-                            text_max_w,
                         );
-                        p.galley(pos2(text_left, card_rect.min.y + 4.0), title_galley, Color32::WHITE);
+                        p.galley(pos2(text_left, card_rect.min.y + 5.0), title_galley, Color32::WHITE);
 
                         let sub = format!("Step {} | {}x{}", node.step_num, node.width, node.height);
-                        let sub_galley = p.layout(
-                            sub,
-                            egui::FontId::proportional(10.0),
+                        let sub_font = egui::FontId::proportional(10.0);
+                        let fitted_sub = Self::fit_single_line_middle(&p, &sub, sub_font.clone(), text_max_w);
+                        let sub_galley = p.layout_no_wrap(
+                            fitted_sub,
+                            sub_font,
                             DIM,
-                            text_max_w,
                         );
-                        p.galley(pos2(text_left, card_rect.min.y + 20.0), sub_galley, DIM);
+                        p.galley(pos2(text_left, card_rect.min.y + 21.0), sub_galley, DIM);
 
                         if has_fork {
                             let fork_txt = format!("{} branches", children.len());
@@ -1676,16 +1698,56 @@ impl App {
             return;
         }
         let mut open = self.show_history_window;
-        egui::Window::new("History")
+        let screen_rect = ctx.content_rect();
+        let left_dock_thresh = screen_rect.min.x + 280.0;
+        let right_dock_thresh = screen_rect.max.x - 300.0;
+
+        let win_resp = egui::Window::new("History")
             .open(&mut open)
+            .id(egui::Id::new("floating_history_window"))
             .default_width(280.0)
-            .default_height(380.0)
+            .default_height(400.0)
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
                 self.render_history_ui(ui);
             });
         self.show_history_window = open;
+
+        if let Some(resp) = win_resp {
+            let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+            let is_dragged = resp.response.dragged();
+            let is_down = ctx.input(|i| i.pointer.primary_down());
+            let just_released = ctx.input(|i| i.pointer.any_released());
+
+            if let Some(pos) = pointer_pos {
+                let hover_left = pos.x < left_dock_thresh;
+                let hover_right = pos.x > right_dock_thresh;
+
+                if is_dragged || (is_down && (hover_left || hover_right)) {
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dock_overlay")));
+                    if hover_left {
+                        let r = Rect::from_min_max(screen_rect.min, pos2(left_dock_thresh, screen_rect.max.y));
+                        painter.rect_filled(r, 8.0, Color32::from_rgba_unmultiplied(20, 100, 180, 50));
+                        painter.rect_stroke(r.shrink(4.0), 8.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+                        painter.text(r.center(), egui::Align2::CENTER_CENTER, "Drop to dock Left", egui::FontId::proportional(15.0), Color32::WHITE);
+                    } else if hover_right {
+                        let r = Rect::from_min_max(pos2(right_dock_thresh, screen_rect.min.y), screen_rect.max);
+                        painter.rect_filled(r, 8.0, Color32::from_rgba_unmultiplied(20, 100, 180, 50));
+                        painter.rect_stroke(r.shrink(4.0), 8.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+                        painter.text(r.center(), egui::Align2::CENTER_CENTER, "Drop to dock Right", egui::FontId::proportional(15.0), Color32::WHITE);
+                    }
+                }
+
+                if just_released {
+                    if hover_left {
+                        self.history_dock = HistoryDock::Left;
+                    } else if hover_right {
+                        self.history_dock = HistoryDock::Right;
+                    }
+                }
+            }
+        }
     }
 
     fn render_setup_card(&mut self, ui: &mut egui::Ui, rect: Rect, state: &EngState) {
@@ -2192,23 +2254,27 @@ impl App {
                             self.prompt.pop();
                         }
                         let p_text = self.prompt.trim().to_string();
-                        if !p_text.is_empty() && self.can_generate().is_ok() {
+                        if !p_text.is_empty() {
                             if self.generating {
-                                self.queue.push(QueuedItem { prompt: p_text });
-                                self.prompt.clear();
-                            } else {
+                                if self.can_queue().is_ok() {
+                                    self.queue.push(QueuedItem { prompt: p_text });
+                                    self.prompt.clear();
+                                }
+                            } else if self.can_generate().is_ok() {
                                 self.start_generation(ctx);
                             }
                         }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can = self.can_generate();
-                        let is_ok = can.is_ok();
-                        let btn_text = if self.generating {
-                            if is_ok { "Queue" } else { "Generating..." }
+                        let (is_ok, btn_text, tip) = if self.generating {
+                            let q_can = self.can_queue();
+                            let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
+                            (ok, "Queue", q_can.err())
                         } else {
-                            "Generate"
+                            let g_can = self.can_generate();
+                            let ok = g_can.is_ok() && !self.prompt.trim().is_empty();
+                            (ok, "Generate", g_can.err())
                         };
 
                         let send_btn = egui::Button::new(
@@ -2227,17 +2293,17 @@ impl App {
                             let p_text = self.prompt.trim().to_string();
                             if !p_text.is_empty() {
                                 if self.generating {
-                                    self.queue.push(QueuedItem { prompt: p_text });
-                                    self.prompt.clear();
-                                } else {
+                                    if self.can_queue().is_ok() {
+                                        self.queue.push(QueuedItem { prompt: p_text });
+                                        self.prompt.clear();
+                                    }
+                                } else if self.can_generate().is_ok() {
                                     self.start_generation(ctx);
                                 }
                             }
                         }
-                        if let Err(why) = can {
-                            if !self.generating {
-                                resp.on_hover_text(why);
-                            }
+                        if let Some(why) = tip {
+                            resp.on_hover_text(why);
                         }
 
                         if self.generating {
