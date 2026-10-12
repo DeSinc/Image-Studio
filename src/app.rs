@@ -946,6 +946,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn engine_ready(&self) -> bool {
         matches!(*self.sh.state.lock().unwrap(), EngState::Ready { .. })
     }
@@ -954,11 +955,18 @@ impl App {
         if self.generating {
             return Err("Generating...");
         }
-        if !self.engine_ready() {
-            return Err("Waiting for engine...");
+        let st = self.sh.state.lock().unwrap().clone();
+        match st {
+            EngState::Ready { .. } => {}
+            EngState::DownloadingEngine { .. } => return Err("Downloading engine..."),
+            EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
+            EngState::DownloadingModels { .. } => return Err("Downloading models..."),
+            EngState::Starting { .. } => return Err("Starting engine..."),
+            EngState::Detecting => return Err("Detecting engine..."),
+            EngState::Failed(_) => return Err("Engine setup failed (see Setup)"),
         }
         if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
-            return Err("Missing model weights (see Setup)");
+            return Err("Downloading model weights...");
         }
         if self.active_node().is_none() {
             return Err("Drop or select a base image first");
@@ -1020,7 +1028,9 @@ impl App {
                         }
                         let (txt, col) = match &*self.sh.state.lock().unwrap() {
                             EngState::Detecting => ("Detecting engine...".to_string(), AMBER),
-                            EngState::NotInstalled => ("ComfyUI not found".to_string(), RED),
+                            EngState::DownloadingEngine { .. } => ("Downloading engine...".to_string(), AMBER),
+                            EngState::ExtractingEngine { .. } => ("Extracting engine...".to_string(), AMBER),
+                            EngState::DownloadingModels { file_index, total_files, .. } => (format!("Downloading model ({}/{})", file_index, total_files), AMBER),
                             EngState::Starting { since, .. } => (format!("Starting engine... {}s", since.elapsed().as_secs()), AMBER),
                             EngState::Ready { ours, .. } => (
                                 if *ours {
@@ -1030,7 +1040,7 @@ impl App {
                                 },
                                 GREEN,
                             ),
-                            EngState::Failed(_) => ("Engine failed".to_string(), RED),
+                            EngState::Failed(_) => ("Engine setup failed".to_string(), RED),
                         };
                         egui::Frame::new()
                             .fill(col.linear_multiply(0.14))
@@ -1621,6 +1631,124 @@ impl App {
         self.show_history_window = open;
     }
 
+    fn render_setup_card(&mut self, ui: &mut egui::Ui, rect: Rect, state: &EngState) {
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
+        p.rect_stroke(rect, 10, Stroke::new(1.5, LINE), StrokeKind::Inside);
+
+        let card_w = 540.0f32.min(rect.width() - 40.0);
+        let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, 240.0));
+
+        p.rect_filled(card_rect, 12, CARD);
+        p.rect_stroke(card_rect, 12, Stroke::new(1.0, CARD_HI), StrokeKind::Inside);
+
+        let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
+        card_ui.vertical_centered(|ui| {
+            match state {
+                EngState::DownloadingEngine { step: _, progress, bytes_done, bytes_total, speed_mb } => {
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Downloading AI Image Engine").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(format!("Step 1 of 2: Portable ComfyUI environment • {:.1} MB/s", speed_mb)).size(12.0).color(DIM));
+                    ui.add_space(14.0);
+
+                    let bar = egui::ProgressBar::new(*progress)
+                        .show_percentage()
+                        .fill(ACCENT)
+                        .animate(true);
+                    ui.add_sized([card_w - 44.0, 14.0], bar);
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
+                        });
+                    });
+                }
+                EngState::ExtractingEngine { step } => {
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Extracting Portable Engine").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new("Unpacking runtime components (this takes 1-2 minutes)...").size(12.0).color(DIM));
+                    ui.add_space(14.0);
+
+                    let spinner_bar = egui::ProgressBar::new(0.5).fill(ACCENT).animate(true);
+                    ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(step).size(11.5).color(DIM));
+                }
+                EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("Downloading AI Model Weights ({}/{})", file_index, total_files)).size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(format!("Qwen Image 2.1 Multi-Ref ({})", current_file)).size(11.5).color(DIM));
+                    ui.add_space(10.0);
+
+                    let bar = egui::ProgressBar::new(*file_progress)
+                        .show_percentage()
+                        .fill(ACCENT)
+                        .animate(true);
+                    ui.add_sized([card_w - 44.0, 14.0], bar);
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
+                        });
+                    });
+                    ui.add_space(6.0);
+
+                    let ov_bar = egui::ProgressBar::new(*overall_progress)
+                        .fill(ACCENT.linear_multiply(0.6))
+                        .text(format!("Total Download Progress: {:.0}%", overall_progress * 100.0));
+                    ui.add_sized([card_w - 44.0, 10.0], ov_bar);
+                }
+                EngState::Starting { since, attempt } => {
+                    ui.label(RichText::new("INITIALIZING BACKEND").size(11.0).color(AMBER).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Starting ComfyUI Engine").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(format!("Starting background process (attempt {}, {}s)...", attempt + 1, since.elapsed().as_secs())).size(12.0).color(DIM));
+                    ui.add_space(14.0);
+
+                    let bar = egui::ProgressBar::new(0.6).fill(AMBER).animate(true);
+                    ui.add_sized([card_w - 44.0, 12.0], bar);
+                }
+                EngState::Failed(msg) => {
+                    ui.label(RichText::new("SETUP INTERRUPTED").size(11.0).color(RED).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Engine Setup Failed").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(msg).size(12.0).color(RED));
+                    ui.add_space(14.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Retry Setup").clicked() {
+                            self.sh.retry.store(true, Ordering::SeqCst);
+                        }
+                        if ui.button("Browse Existing ComfyUI Folder").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                let mut cfg = self.sh.cfg.lock().unwrap();
+                                cfg.comfy_dir = Some(folder);
+                                cfg.save();
+                                self.sh.retry.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    });
+                }
+                EngState::Detecting => {
+                    ui.label(RichText::new("DETECTING ENGINE").size(11.0).color(AMBER).strong());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Checking for Local ComfyUI...").size(18.0).strong().color(TEXT));
+                    ui.add_space(14.0);
+                    let bar = egui::ProgressBar::new(0.3).fill(AMBER).animate(true);
+                    ui.add_sized([card_w - 44.0, 12.0], bar);
+                }
+                EngState::Ready { .. } => {}
+            }
+        });
+    }
+
     // Center Hero Canvas (Centered Image + Interactive Zoom & Pan)
     fn center_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let max_size = ui.available_size();
@@ -1855,32 +1983,37 @@ impl App {
             }
         } else {
             let (rect, resp) = ui.allocate_exact_size(max_size, Sense::click());
-            let hover = resp.hovered();
-            let p = ui.painter_at(rect);
-            p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
-            p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
+            let st = self.sh.state.lock().unwrap().clone();
+            if !matches!(st, EngState::Ready { .. }) {
+                self.render_setup_card(ui, rect, &st);
+            } else {
+                let hover = resp.hovered();
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
+                p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
 
-            let c = rect.center();
-            p.text(
-                c - vec2(0.0, 14.0),
-                egui::Align2::CENTER_CENTER,
-                if self.loading > 0 { "Loading image..." } else { "Drop an image here to start editing" },
-                egui::FontId::proportional(18.0),
-                TEXT,
-            );
-            p.text(
-                c + vec2(0.0, 14.0),
-                egui::Align2::CENTER_CENTER,
-                "Click to browse | Ctrl+V to paste from clipboard",
-                egui::FontId::proportional(13.0),
-                DIM,
-            );
+                let c = rect.center();
+                p.text(
+                    c - vec2(0.0, 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    if self.loading > 0 { "Loading image..." } else { "Drop an image here to start editing" },
+                    egui::FontId::proportional(18.0),
+                    TEXT,
+                );
+                p.text(
+                    c + vec2(0.0, 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Click to browse | Ctrl+V to paste from clipboard",
+                    egui::FontId::proportional(13.0),
+                    DIM,
+                );
 
-            if hover {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                self.pick_images(ctx, Target::Base, false);
+                if hover {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    self.pick_images(ctx, Target::Base, false);
+                }
             }
         }
     }
@@ -2031,8 +2164,14 @@ impl App {
                 let paths = self.sh.paths.lock().unwrap().clone();
                 let state = self.sh.state.lock().unwrap().clone();
                 let st = match &state {
-                    EngState::Detecting => "Detecting...".to_string(),
-                    EngState::NotInstalled => "ComfyUI not found - use Browse to point at your ComfyUI folder".into(),
+                    EngState::Detecting => "Detecting engine...".to_string(),
+                    EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
+                        format!("{step} ({:.1}%) - {} / {} @ {:.1} MB/s", progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
+                    }
+                    EngState::ExtractingEngine { step } => step.clone(),
+                    EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, .. } => {
+                        format!("Downloading Model [{}/{}] {} ({:.1}%) - {} / {} @ {:.1} MB/s", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
+                    }
                     EngState::Starting { since, attempt } => format!("Starting (attempt {}, {}s)", attempt + 1, since.elapsed().as_secs()),
                     EngState::Ready { ours, gpu } => {
                         format!("Ready on {gpu} ({})", if *ours { "launched by Image Studio" } else { "already running" })
@@ -2078,7 +2217,8 @@ impl App {
                             .color(if *ok { GREEN } else { RED }),
                     );
                 }
-                if ui.button("Restart engine").clicked() {
+                if ui.button("Retry Setup / Restart engine").clicked() {
+                    self.sh.retry.store(true, Ordering::SeqCst);
                     self.sh.restart.store(true, Ordering::SeqCst);
                 }
 
@@ -2127,9 +2267,16 @@ impl eframe::App for App {
         self.drain(&ctx);
         self.handle_input(&ctx);
 
-        let starting = matches!(*self.sh.state.lock().unwrap(), EngState::Starting { .. } | EngState::Detecting);
+        let starting = matches!(
+            *self.sh.state.lock().unwrap(),
+            EngState::Starting { .. }
+                | EngState::Detecting
+                | EngState::DownloadingEngine { .. }
+                | EngState::ExtractingEngine { .. }
+                | EngState::DownloadingModels { .. }
+        );
         if starting || self.generating || self.loading > 0 {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
 
         // Top Header

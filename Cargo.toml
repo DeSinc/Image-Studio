@@ -18,6 +18,7 @@ dirs = "6.0"
 rfd = "0.15"
 arboard = "3.4"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+sevenz-rust2 = "0.24.0"
 
 [profile.release]
 opt-level = 3
