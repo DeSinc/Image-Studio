@@ -961,6 +961,7 @@ impl App {
             EngState::DownloadingEngine { .. } => return Err("Downloading engine..."),
             EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
             EngState::DownloadingModels { .. } => return Err("Downloading models..."),
+            EngState::RepairingEngine { .. } => return Err("Repairing engine..."),
             EngState::Starting { .. } => return Err("Starting engine..."),
             EngState::Detecting => return Err("Detecting engine..."),
             EngState::Failed(_) => return Err("Engine setup failed (see Setup)"),
@@ -1031,6 +1032,7 @@ impl App {
                             EngState::DownloadingEngine { .. } => ("Downloading engine...".to_string(), AMBER),
                             EngState::ExtractingEngine { .. } => ("Extracting engine...".to_string(), AMBER),
                             EngState::DownloadingModels { file_index, total_files, .. } => (format!("Downloading model ({}/{})", file_index, total_files), AMBER),
+                            EngState::RepairingEngine { .. } => ("Repairing engine...".to_string(), AMBER),
                             EngState::Starting { since, .. } => (format!("Starting engine... {}s", since.elapsed().as_secs()), AMBER),
                             EngState::Ready { ours, .. } => (
                                 if *ours {
@@ -1636,11 +1638,13 @@ impl App {
         p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
         p.rect_stroke(rect, 10, Stroke::new(1.5, LINE), StrokeKind::Inside);
 
-        let card_w = 540.0f32.min(rect.width() - 40.0);
-        let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, 240.0));
+        let is_failed = matches!(state, EngState::Failed(_));
+        let card_w = (if is_failed { 620.0f32 } else { 540.0f32 }).min(rect.width() - 32.0);
+        let card_h = if is_failed { 380.0f32 } else { 240.0f32 };
+        let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, card_h));
 
         p.rect_filled(card_rect, 12, CARD);
-        p.rect_stroke(card_rect, 12, Stroke::new(1.0, CARD_HI), StrokeKind::Inside);
+        p.rect_stroke(card_rect, 12, Stroke::new(1.0, if is_failed { RED.linear_multiply(0.4) } else { CARD_HI }), StrokeKind::Inside);
 
         let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
         card_ui.vertical_centered(|ui| {
@@ -1715,24 +1719,85 @@ impl App {
                     let bar = egui::ProgressBar::new(0.6).fill(AMBER).animate(true);
                     ui.add_sized([card_w - 44.0, 12.0], bar);
                 }
-                EngState::Failed(msg) => {
-                    ui.label(RichText::new("SETUP INTERRUPTED").size(11.0).color(RED).strong());
+                EngState::RepairingEngine { step } => {
+                    ui.label(RichText::new("REPAIRING ENVIRONMENT").size(11.0).color(AMBER).strong());
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Engine Setup Failed").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(msg).size(12.0).color(RED));
+                    ui.label(RichText::new("Installing Missing Dependencies").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new(step).size(12.0).color(DIM));
                     ui.add_space(14.0);
 
+                    let spinner_bar = egui::ProgressBar::new(0.5).fill(AMBER).animate(true);
+                    ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
+                }
+                EngState::Failed(msg) => {
+                    ui.label(RichText::new("SETUP INTERRUPTED").size(11.0).color(RED).strong());
+                    ui.add_space(3.0);
+                    ui.label(RichText::new("Engine Failed to Start").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new("The local ComfyUI installation failed to launch (missing dependencies or incompatible version).").size(11.5).color(DIM));
+                    ui.add_space(8.0);
+
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(10, 12, 16))
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("err_log_scroll")
+                                .max_height(105.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(msg)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(255, 120, 120)),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                        });
+                    ui.add_space(10.0);
+
+                    let clean_btn = egui::Button::new(
+                        RichText::new("Download Clean Dedicated Engine (Recommended)")
+                            .size(12.5)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .stroke(Stroke::new(1.0, ACCENT_GLOW))
+                    .corner_radius(6);
+                    if ui.add(clean_btn).on_hover_text("Bypasses broken local installs and automatically downloads a clean, tested portable engine").clicked() {
+                        engine::reset_to_clean_engine(&self.sh);
+                    }
+                    ui.add_space(6.0);
+
                     ui.horizontal(|ui| {
-                        if ui.button("Retry Setup").clicked() {
-                            self.sh.retry.store(true, Ordering::SeqCst);
+                        let rep_btn = egui::Button::new(
+                            RichText::new("Auto-Repair Environment (pip)")
+                                .size(11.5)
+                                .color(TEXT),
+                        )
+                        .fill(CARD_HI)
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6);
+                        if ui.add(rep_btn).on_hover_text("Runs pip install (async-timeout, aiohttp, requirements.txt) in the detected Python environment").clicked() {
+                            engine::repair_environment(self.sh.clone(), ui.ctx().clone());
                         }
-                        if ui.button("Browse Existing ComfyUI Folder").clicked() {
+
+                        if ui.button("Browse Different Folder").clicked() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 let mut cfg = self.sh.cfg.lock().unwrap();
                                 cfg.comfy_dir = Some(folder);
                                 cfg.save();
                                 self.sh.retry.store(true, Ordering::SeqCst);
                             }
+                        }
+
+                        if ui.button("Retry").clicked() {
+                            self.sh.retry.store(true, Ordering::SeqCst);
                         }
                     });
                 }
@@ -2169,6 +2234,7 @@ impl App {
                         format!("{step} ({:.1}%) - {} / {} @ {:.1} MB/s", progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
                     }
                     EngState::ExtractingEngine { step } => step.clone(),
+                    EngState::RepairingEngine { step } => format!("Repairing: {step}"),
                     EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, .. } => {
                         format!("Downloading Model [{}/{}] {} ({:.1}%) - {} / {} @ {:.1} MB/s", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
                     }
@@ -2217,10 +2283,15 @@ impl App {
                             .color(if *ok { GREEN } else { RED }),
                     );
                 }
-                if ui.button("Retry Setup / Restart engine").clicked() {
-                    self.sh.retry.store(true, Ordering::SeqCst);
-                    self.sh.restart.store(true, Ordering::SeqCst);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Retry Setup / Restart Engine").clicked() {
+                        self.sh.retry.store(true, Ordering::SeqCst);
+                        self.sh.restart.store(true, Ordering::SeqCst);
+                    }
+                    if ui.button("Switch to Clean Managed Engine").on_hover_text("Bypasses custom/old ComfyUI folders and downloads the official portable engine").clicked() {
+                        engine::reset_to_clean_engine(&self.sh);
+                    }
+                });
 
                 ui.separator();
                 heading(ui, "COMFYUI LOG (tail)");
@@ -2274,6 +2345,7 @@ impl eframe::App for App {
                 | EngState::DownloadingEngine { .. }
                 | EngState::ExtractingEngine { .. }
                 | EngState::DownloadingModels { .. }
+                | EngState::RepairingEngine { .. }
         );
         if starting || self.generating || self.loading > 0 {
             ctx.request_repaint_after(Duration::from_millis(150));

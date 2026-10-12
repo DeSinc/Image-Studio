@@ -55,6 +55,8 @@ pub fn format_bytes(b: u64) -> String {
 pub struct Config {
     pub comfy_dir: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub ignore_paths: Vec<PathBuf>,
 }
 
 impl Config {
@@ -145,6 +147,9 @@ pub enum EngState {
         speed_mb: f32,
         overall_progress: f32,
     },
+    RepairingEngine {
+        step: String,
+    },
     Starting {
         since: Instant,
         attempt: usize,
@@ -185,6 +190,71 @@ impl Shared {
             cfg: Mutex::new(Config::load()),
         })
     }
+}
+
+pub fn reset_to_clean_engine(sh: &Shared) {
+    let mut cfg = sh.cfg.lock().unwrap();
+    if let Some(cd) = &sh.paths.lock().unwrap().comfy {
+        if !cfg.ignore_paths.contains(cd) {
+            cfg.ignore_paths.push(cd.clone());
+        }
+    }
+    cfg.comfy_dir = None;
+    cfg.save();
+    sh.retry.store(true, Ordering::SeqCst);
+    log("reset to clean managed engine requested");
+}
+
+pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let paths = sh.paths.lock().unwrap().clone();
+        let py = match paths.python {
+            Some(p) => p,
+            None => {
+                *sh.state.lock().unwrap() = EngState::Failed("Cannot repair: No Python executable found in detected folder.".into());
+                ctx.request_repaint();
+                return;
+            }
+        };
+        let comfy = match paths.comfy {
+            Some(c) => c,
+            None => {
+                *sh.state.lock().unwrap() = EngState::Failed("Cannot repair: No ComfyUI folder found.".into());
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        *sh.state.lock().unwrap() = EngState::RepairingEngine {
+            step: "Running pip install to fix dependencies (async-timeout, aiohttp, requirements.txt)...".into(),
+        };
+        ctx.request_repaint();
+
+        log(&format!("repair: running pip via {} in {}", py.display(), comfy.display()));
+        let mut cmd = Command::new(&py);
+        cmd.args(["-m", "pip", "install", "async-timeout", "aiohttp", "-r", "requirements.txt"])
+            .current_dir(&comfy)
+            .creation_flags(CREATE_NO_WINDOW);
+
+        match cmd.output() {
+            Ok(out) => {
+                if out.status.success() {
+                    log("repair: pip finished successfully");
+                    sh.retry.store(true, Ordering::SeqCst);
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    let out_txt = String::from_utf8_lossy(&out.stdout);
+                    log(&format!("repair failed: {err}\n{out_txt}"));
+                    *sh.state.lock().unwrap() = EngState::Failed(format!("Pip repair exited with error:\n{}", if err.is_empty() { out_txt } else { err }));
+                }
+            }
+            Err(e) => {
+                log(&format!("repair: failed to spawn pip: {e}"));
+                *sh.state.lock().unwrap() = EngState::Failed(format!("Failed to execute pip: {e}"));
+            }
+        }
+        ctx.request_repaint();
+    });
 }
 
 fn detect_gpu_vendor() -> &'static str {
@@ -243,7 +313,10 @@ pub fn find_comfy(cfg: &Config) -> Option<PathBuf> {
         c.push(h.join("ComfyUI"));
         c.push(h.join("Documents/ComfyUI"));
     }
-    c.into_iter().find(|p| p.join("main.py").exists())
+
+    c.into_iter().find(|p| {
+        !cfg.ignore_paths.iter().any(|ign| ign == p || p.starts_with(ign)) && p.join("main.py").exists()
+    })
 }
 
 fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
