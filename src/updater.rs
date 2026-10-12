@@ -71,22 +71,32 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
         match client.get(UPDATE_URL).send() {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    if let Ok(info) = resp.json::<RemoteVersion>() {
-                        let mut st = state.lock().unwrap();
-                        st.checked = true;
-                        st.latest_version = info.version.clone();
-                        st.download_url = info.download_url.clone();
-                        st.changelog = info.changelog;
-                        st.error = None;
-                        if is_newer(&info.version, current_ver) {
-                            st.update_available = true;
-                        } else {
-                            st.update_available = false;
+                    let text = match resp.text() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let mut st = state.lock().unwrap();
+                            st.checked = true;
+                            st.error = Some(format!("Failed to read response body: {e}"));
+                            ctx.request_repaint();
+                            return;
                         }
-                    } else {
-                        let mut st = state.lock().unwrap();
-                        st.checked = true;
-                        st.error = Some("Failed to parse remote version info".into());
+                    };
+                    let clean = text.trim_start_matches('\u{feff}').trim();
+                    match serde_json::from_str::<RemoteVersion>(clean) {
+                        Ok(info) => {
+                            let mut st = state.lock().unwrap();
+                            st.checked = true;
+                            st.latest_version = info.version.clone();
+                            st.download_url = info.download_url.clone();
+                            st.changelog = info.changelog;
+                            st.error = None;
+                            st.update_available = is_newer(&info.version, current_ver);
+                        }
+                        Err(e) => {
+                            let mut st = state.lock().unwrap();
+                            st.checked = true;
+                            st.error = Some(format!("Failed to parse version JSON: {e}"));
+                        }
                     }
                 } else {
                     let mut st = state.lock().unwrap();
@@ -190,5 +200,15 @@ mod tests {
         assert!(is_newer("1.0.0", "0.9.9"));
         assert!(!is_newer("0.2.7", "0.2.7"));
         assert!(!is_newer("0.2.6", "0.2.7"));
+    }
+
+    #[test]
+    fn test_parse_version_with_bom() {
+        let raw_with_bom = "\u{feff}{\"version\": \"0.2.8\", \"download_url\": \"https://desinc.my.to/image-studio/ImageStudio.exe\"}";
+        let clean = raw_with_bom.trim_start_matches('\u{feff}').trim();
+        let parsed: Result<RemoteVersion, _> = serde_json::from_str(clean);
+        assert!(parsed.is_ok());
+        let info = parsed.unwrap();
+        assert_eq!(info.version, "0.2.8");
     }
 }
