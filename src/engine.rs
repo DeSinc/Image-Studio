@@ -57,6 +57,8 @@ pub struct Config {
     pub models_dir: Option<PathBuf>,
     #[serde(default)]
     pub ignore_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub active_profile: Option<String>,
 }
 
 impl Config {
@@ -88,7 +90,12 @@ pub struct ModelFile {
 #[derive(Deserialize, Clone)]
 #[allow(dead_code)]
 pub struct Profile {
+    pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub recommended_vram_gb: u32,
     pub default_steps: u32,
     pub default_cfg: f32,
     pub sampler: String,
@@ -96,14 +103,33 @@ pub struct Profile {
     pub models: Vec<ModelFile>,
 }
 #[derive(Deserialize)]
-struct ProfileFile {
-    active_profile: String,
-    profiles: Vec<serde_json::Value>,
+#[allow(dead_code)]
+pub struct ProfileFile {
+    pub active_profile: String,
+    pub profiles: Vec<Profile>,
+}
+
+pub fn detect_gpu_vram_gb() -> Option<u32> {
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .creation_flags(CREATE_NO_WINDOW);
+    if let Ok(out) = cmd.output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(first_line) = s.lines().next() {
+                if let Ok(mib) = first_line.trim().parse::<u32>() {
+                    let gb = (mib as f32 / 1024.0).round() as u32;
+                    log(&format!("detect_gpu_vram: nvidia-smi reported {mib} MiB ({gb} GB)"));
+                    return Some(gb);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl Profile {
-    /// `models.json` next to the exe overrides the embedded default.
-    pub fn load() -> Profile {
+    pub fn all() -> Vec<Profile> {
         let exe_json = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("models.json")))
@@ -113,11 +139,31 @@ impl Profile {
             .or_else(|_| serde_json::from_str(include_str!("../models.json")))
             .expect("models.json");
         pf.profiles
-            .into_iter()
-            .find(|p| p["id"] == pf.active_profile.as_str())
-            .and_then(|p| serde_json::from_value(p).ok())
-            .expect("active profile")
     }
+
+    pub fn load_with_cfg(cfg: &Config) -> Profile {
+        let profiles = Self::all();
+        if let Some(ref aid) = cfg.active_profile {
+            if let Some(p) = profiles.iter().find(|p| &p.id == aid) {
+                return p.clone();
+            }
+        }
+        if let Some(vram) = detect_gpu_vram_gb() {
+            if vram <= 8 {
+                if let Some(p) = profiles.iter().find(|p| p.id == "qwen_2.1_8gb") {
+                    log(&format!("Profile auto-selected 8GB quant profile for {vram}GB GPU"));
+                    return p.clone();
+                }
+            }
+        }
+        profiles.first().cloned().expect("at least one profile")
+    }
+
+    pub fn load() -> Profile {
+        let cfg = Config::load();
+        Self::load_with_cfg(&cfg)
+    }
+
     pub fn file(&self, cat: &str) -> String {
         self.models.iter().find(|m| m.category == cat).map(|m| m.filename.clone()).unwrap_or_default()
     }
@@ -179,6 +225,7 @@ pub struct Shared {
     pub cfg: Mutex<Config>,
     pub pending_models_dir: Mutex<Option<PathBuf>>,
     pub migration_status: Mutex<Option<String>>,
+    pub active_profile: Mutex<Profile>,
 }
 
 impl Shared {
@@ -194,6 +241,7 @@ impl Shared {
             cfg: Mutex::new(Config::load()),
             pending_models_dir: Mutex::new(None),
             migration_status: Mutex::new(None),
+            active_profile: Mutex::new(Profile::load()),
         })
     }
 }
@@ -817,7 +865,7 @@ fn bootstrap_models(
     Ok(())
 }
 
-pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Context) {
+pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let ping_client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(1200)).build().unwrap();
         let dl_client = reqwest::blocking::Client::builder()
@@ -835,6 +883,7 @@ pub fn start_supervisor(sh: Arc<Shared>, profile: Profile, ctx: eframe::egui::Co
         let mut consecutive_crashes = 0usize;
 
         loop {
+            let profile = sh.active_profile.lock().unwrap().clone();
             let clean_requested = sh.clean_engine.swap(false, Ordering::SeqCst);
             let retry_requested = sh.retry.swap(false, Ordering::SeqCst);
             let restart_requested = sh.restart.swap(false, Ordering::SeqCst);
