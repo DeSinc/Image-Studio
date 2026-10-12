@@ -110,22 +110,53 @@ pub struct ProfileFile {
 }
 
 pub fn detect_gpu_vram_gb() -> Option<u32> {
-    let mut cmd = Command::new("nvidia-smi");
-    cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .creation_flags(CREATE_NO_WINDOW);
-    if let Ok(out) = cmd.output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(first_line) = s.lines().next() {
-                if let Ok(mib) = first_line.trim().parse::<u32>() {
-                    let gb = (mib as f32 / 1024.0).round() as u32;
-                    log(&format!("detect_gpu_vram: nvidia-smi reported {mib} MiB ({gb} GB)"));
-                    return Some(gb);
+    static CACHE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let mut cmd = Command::new("nvidia-smi");
+        cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+            .creation_flags(CREATE_NO_WINDOW);
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if let Some(first_line) = s.lines().next() {
+                    if let Ok(mib) = first_line.trim().parse::<u32>() {
+                        let gb = (mib as f32 / 1024.0).round() as u32;
+                        log(&format!("detect_gpu_vram: nvidia-smi reported {mib} MiB ({gb} GB)"));
+                        return Some(gb);
+                    }
                 }
             }
         }
+        None
+    })
+}
+
+pub fn candidate_models_dirs(cfg: &Config) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(m) = &cfg.models_dir {
+        dirs.push(m.clone());
     }
-    None
+    if let Some(h) = dirs::home_dir() {
+        dirs.push(h.join("ComfyUI-Shared").join("models"));
+    }
+    if let Some(cd) = find_comfy(cfg) {
+        dirs.push(cd.join("models"));
+        if let Some(parent) = cd.parent() {
+            dirs.push(parent.join("models"));
+        }
+    }
+    let d = data_dir();
+    dirs.push(d.join("engine").join("ComfyUI").join("models"));
+    dirs.push(d.join("engine").join("ComfyUI_windows_portable").join("ComfyUI").join("models"));
+    dirs.push(d.join("ComfyUI").join("models"));
+    dirs.push(d.join("models"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("models"));
+            dirs.push(parent.join("ComfyUI").join("models"));
+        }
+    }
+    dirs
 }
 
 impl Profile {
@@ -143,20 +174,50 @@ impl Profile {
 
     pub fn load_with_cfg(cfg: &Config) -> Profile {
         let profiles = Self::all();
+        // 1. Explicit user choice in config.json
         if let Some(ref aid) = cfg.active_profile {
             if let Some(p) = profiles.iter().find(|p| &p.id == aid) {
                 return p.clone();
             }
         }
+
+        // 2. Check existing models on disk: NEVER force redownload for existing installs!
+        let candidates = candidate_models_dirs(cfg);
+        let has_int8 = candidates.iter().any(|d| {
+            d.join("text_encoders").join("qwen3vl_8b_int8_convrot.safetensors").is_file()
+        });
+        let has_w4a8 = candidates.iter().any(|d| {
+            d.join("text_encoders").join("qwen3vl_8b_w4a8.safetensors").is_file()
+        });
+
+        if has_int8 {
+            if let Some(p) = profiles.iter().find(|p| p.id == "qwen_2.1_int8") {
+                log("Profile: detected existing INT8 models on disk; preserving qwen_2.1_int8 profile");
+                return p.clone();
+            }
+        } else if has_w4a8 {
+            if let Some(p) = profiles.iter().find(|p| p.id == "qwen_2.1_8gb") {
+                log("Profile: detected existing W4A8 models on disk; preserving qwen_2.1_8gb profile");
+                return p.clone();
+            }
+        }
+
+        // 3. New install with no text encoder downloaded yet: auto-detect based on VRAM
         if let Some(vram) = detect_gpu_vram_gb() {
             if vram <= 8 {
                 if let Some(p) = profiles.iter().find(|p| p.id == "qwen_2.1_8gb") {
-                    log(&format!("Profile auto-selected 8GB quant profile for {vram}GB GPU"));
+                    log(&format!("Profile: fresh install auto-selected 8GB quant profile for {vram}GB GPU"));
                     return p.clone();
                 }
             }
         }
-        profiles.first().cloned().expect("at least one profile")
+
+        // 4. Default to standard int8 profile
+        if let Some(p) = profiles.iter().find(|p| p.id == "qwen_2.1_int8") {
+            p.clone()
+        } else {
+            profiles.first().cloned().expect("at least one profile")
+        }
     }
 
     pub fn load() -> Profile {
@@ -486,7 +547,7 @@ pub fn find_models(cfg: &Config, comfy: &Path) -> PathBuf {
         return m.clone();
     }
     if let Some(h) = dirs::home_dir() {
-        let s = h.join("ComfyUI-Shared/models");
+        let s = h.join("ComfyUI-Shared").join("models");
         if s.exists() {
             return s;
         }
