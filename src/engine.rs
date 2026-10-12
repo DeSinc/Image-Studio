@@ -811,6 +811,12 @@ fn fresh_engine_dir(root: &Path) -> Result<PathBuf, String> {
     Err("Cannot allocate an isolated engine directory.".into())
 }
 
+pub fn safe_model_path(base: &Path, category: &str, filename: &str) -> PathBuf {
+    let safe_cat = Path::new(category).file_name().unwrap_or_else(|| std::ffi::OsStr::new(category));
+    let safe_file = Path::new(filename).file_name().unwrap_or_else(|| std::ffi::OsStr::new(filename));
+    base.join(safe_cat).join(safe_file)
+}
+
 fn bootstrap_models(
     sh: &Shared,
     ctx: &eframe::egui::Context,
@@ -827,7 +833,7 @@ fn bootstrap_models(
     let missing: Vec<_> = profile
         .models
         .iter()
-        .filter(|m| !current_models_dir.join(&m.category).join(&m.filename).exists())
+        .filter(|m| !safe_model_path(&current_models_dir, &m.category, &m.filename).exists())
         .cloned()
         .collect();
 
@@ -842,7 +848,7 @@ fn bootstrap_models(
         if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
             current_models_dir = p;
         }
-        let dest = current_models_dir.join(&m.category).join(&m.filename);
+        let dest = safe_model_path(&current_models_dir, &m.category, &m.filename);
         log(&format!("bootstrap: downloading model {} -> {}", m.filename, dest.display()));
 
         let cur_file = m.filename.clone();
@@ -913,7 +919,7 @@ fn bootstrap_models(
 
         if let Some(target) = sh.pending_models_dir.lock().unwrap().clone() {
             if target != current_models_dir {
-                let target_dest = target.join(&m.category).join(&m.filename);
+                let target_dest = safe_model_path(&target, &m.category, &m.filename);
                 log(&format!("bootstrap: moving finished model file to new storage: {} -> {}", dest.display(), target_dest.display()));
                 let _ = move_file_robust(&dest, &target_dest);
                 current_models_dir = target;
