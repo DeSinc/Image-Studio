@@ -84,13 +84,20 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
                     let clean = text.trim_start_matches('\u{feff}').trim();
                     match serde_json::from_str::<RemoteVersion>(clean) {
                         Ok(info) => {
-                            let mut st = state.lock().unwrap();
-                            st.checked = true;
-                            st.latest_version = info.version.clone();
-                            st.download_url = info.download_url.clone();
-                            st.changelog = info.changelog;
-                            st.error = None;
-                            st.update_available = is_newer(&info.version, current_ver);
+                            let is_new = is_newer(&info.version, current_ver);
+                            let should_auto_dl = {
+                                let mut st = state.lock().unwrap();
+                                st.checked = true;
+                                st.latest_version = info.version.clone();
+                                st.download_url = info.download_url.clone();
+                                st.changelog = info.changelog;
+                                st.error = None;
+                                st.update_available = is_new;
+                                is_new && !st.downloading && !st.update_applied
+                            };
+                            if should_auto_dl {
+                                download_and_install_update(state.clone(), ctx.clone());
+                            }
                         }
                         Err(e) => {
                             let mut st = state.lock().unwrap();
@@ -112,6 +119,36 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
         }
         ctx.request_repaint();
     });
+}
+
+/// Detaches and cleanly restarts the newly updated ImageStudio application
+pub fn restart_application() {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let target_exe = if exe.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("old")).unwrap_or(false) {
+        exe.with_extension("exe")
+    } else {
+        exe
+    };
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+
+        let target_str = target_exe.to_string_lossy().to_string();
+        let cmd_script = format!("timeout /t 1 /nobreak > nul & start \"\" \"{}\"", target_str);
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", &cmd_script]);
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
+        let _ = cmd.spawn();
+        std::process::exit(0);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new(target_exe).spawn();
+        std::process::exit(0);
+    }
 }
 
 /// Downloads new ImageStudio executable and stages it for replacement

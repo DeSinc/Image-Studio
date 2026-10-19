@@ -340,6 +340,7 @@ pub fn run(
         names.push(upload(&c, png, &filename)?);
         temp_files.push(filename);
     }
+    prepare_clean_slate(&c, status);
     status("Queueing...".into());
     let body = json!({"prompt": workflow(p, &names), "client_id": "image-studio"});
     let r = c.post(format!("{}/prompt", base_url())).json(&body).send().map_err(|e| format!("queue: {e}"))?;
@@ -456,6 +457,8 @@ pub fn run_video(
         temp_files.push(filename);
     }
 
+    prepare_clean_slate(&c, status);
+
     status("Queueing video generation...".into());
     let body = json!({ "prompt": workflow_video(p, image_name.as_deref()), "client_id": "image-studio" });
     let r = c.post(format!("{}/prompt", base_url())).json(&body).send().map_err(|e| format!("queue: {e}"))?;
@@ -556,6 +559,30 @@ pub fn run_video(
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Timed out (video generation took > 1hr)".into());
         }
+    }
+}
+
+fn prepare_clean_slate(c: &Client, status: &dyn Fn(String)) {
+    let base = base_url();
+    // 1. Clear residual queue
+    let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
+
+    // 2. Wait up to 3 seconds if an old job is currently finishing its abort/unwind
+    let t0 = Instant::now();
+    let mut notified = false;
+    while t0.elapsed() < Duration::from_millis(3000) {
+        let q: Value = c.get(format!("{base}/queue")).send().ok().and_then(|r| r.json().ok()).unwrap_or(Value::Null);
+        let running_count = q["queue_running"].as_array().map(|a| a.len()).unwrap_or(0);
+        if running_count == 0 {
+            break;
+        }
+        if !notified {
+            status("Waiting for engine to settle...".into());
+            notified = true;
+        }
+        let _ = c.post(format!("{base}/interrupt")).send();
+        let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 

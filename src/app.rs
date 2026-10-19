@@ -1764,10 +1764,7 @@ fn is_win_ctrl_v() -> bool {
             );
             let resp = resp.on_hover_text("Update ready! Click to restart Image Studio now");
             if resp.clicked() {
-                if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(exe).spawn();
-                    std::process::exit(0);
-                }
+                crate::updater::restart_application();
             }
         } else if is_dl {
             let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 24.0), Sense::hover());
@@ -2194,15 +2191,11 @@ fn is_win_ctrl_v() -> bool {
                 heading(ui, "AI PROMPT ENHANCER");
                 let chk = egui::Checkbox::new(&mut self.video_prompt_enhance, RichText::new("Gemma 3 12B Enhancer").strong());
                 ui.add(chk);
-                if self.video_prompt_enhance {
-                    ui.label(
-                        RichText::new("Active: Expands prompt into a cinematic script via local Gemma 3 (~2 min).")
-                            .size(10.5)
-                            .color(GREEN),
-                    );
-                } else {
-                    ui.label(RichText::new("Off (Fast): Encodes your exact prompt directly in <1s with zero LLM overhead.").size(10.5).color(DIM));
-                }
+                ui.label(
+                    RichText::new("Expands short prompts into detailed cinematic visual scripts using local Gemma 3 12B before rendering.")
+                        .size(10.5)
+                        .color(DIM),
+                );
             });
 
             ui.add_space(6.0);
@@ -3791,6 +3784,48 @@ fn is_win_ctrl_v() -> bool {
                 }
             }
         }
+
+        if self.generating {
+            let status_txt = if self.is_swapping_detected {
+                if let Some((v, max)) = self.progress {
+                    format!("{}/{} • VRAM paging active (~{:.1}s/step)", v, max, self.step_duration_ema)
+                } else {
+                    "VRAM paging active".to_string()
+                }
+            } else if let Some((v, max)) = self.progress {
+                format!("{}/{} • {}", v, max, self.status)
+            } else {
+                self.status.clone()
+            };
+            let status_col = if self.is_swapping_detected { AMBER } else { TEXT };
+
+            let canvas_rect = ui.max_rect();
+            let margin = 14.0;
+            egui::Area::new(egui::Id::new("floating_canvas_generation_status"))
+                .fixed_pos(pos2(canvas_rect.right() - margin, canvas_rect.bottom() - margin))
+                .pivot(egui::Align2::RIGHT_BOTTOM)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(CARD_HI)
+                        .stroke(Stroke::new(1.0, if self.is_swapping_detected { AMBER } else { ACCENT }))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(14, 9))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 2],
+                            blur: 10,
+                            spread: 0,
+                            color: Color32::from_black_alpha(150),
+                        })
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new(status_txt).size(12.0).color(status_col).strong());
+                            });
+                        });
+                });
+        }
     }
 
     // Bottom Docked ChatGPT-style Prompt & Action Bar
@@ -4018,7 +4053,6 @@ fn is_win_ctrl_v() -> bool {
                                         let base = engine::base_url();
                                         let _ = c.post(format!("{base}/interrupt")).send();
                                         let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
-                                        let _ = c.post(format!("{base}/free")).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
                                     }
                                 });
                             }
@@ -4044,21 +4078,6 @@ fn is_win_ctrl_v() -> bool {
                                 }
                                 ui.add_space(4.0);
                             }
-
-                            let status_txt = if self.is_swapping_detected {
-                                if let Some((v, max)) = self.progress {
-                                    format!("{}/{} • [!] VRAM paging active (~{:.1}s/step)", v, max, self.step_duration_ema)
-                                } else {
-                                    "[!] VRAM paging active".to_string()
-                                }
-                            } else if let Some((v, max)) = self.progress {
-                                format!("{}/{} ({})", v, max, self.status)
-                            } else {
-                                self.status.clone()
-                            };
-                            let status_col = if self.is_swapping_detected { AMBER } else { DIM };
-                            ui.label(RichText::new(status_txt).size(11.5).color(status_col));
-                            ui.spinner();
                         }
                     });
                 });
@@ -4150,10 +4169,7 @@ fn is_win_ctrl_v() -> bool {
                             if applied {
                                 ui.label(RichText::new("Update installed successfully! Restart Image Studio to use the new version.").color(DISCORD_GREEN).strong());
                                 if ui.button("Restart Image Studio Now").clicked() {
-                                    if let Ok(exe) = std::env::current_exe() {
-                                        let _ = std::process::Command::new(exe).spawn();
-                                        std::process::exit(0);
-                                    }
+                                    crate::updater::restart_application();
                                 }
                             } else if is_dl {
                                 ui.label(RichText::new(format!("Downloading update: {:.0}%", dl_prog * 100.0)).size(12.0).color(ACCENT));

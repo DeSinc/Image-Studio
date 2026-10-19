@@ -1617,7 +1617,7 @@ pub fn adopt_into_kill_job() {
             return;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         let ok1 = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
