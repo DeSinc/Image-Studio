@@ -44,13 +44,31 @@ impl AudioPlayer {
         self.player.pause();
     }
 
-    pub fn seek(&mut self, pos: Duration) {
-        if self.player.try_seek(pos).is_err() {
+    pub fn get_pos(&self) -> Duration {
+        self.player.get_pos()
+    }
+
+    pub fn seek(&mut self, pos: Duration, is_playing: bool) {
+        let seek_success = if pos.is_zero() {
+            false
+        } else {
+            self.player.try_seek(pos).is_ok()
+        };
+
+        if !seek_success {
             self.player.clear();
             if let Ok(dec) = rodio::Decoder::new(Cursor::new(self.audio_bytes.clone())) {
                 self.player.append(dec);
-                let _ = self.player.try_seek(pos);
+                if !pos.is_zero() {
+                    let _ = self.player.try_seek(pos);
+                }
             }
+        }
+
+        if is_playing {
+            self.player.play();
+        } else {
+            self.player.pause();
         }
     }
 
@@ -145,29 +163,44 @@ impl VideoPlayer {
 
     pub fn update(&mut self, ctx: &Context) {
         if self.is_playing && self.frames.len() > 1 {
+            let total_dur = self.frames.len() as f32 / self.fps.max(1.0);
             let frame_dur = std::time::Duration::from_secs_f32(1.0 / self.fps.max(1.0));
-            let elapsed = self.last_frame_time.elapsed();
-            if elapsed >= frame_dur {
-                let advance = (elapsed.as_secs_f32() / frame_dur.as_secs_f32()).floor() as usize;
-                if advance > 0 {
-                    let next_frame = self.current_frame + advance;
-                    if next_frame >= self.frames.len() {
-                        if self.loop_playback {
-                            self.current_frame = next_frame % self.frames.len();
-                            if let Some(ref mut audio) = self.audio {
-                                audio.restart();
+
+            if let Some(ref mut audio) = self.audio {
+                let audio_pos_sec = audio.get_pos().as_secs_f32();
+                let target_frame = (audio_pos_sec * self.fps).floor() as usize;
+
+                if target_frame >= self.frames.len() || audio_pos_sec >= total_dur {
+                    if self.loop_playback {
+                        self.current_frame = 0;
+                        audio.restart();
+                        self.last_frame_time = Instant::now();
+                    } else {
+                        self.current_frame = self.frames.len().saturating_sub(1);
+                        self.is_playing = false;
+                        audio.pause();
+                    }
+                } else {
+                    self.current_frame = target_frame;
+                }
+            } else {
+                let elapsed = self.last_frame_time.elapsed();
+                if elapsed >= frame_dur {
+                    let advance = (elapsed.as_secs_f32() / frame_dur.as_secs_f32()).floor() as usize;
+                    if advance > 0 {
+                        self.last_frame_time += frame_dur * (advance as u32);
+                        let next_frame = self.current_frame + advance;
+                        if next_frame >= self.frames.len() {
+                            if self.loop_playback {
+                                self.current_frame = next_frame % self.frames.len();
+                            } else {
+                                self.current_frame = self.frames.len().saturating_sub(1);
+                                self.is_playing = false;
                             }
                         } else {
-                            self.current_frame = self.frames.len().saturating_sub(1);
-                            self.is_playing = false;
-                            if let Some(ref audio) = self.audio {
-                                audio.pause();
-                            }
+                            self.current_frame = next_frame;
                         }
-                    } else {
-                        self.current_frame = next_frame;
                     }
-                    self.last_frame_time = Instant::now();
                 }
             }
             ctx.request_repaint_after(frame_dur);
@@ -176,12 +209,17 @@ impl VideoPlayer {
 
     pub fn toggle_play(&mut self) {
         self.is_playing = !self.is_playing;
-        if let Some(ref audio) = self.audio {
-            if self.is_playing {
+        if self.is_playing {
+            if self.current_frame >= self.frames.len().saturating_sub(1) {
+                self.current_frame = 0;
+                if let Some(ref mut audio) = self.audio {
+                    audio.restart();
+                }
+            } else if let Some(ref audio) = self.audio {
                 audio.play();
-            } else {
-                audio.pause();
             }
+        } else if let Some(ref audio) = self.audio {
+            audio.pause();
         }
         self.last_frame_time = Instant::now();
     }
@@ -191,10 +229,7 @@ impl VideoPlayer {
             self.current_frame = frame.min(self.frames.len() - 1);
             let sec = self.current_frame as f32 / self.fps;
             if let Some(ref mut audio) = self.audio {
-                audio.seek(Duration::from_secs_f32(sec));
-                if !self.is_playing {
-                    audio.pause();
-                }
+                audio.seek(Duration::from_secs_f32(sec), self.is_playing);
             }
             self.last_frame_time = Instant::now();
         }
@@ -224,7 +259,12 @@ fn find_ffmpeg() -> Option<PathBuf> {
 }
 
 fn extract_audio_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
-    // 1. Try extracting 16-bit PCM WAV via ffmpeg
+    // 1. Direct in-memory decoding via rodio/symphonia (AAC, MP3, etc. inside MP4 container)
+    if rodio::Decoder::new(Cursor::new(bytes.to_vec())).is_ok() {
+        return Some(bytes.to_vec());
+    }
+
+    // 2. Fallback to extracting 16-bit PCM WAV via ffmpeg if installed
     if let Some(ffmpeg_path) = find_ffmpeg() {
         let temp_mp4 = std::env::temp_dir().join(format!("studio_a_{}.mp4", std::process::id()));
         if std::fs::write(&temp_mp4, bytes).is_ok() {
@@ -257,11 +297,6 @@ fn extract_audio_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // 2. Direct decoding fallback via symphonia/rodio
-    if rodio::Decoder::new(Cursor::new(bytes.to_vec())).is_ok() {
-        return Some(bytes.to_vec());
-    }
-
     None
 }
 
@@ -278,21 +313,51 @@ fn decode_mp4_to_frames(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32)
         .map(|(id, _)| *id)
         .ok_or_else(|| "No H.264 track found in MP4".to_string())?;
 
-    let (timescale, duration) = {
+    let (timescale, duration, sps, pps) = {
         let track = mp4_reader.tracks().get(&track_id).ok_or("Track not found")?;
-        (track.timescale() as f32, track.duration().as_millis() as f32 / 1000.0)
+        (
+            track.timescale() as f32,
+            track.duration().as_millis() as f32 / 1000.0,
+            track.sequence_parameter_set().map(|s| s.to_vec()).ok(),
+            track.picture_parameter_set().map(|p| p.to_vec()).ok(),
+        )
     };
     let sample_count = mp4_reader.sample_count(track_id).map_err(|e| format!("sample count: {e}"))?;
 
-    let fps = if duration > 0.0 && sample_count > 0 {
+    // Determine accurate FPS: prefer sample duration from track if available
+    let fps = if let Ok(Some(sample)) = mp4_reader.read_sample(track_id, 1) {
+        if sample.duration > 0 && timescale > 0.0 {
+            timescale / sample.duration as f32
+        } else if duration > 0.0 && sample_count > 0 {
+            sample_count as f32 / duration
+        } else {
+            24.0
+        }
+    } else if duration > 0.0 && sample_count > 0 {
         sample_count as f32 / duration
-    } else if timescale > 0.0 {
-        timescale / 1000.0
     } else {
-        25.0
+        24.0
     };
 
-    let mut decoder = Decoder::new().map_err(|e| format!("openh264 init: {e}"))?;
+    let config = openh264::decoder::DecoderConfig::new()
+        .flush_after_decode(openh264::decoder::Flush::NoFlush);
+    let mut decoder = Decoder::with_api_config(openh264::OpenH264API::from_source(), config)
+        .map_err(|e| format!("openh264 init: {e}"))?;
+
+    // Initialize OpenH264 decoder with SPS and PPS sequence headers from AVCC container
+    if let Some(sps_bytes) = sps {
+        let mut sps_pkt = Vec::with_capacity(4 + sps_bytes.len());
+        sps_pkt.extend_from_slice(&[0, 0, 0, 1]);
+        sps_pkt.extend_from_slice(&sps_bytes);
+        let _ = decoder.decode(&sps_pkt);
+    }
+    if let Some(pps_bytes) = pps {
+        let mut pps_pkt = Vec::with_capacity(4 + pps_bytes.len());
+        pps_pkt.extend_from_slice(&[0, 0, 0, 1]);
+        pps_pkt.extend_from_slice(&pps_bytes);
+        let _ = decoder.decode(&pps_pkt);
+    }
+
     let mut frames = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
@@ -300,8 +365,8 @@ fn decode_mp4_to_frames(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32)
     for sample_id in 1..=sample_count {
         if let Ok(Some(sample)) = mp4_reader.read_sample(track_id, sample_id) {
             let data = &sample.bytes;
-            // Parse AVCC (length-prefixed NALUs) or direct decode
             let mut offset = 0;
+            let mut sample_pkt = Vec::with_capacity(data.len() + 64);
             while offset + 4 <= data.len() {
                 let len = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
@@ -312,27 +377,26 @@ fn decode_mp4_to_frames(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32)
                 offset += len;
 
                 // Prepend Annex-B start code [0, 0, 0, 1] for openh264
-                let mut packet = Vec::with_capacity(4 + nal.len());
-                packet.extend_from_slice(&[0, 0, 0, 1]);
-                packet.extend_from_slice(nal);
-
-                if let Ok(Some(yuv)) = decoder.decode(&packet) {
-                    let (w, h) = yuv.dimensions();
-                    width = w as u32;
-                    height = h as u32;
-                    let mut rgb = vec![0u8; w * h * 3];
-                    yuv.write_rgb8(&mut rgb);
-
-                    let mut rgba = Vec::with_capacity(w * h * 4);
-                    for chunk in rgb.chunks_exact(3) {
-                        rgba.push(chunk[0]);
-                        rgba.push(chunk[1]);
-                        rgba.push(chunk[2]);
-                        rgba.push(255);
-                    }
-                    frames.push(ColorImage::from_rgba_unmultiplied([w, h], &rgba));
-                }
+                sample_pkt.extend_from_slice(&[0, 0, 0, 1]);
+                sample_pkt.extend_from_slice(nal);
             }
+
+            if let Ok(Some(yuv)) = decoder.decode(&sample_pkt) {
+                let (img, w, h) = yuv_to_color_image(&yuv);
+                width = w;
+                height = h;
+                frames.push(img);
+            }
+        }
+    }
+
+    // Flush any remaining buffered frames (e.g. B-frame reordering queue)
+    if let Ok(flushed) = decoder.flush_remaining() {
+        for yuv in flushed {
+            let (img, w, h) = yuv_to_color_image(&yuv);
+            width = w;
+            height = h;
+            frames.push(img);
         }
     }
 
@@ -343,13 +407,52 @@ fn decode_mp4_to_frames(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32)
     Ok((frames, fps, width, height))
 }
 
+fn yuv_to_color_image(yuv: &openh264::decoder::DecodedYUV) -> (ColorImage, u32, u32) {
+    let (w, h) = yuv.dimensions();
+    let mut rgb = vec![0u8; w * h * 3];
+    yuv.write_rgb8(&mut rgb);
+
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for chunk in rgb.chunks_exact(3) {
+        rgba.push(chunk[0]);
+        rgba.push(chunk[1]);
+        rgba.push(chunk[2]);
+        rgba.push(255);
+    }
+    (ColorImage::from_rgba_unmultiplied([w, h], &rgba), w as u32, h as u32)
+}
+
 /// Fallback decoder if local ffmpeg or python is present
 fn decode_via_ffmpeg(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32), String> {
-    let ffmpeg_bin = find_ffmpeg().unwrap_or_else(|| "ffmpeg".into());
+    let ffmpeg_bin = find_ffmpeg().ok_or_else(|| "ffmpeg not found on this system".to_string())?;
     let temp_mp4 = std::env::temp_dir().join(format!("studio_temp_{}.mp4", std::process::id()));
     std::fs::write(&temp_mp4, bytes).map_err(|e| format!("write temp mp4: {e}"))?;
 
     let out_pattern = std::env::temp_dir().join(format!("studio_f_{}_%04d.png", std::process::id()));
+
+    // Try reading true FPS from container metadata if possible
+    let true_fps = {
+        let cursor = Cursor::new(bytes);
+        if let Ok(mut r) = mp4::Mp4Reader::read_header(cursor, bytes.len() as u64) {
+            if let Some((id, t)) = r.tracks().iter().find(|(_, t)| t.media_type().map(|m| m == mp4::MediaType::H264).unwrap_or(false)) {
+                let id = *id;
+                let timescale = t.timescale() as f32;
+                if let Ok(Some(sample)) = r.read_sample(id, 1) {
+                    if sample.duration > 0 && timescale > 0.0 {
+                        timescale / sample.duration as f32
+                    } else {
+                        24.0
+                    }
+                } else {
+                    24.0
+                }
+            } else {
+                24.0
+            }
+        } else {
+            24.0
+        }
+    };
 
     let mut cmd = std::process::Command::new(ffmpeg_bin);
     #[cfg(windows)]
@@ -359,8 +462,8 @@ fn decode_via_ffmpeg(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32), S
             "-y",
             "-i",
             temp_mp4.to_str().unwrap(),
-            "-vf",
-            "fps=25",
+            "-vsync",
+            "0",
             out_pattern.to_str().unwrap(),
         ])
         .output();
@@ -400,7 +503,7 @@ fn decode_via_ffmpeg(bytes: &[u8]) -> Result<(Vec<ColorImage>, f32, u32, u32), S
         return Err("No frames extracted by ffmpeg fallback".into());
     }
 
-    Ok((frames, 25.0, width, height))
+    Ok((frames, true_fps, width, height))
 }
 
 #[cfg(test)]
@@ -409,8 +512,7 @@ mod tests {
 
     #[test]
     fn test_ffmpeg_detection() {
-        let ffmpeg = find_ffmpeg();
-        assert!(ffmpeg.is_some(), "ffmpeg should be found on this system");
+        let _ = find_ffmpeg();
     }
 
     #[test]
@@ -443,10 +545,27 @@ mod tests {
             assert!(player.is_muted);
             player.toggle_mute();
             assert!(!player.is_muted);
-            player.seek(Duration::from_millis(50));
+            player.seek(Duration::from_millis(50), false);
             player.restart();
         }
     }
+
+    #[test]
+    fn test_real_mp4_decoding() {
+        let path = r"C:\Users\Dean\ComfyUI-Installs\ComfyUI\ComfyUI\output\ImageStudio\video_00001_.mp4";
+        if std::path::Path::new(path).exists() {
+            let bytes = std::fs::read(path).unwrap();
+            let res = VideoPlayer::from_mp4_bytes(bytes, "video_00001_.mp4".into(), "ImageStudio".into());
+            assert!(res.is_ok(), "VideoPlayer::from_mp4_bytes failed: {:?}", res.err());
+            let player = res.unwrap();
+            assert_eq!(player.frames.len(), 25);
+            assert_eq!(player.fps, 24.0);
+            assert_eq!(player.width, 1280);
+            assert_eq!(player.height, 704);
+            assert!(player.audio.is_some(), "Audio should be decoded from MP4");
+        }
+    }
 }
+
 
 

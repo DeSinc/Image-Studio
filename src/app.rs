@@ -3250,7 +3250,9 @@ fn is_win_ctrl_v() -> bool {
                         if let Some(pos) = scrub_resp.interact_pointer_pos() {
                             let rel_x = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
                             let target_frame = (rel_x * max_f as f32).round() as usize;
-                            player.seek(target_frame);
+                            if scrub_resp.clicked() || target_frame != player.current_frame {
+                                player.seek(target_frame);
+                            }
                         }
                     }
                 }
