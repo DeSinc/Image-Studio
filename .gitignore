@@ -40,6 +40,10 @@ config.json
 .gemini/
 scratch/
 
+# Local deployment & agent config
+deploy.ps1
+GEMINI.md
+
 # OS artifacts
 Thumbs.db
 [Dd]esktop.ini
