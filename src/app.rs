@@ -2050,12 +2050,12 @@ fn is_win_ctrl_v() -> bool {
                 // 2. Clean Presets: 360p, 480p, 720p, 1080p, 1440p, 4K
                 let is_portrait = self.video_orientation == VideoOrientation::Portrait;
                 let presets: [(&str, u32, u32, &str); 6] = [
-                    ("360p", 640, 352, "640x352 • Fast preview, minimal VRAM"),
-                    ("480p", 864, 480, "864x480 • Smooth preview, standard definition"),
-                    ("720p", 1280, 720, "1280x720 • Standard HD (Recommended standard)"),
-                    ("1080p", 1920, 1080, "1920x1080 • Full HD (Crisp, requires ~16GB VRAM)"),
-                    ("1440p", 2560, 1440, "2560x1440 • 2K Quad HD (Requires ~22GB VRAM)"),
-                    ("4K", 3840, 2160, "3840x2160 • Ultra HD (Requires 32GB+ VRAM or heavy paging)"),
+                    ("360p", 640, 384, "640x384 • Fast preview, minimal VRAM"),
+                    ("480p", 832, 448, "832x448 • Smooth preview, standard definition"),
+                    ("720p", 1280, 704, "1280x704 • Standard HD (Recommended standard)"),
+                    ("1080p", 1920, 1088, "1920x1088 • Full HD (Crisp, requires ~16GB VRAM)"),
+                    ("1440p", 2560, 1408, "2560x1408 • 2K Quad HD (Requires ~22GB VRAM)"),
+                    ("4K", 3840, 2176, "3840x2176 • Ultra HD (Requires 32GB+ VRAM or heavy paging)"),
                 ];
 
                 ui.horizontal_wrapped(|ui| {
@@ -3792,8 +3792,12 @@ fn is_win_ctrl_v() -> bool {
                 } else {
                     "VRAM paging active".to_string()
                 }
-            } else if let Some((v, max)) = self.progress {
-                format!("{}/{} • {}", v, max, self.status)
+            } else if self.status.contains("diffusion") || self.status.contains("Generating...") {
+                if let Some((v, max)) = self.progress {
+                    format!("{}/{} • {}", v, max, self.status)
+                } else {
+                    self.status.clone()
+                }
             } else {
                 self.status.clone()
             };
@@ -4629,7 +4633,7 @@ mod tests {
         let vram_720p_9s = estimate_video_vram_gb(1280, 720, 9, 24);
         assert!(vram_720p_9s > 13.0, "720p 9s should exceed 12GB VRAM and trigger warning");
 
-        let vram_360p_5s = estimate_video_vram_gb(640, 352, 5, 24);
+        let vram_360p_5s = estimate_video_vram_gb(640, 384, 5, 24);
         assert!(vram_360p_5s < 10.5, "360p 5s should require minimal VRAM");
 
         let vram_4k_5s = estimate_video_vram_gb(3840, 2160, 5, 24);

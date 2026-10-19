@@ -3,7 +3,7 @@ use crate::engine::base_url;
 use reqwest::blocking::{multipart, Client};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct GenResult {
@@ -117,6 +117,8 @@ fn workflow(p: &Params, names: &[String]) -> Value {
 }
 
 fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
+    let w = ((p.width.max(128) + 31) / 64) * 64;
+    let h = ((p.height.max(128) + 31) / 64) * 64;
     let mut g = json!({
         "316": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": p.ckpt_name } },
         "317": { "class_type": "LTXAVTextEncoderLoader", "inputs": { "text_encoder": p.text_encoder, "ckpt_name": p.ckpt_name, "device": "default" } },
@@ -135,7 +137,7 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
         "304": { "class_type": "LTXVConditioning", "inputs": { "positive": ["303", 0], "negative": ["313", 0], "frame_rate": p.fps as f32 } },
         "314": { "class_type": "CFGGuider", "inputs": { "model": ["285", 0], "positive": ["304", 0], "negative": ["304", 1], "cfg": 1.0 } },
 
-        "295": { "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": p.width / 2, "height": p.height / 2, "length": (p.duration * p.fps + 1) as i64, "batch_size": 1 } },
+        "295": { "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w / 2, "height": h / 2, "length": (p.duration * p.fps + 1) as i64, "batch_size": 1 } },
         "305": { "class_type": "LTXVEmptyLatentAudio", "inputs": { "audio_vae": ["279", 0], "frames_number": (p.duration * p.fps + 1) as i64, "frame_rate": p.fps as i64, "batch_size": 1 } },
 
         "318": { "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["296", 0], "audio_latent": ["305", 0] } },
@@ -159,7 +161,7 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
     if let Some(img_name) = image_name {
         g["269"] = json!({ "class_type": "LoadImage", "inputs": { "image": img_name } });
         g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": p.width, "resize_type.height": p.height, "resize_type.crop": "center", "scale_method": "lanczos"
+            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
         }});
         g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
@@ -171,15 +173,15 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
 
         if p.prompt_enhance {
             g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
-                "clip": ["324", 1], "image": ["330", 0], "prompt": p.prompt, "max_length": 2048, "sampling_mode": "on",
+                "clip": ["324", 1], "image": ["330", 0], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
                 "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": true
+                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
             }});
         }
     } else {
         g["269"] = json!({ "class_type": "EmptyImage", "inputs": { "width": 512, "height": 512, "batch_size": 1, "color": 0 } });
         g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": p.width, "resize_type.height": p.height, "resize_type.crop": "center", "scale_method": "lanczos"
+            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
         }});
         g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
@@ -191,9 +193,9 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
 
         if p.prompt_enhance {
             g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
-                "clip": ["324", 1], "prompt": p.prompt, "max_length": 2048, "sampling_mode": "on",
+                "clip": ["324", 1], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
                 "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": true
+                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
             }});
         }
     }
@@ -237,8 +239,17 @@ fn explain(v: &Value) -> String {
     }
 }
 
+#[derive(Default)]
+struct WsTracker {
+    last_activity: Mutex<Option<Instant>>,
+    executing_node: Mutex<Option<String>>,
+    execution_error: Mutex<Option<String>>,
+    execution_interrupted: AtomicBool,
+}
+
 fn spawn_ws_progress(
     stop: Arc<AtomicBool>,
+    tracker: Arc<WsTracker>,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
     on_preview: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) {
@@ -290,14 +301,39 @@ fn spawn_ws_progress(
             if opcode == 0x1 {
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                        if val["type"] == "progress" {
-                            if let (Some(cur), Some(max)) = (val["data"]["value"].as_u64(), val["data"]["max"].as_u64()) {
-                                on_progress(cur as u32, max as u32);
+                        match val["type"].as_str() {
+                            Some("progress") => {
+                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                if let (Some(cur), Some(max)) = (val["data"]["value"].as_u64(), val["data"]["max"].as_u64()) {
+                                    on_progress(cur as u32, max as u32);
+                                }
                             }
+                            Some("executing") => {
+                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                let node = val["data"]["node"].as_str().map(|s| s.to_string());
+                                *tracker.executing_node.lock().unwrap() = node;
+                            }
+                            Some("execution_error") => {
+                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                let err = format!(
+                                    "{}: {}",
+                                    val["data"]["node_type"].as_str().unwrap_or("Engine"),
+                                    val["data"]["exception_message"].as_str().unwrap_or("Execution error")
+                                );
+                                *tracker.execution_error.lock().unwrap() = Some(err);
+                            }
+                            Some("execution_interrupted") => {
+                                tracker.execution_interrupted.store(true, Ordering::SeqCst);
+                            }
+                            Some("executed") => {
+                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                            }
+                            _ => {}
                         }
                     }
                 }
             } else if opcode == 0x2 && payload.len() > 8 {
+                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
                 let event = u32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
                 let img_bytes = if event == 1 {
                     Some(&payload[8..])
@@ -328,7 +364,8 @@ pub fn run(
     preview: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) -> Result<GenResult, String> {
     let ws_stop = Arc::new(AtomicBool::new(false));
-    spawn_ws_progress(ws_stop.clone(), progress, preview);
+    let tracker = Arc::new(WsTracker::default());
+    spawn_ws_progress(ws_stop.clone(), tracker.clone(), progress, preview);
 
     let c = Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
     let tag = p.seed % 100000;
@@ -353,15 +390,35 @@ pub fn run(
     let id = v["prompt_id"].as_str().ok_or("no prompt_id")?.to_string();
     let t0 = Instant::now();
     let mut consecutive_errs = 0;
+    let mut missing_queue_ticks = 0;
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::SeqCst) || tracker.execution_interrupted.load(Ordering::SeqCst) {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Cancelled".into());
         }
+
+        if let Some(err) = tracker.execution_error.lock().unwrap().take() {
+            let _ = c.post(format!("{}/interrupt", base_url())).send();
+            let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            ws_stop.store(true, Ordering::SeqCst);
+            return Err(err);
+        }
+
         std::thread::sleep(Duration::from_millis(500));
         let secs = t0.elapsed().as_secs();
+
+        // Stall watchdog: if no activity received for >120s during image generation, abort cleanly
+        let last_act = tracker.last_activity.lock().unwrap().unwrap_or(t0);
+        let inactive_secs = last_act.elapsed().as_secs();
+        if inactive_secs > 120 {
+            let _ = c.post(format!("{}/interrupt", base_url())).send();
+            let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            ws_stop.store(true, Ordering::SeqCst);
+            return Err(format!("Engine stalled (no progress for {inactive_secs}s). Queue cleared."));
+        }
+
         let h_res = c.get(format!("{}/history/{id}", base_url())).send();
         let h: Value = match h_res {
             Ok(r) => {
@@ -420,13 +477,27 @@ pub fn run(
                 return Err("Finished but produced no image".into());
             }
         }
+
         let q: Value = c.get(format!("{}/queue", base_url())).send().ok().and_then(|r| r.json().ok()).unwrap_or(Value::Null);
         let running = q["queue_running"].as_array().map(|a| a.iter().any(|x| x[1] == id.as_str())).unwrap_or(false);
+        let pending = q["queue_pending"].as_array().map(|a| a.iter().any(|x| x[1] == id.as_str())).unwrap_or(false);
+
+        if !running && !pending {
+            missing_queue_ticks += 1;
+            if missing_queue_ticks >= 4 {
+                ws_stop.store(true, Ordering::SeqCst);
+                return Err("Generation stopped: job left queue without producing image output".into());
+            }
+        } else {
+            missing_queue_ticks = 0;
+        }
+
         status(if running {
             format!("Generating... {secs}s")
         } else {
             format!("Waiting in queue... {secs}s")
         });
+
         if secs > 1800 {
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Timed out".into());
@@ -443,7 +514,8 @@ pub fn run_video(
     preview: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) -> Result<VideoGenResult, String> {
     let ws_stop = Arc::new(AtomicBool::new(false));
-    spawn_ws_progress(ws_stop.clone(), progress, preview);
+    let tracker = Arc::new(WsTracker::default());
+    spawn_ws_progress(ws_stop.clone(), tracker.clone(), progress, preview);
 
     let c = Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
     let tag = p.seed % 100000;
@@ -471,15 +543,47 @@ pub fn run_video(
     let id = v["prompt_id"].as_str().ok_or("no prompt_id")?.to_string();
     let t0 = Instant::now();
     let mut consecutive_errs = 0;
+    let mut missing_queue_ticks = 0;
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::SeqCst) || tracker.execution_interrupted.load(Ordering::SeqCst) {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Cancelled".into());
         }
+
+        if let Some(err) = tracker.execution_error.lock().unwrap().take() {
+            let _ = c.post(format!("{}/interrupt", base_url())).send();
+            let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            ws_stop.store(true, Ordering::SeqCst);
+            return Err(err);
+        }
+
         std::thread::sleep(Duration::from_millis(500));
         let secs = t0.elapsed().as_secs();
+
+        // Stall Watchdog: detect genuine hangs and automatically abort & clear queue
+        let active_node = tracker.executing_node.lock().unwrap().clone();
+        let last_act = tracker.last_activity.lock().unwrap().unwrap_or(t0);
+        let inactive_secs = last_act.elapsed().as_secs();
+        let max_inactive = if active_node.as_deref() == Some("325") { 150 } else { 180 };
+        if inactive_secs > max_inactive {
+            let _ = c.post(format!("{}/interrupt", base_url())).send();
+            let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            ws_stop.store(true, Ordering::SeqCst);
+            let stage_name = match active_node.as_deref() {
+                Some("325") => "prompt expansion (Gemma 3 12B)",
+                Some("283") => "Stage 1 video diffusion",
+                Some("287") => "spatial 2x upscaling",
+                Some("308") => "Stage 2 detail refinement",
+                Some("315") => "tiled VAE decoding",
+                Some("297") => "audio VAE decoding",
+                Some("310") | Some("75") => "MP4 video encoding",
+                _ => "pipeline execution",
+            };
+            return Err(format!("Engine stalled during {stage_name} (no activity for {inactive_secs}s). Queue cleared automatically."));
+        }
+
         let h_res = c.get(format!("{}/history/{id}", base_url())).send();
         let h: Value = match h_res {
             Ok(r) => {
@@ -548,16 +652,50 @@ pub fn run_video(
                 return Err("Finished but produced no video output".into());
             }
         }
+
         let q: Value = c.get(format!("{}/queue", base_url())).send().ok().and_then(|r| r.json().ok()).unwrap_or(Value::Null);
         let running = q["queue_running"].as_array().map(|a| a.iter().any(|x| x[1] == id.as_str())).unwrap_or(false);
-        status(if running {
-            format!("Generating video (high-load diffusion)... {secs}s")
+        let pending = q["queue_pending"].as_array().map(|a| a.iter().any(|x| x[1] == id.as_str())).unwrap_or(false);
+
+        if !running && !pending {
+            missing_queue_ticks += 1;
+            // If the prompt is gone from the queue for 2s without producing output, it failed/aborted
+            if missing_queue_ticks >= 4 {
+                ws_stop.store(true, Ordering::SeqCst);
+                return Err("Generation stopped: engine completed job without producing video output".into());
+            }
         } else {
-            format!("Waiting in queue... {secs}s")
-        });
-        if secs > 3600 {
+            missing_queue_ticks = 0;
+        }
+
+        // Informative live stage reporting
+        let status_text = match active_node.as_deref() {
+            Some("325") => format!("Expanding prompt with Gemma 3 12B... {secs}s"),
+            Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => {
+                format!("Staging model weights into VRAM... {secs}s")
+            }
+            Some("283") => format!("Generating video (Stage 1 diffusion)... {secs}s"),
+            Some("287") => format!("Upscaling video latents (2x spatial)... {secs}s"),
+            Some("308") => format!("Refining video details (Stage 2 diffusion)... {secs}s"),
+            Some("315") => format!("Decoding video frames (tiled VAE)... {secs}s"),
+            Some("297") => format!("Decoding audio track... {secs}s"),
+            Some("310") | Some("75") => format!("Assembling final MP4 video... {secs}s"),
+            Some(other) => format!("Processing node {other}... {secs}s"),
+            None => {
+                if pending {
+                    format!("Waiting in queue... {secs}s")
+                } else if running {
+                    format!("Preparing video generation... {secs}s")
+                } else {
+                    format!("Finalizing output... {secs}s")
+                }
+            }
+        };
+        status(status_text);
+
+        if secs > 1800 {
             ws_stop.store(true, Ordering::SeqCst);
-            return Err("Timed out (video generation took > 1hr)".into());
+            return Err("Timed out (video generation took > 30m)".into());
         }
     }
 }
