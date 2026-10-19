@@ -10,7 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub fn estimate_video_vram_gb(w: u32, h: u32, duration: u32, fps: u32) -> f32 {
+    let frames = (duration * fps) as f32;
+    let mp = (w * h) as f32 / 1_000_000.0;
+    let load_factor = mp * (frames / 24.0);
+    9.5 + load_factor * 0.55
+}
 
 const BG: Color32 = Color32::from_rgb(12, 14, 19);
 const PANEL: Color32 = Color32::from_rgb(18, 21, 29);
@@ -26,6 +33,18 @@ const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
 const MAX_REFS: usize = 15;
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum StudioMode {
+    Image,
+    Video,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum VideoOrientation {
+    Landscape,
+    Portrait,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
@@ -58,8 +77,15 @@ enum Ev {
         output_subfolder: String,
         temp_files: Vec<String>,
     },
+    VideoDone {
+        mp4_bytes: Vec<u8>,
+        output_filename: String,
+        output_subfolder: String,
+        temp_files: Vec<String>,
+    },
     GenErr(String),
 }
+
 
 struct Item {
     name: String,
@@ -88,6 +114,7 @@ pub struct HistoryNode {
     pub output_filename: String,
     pub output_subfolder: String,
     pub temp_files: Vec<String>,
+    pub mp4_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -245,6 +272,24 @@ pub struct App {
     queue: Vec<QueuedItem>,
     last_ctrl_v_down: bool,
     pub updater: Arc<std::sync::Mutex<crate::updater::UpdaterState>>,
+    pub mode: StudioMode,
+    pub video_orientation: VideoOrientation,
+    pub video_scale: f32,
+    pub video_base_w: u32,
+    pub video_base_h: u32,
+    pub video_player: Option<crate::video::VideoPlayer>,
+    pub video_duration: u32,
+    pub video_fps: u32,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub video_prompt_enhance: bool,
+    pub video_negative: String,
+    pub show_video_dl_modal: bool,
+    pub show_downloads_menu: bool,
+    pub last_progress_time: Option<Instant>,
+    pub last_progress_val: u32,
+    pub step_duration_ema: f32,
+    pub is_swapping_detected: bool,
 }
 
 fn rand_u64() -> u64 {
@@ -374,6 +419,24 @@ impl App {
             queue: Vec::new(),
             last_ctrl_v_down: false,
             updater,
+            mode: StudioMode::Image,
+            video_orientation: VideoOrientation::Landscape,
+            video_scale: 1.0,
+            video_base_w: 1280,
+            video_base_h: 720,
+            video_player: None,
+            video_duration: 5,
+            video_fps: 24,
+            video_width: 1280,
+            video_height: 720,
+            video_prompt_enhance: false,
+            video_negative: String::new(),
+            show_video_dl_modal: false,
+            show_downloads_menu: false,
+            last_progress_time: None,
+            last_progress_val: 0,
+            step_duration_ema: 0.0,
+            is_swapping_detected: false,
         }
     }
 
@@ -480,10 +543,35 @@ impl App {
         self.active_node_id = Some(id);
         self.compare_mode = false;
         if !self.generating {
-            if let Some(node) = self.find_node(id) {
-                if !node.prompt.is_empty() {
-                    self.prompt = node.prompt.clone();
+            let node_info = self.find_node(id).map(|n| (
+                n.prompt.clone(),
+                n.mp4_bytes.clone(),
+                n.output_filename.clone(),
+                n.output_subfolder.clone(),
+            ));
+            if let Some((prompt, mp4_bytes, out_fn, out_sub)) = node_info {
+                if !prompt.is_empty() {
+                    self.prompt = prompt;
                     self.focus_prompt = true;
+                }
+
+                // If selecting a video history node, load it in the video player
+                if let Some(mp4) = mp4_bytes {
+                    let already_loaded = self.video_player.as_ref()
+                        .map(|p| p.filename == out_fn && !out_fn.is_empty())
+                        .unwrap_or(false);
+                    if !already_loaded {
+                        if let Ok(player) = crate::video::VideoPlayer::from_mp4_bytes(
+                            mp4,
+                            out_fn,
+                            out_sub,
+                        ) {
+                            self.video_player = Some(player);
+                        }
+                    }
+                } else {
+                    // Selecting an image history node restores image canvas view
+                    self.video_player = None;
                 }
             }
         }
@@ -790,10 +878,144 @@ impl App {
         });
     }
 
-        fn start_generation(&mut self, ctx: &egui::Context) {
+    pub fn has_video_models(&self) -> bool {
+        let paths = self.sh.paths.lock().unwrap();
+        let models_dir = &paths.models;
+        models_dir.join("checkpoints").join("ltx-2.3-22b-dev-fp8.safetensors").exists()
+    }
+
+    fn start_generation(&mut self, ctx: &egui::Context) {
         let p = self.prompt.trim().to_string();
         self.prompt.clear();
-        self.start_generation_with_prompt(ctx, p);
+        if self.mode == StudioMode::Video {
+            self.start_video_generation_with_prompt(ctx, p);
+        } else {
+            self.start_generation_with_prompt(ctx, p);
+        }
+    }
+
+    fn start_video_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
+        // If a video is currently loaded in the player, automatically extract the frame
+        // the user has scrubbed to as the start frame for the next shot!
+        let (base_png_opt, scrubbed_frame_ci) = if let Some(ref player) = self.video_player {
+            let cur_idx = player.current_frame.min(player.frames.len().saturating_sub(1));
+            let cur_img = player.frames[cur_idx].clone();
+            let [f_w, f_h] = cur_img.size;
+            let mut png_bytes = Vec::new();
+            if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
+                let _ = image::DynamicImage::ImageRgba8(rgba)
+                    .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+            }
+            if !png_bytes.is_empty() {
+                (Some(png_bytes), Some(cur_img))
+            } else {
+                (self.active_node().map(|n| n.png.clone()), None)
+            }
+        } else {
+            (self.active_node().map(|n| n.png.clone()), None)
+        };
+        let is_t2v = base_png_opt.is_none();
+
+        self.generating = true;
+        self.status = if is_t2v {
+            "Generating video from text (LTX-2.3)...".into()
+        } else {
+            "Generating next shot from start frame (LTX-2.3)...".into()
+        };
+        self.error = None;
+        self.generating_parent_id = self.active_node_id;
+        self.generating_prompt = prompt.trim().to_string();
+
+        if let Some(pid) = self.active_node_id {
+            if let Some(parent) = self.nodes.iter_mut().find(|n| n.id == pid) {
+                parent.prompt = self.generating_prompt.clone();
+            }
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+
+        let seed = if self.random_seed { rand_u64() } else { self.seed };
+        if self.random_seed {
+            self.seed = seed;
+        }
+
+        self.generating_dims = Some((self.video_width, self.video_height));
+
+        let vparams = comfy::VideoParams {
+            prompt: self.generating_prompt.clone(),
+            negative: self.video_negative.clone(),
+            width: self.video_width,
+            height: self.video_height,
+            duration: self.video_duration,
+            fps: self.video_fps,
+            seed,
+            prompt_enhance: self.video_prompt_enhance,
+            ..Default::default()
+        };
+
+        self.progress = None;
+        if let Some(ci) = scrubbed_frame_ci {
+            self.preview_tex = Some(ctx.load_texture("locked_start_frame", ci, egui::TextureOptions::LINEAR));
+        } else {
+            self.preview_tex = None;
+        }
+        self.video_player = None;
+        self.last_progress_time = None;
+        self.last_progress_val = 0;
+        self.step_duration_ema = 0.0;
+        self.is_swapping_detected = false;
+
+        let tx_p = tx.clone();
+        let ctx_p = ctx.clone();
+        let prog_cb = Arc::new(move |value: u32, max: u32| {
+            let _ = tx_p.send(Ev::Progress { value, max });
+            ctx_p.request_repaint();
+        });
+
+        let tx_prev = tx.clone();
+        let ctx_prev = ctx.clone();
+        let prev_cb = Arc::new(move |bytes: Vec<u8>| {
+            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let ci = ColorImage::from_rgba_unmultiplied(
+                    [dyn_img.width() as usize, dyn_img.height() as usize],
+                    rgba.as_raw(),
+                );
+                let _ = tx_prev.send(Ev::Preview(ci));
+                ctx_prev.request_repaint();
+            }
+        });
+
+        std::thread::spawn(move || {
+            let res = comfy::run_video(
+                &vparams,
+                base_png_opt,
+                &cancel,
+                &|st: String| {
+                    let _ = tx.send(Ev::Status(st));
+                    ctx.request_repaint();
+                },
+                prog_cb,
+                prev_cb,
+            );
+            match res {
+                Ok(gen_res) => {
+                    let _ = tx.send(Ev::VideoDone {
+                        mp4_bytes: gen_res.mp4,
+                        output_filename: gen_res.output_filename,
+                        output_subfolder: gen_res.output_subfolder,
+                        temp_files: gen_res.temp_files,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Ev::GenErr(e));
+                }
+            }
+            ctx.request_repaint();
+        });
     }
 
     fn start_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
@@ -871,6 +1093,10 @@ impl App {
 
         self.progress = None;
         self.preview_tex = None;
+        self.last_progress_time = None;
+        self.last_progress_val = 0;
+        self.step_duration_ema = 0.0;
+        self.is_swapping_detected = false;
         let tx_p = tx.clone();
         let ctx_p = ctx.clone();
         let prog_cb = Arc::new(move |value: u32, max: u32| {
@@ -966,6 +1192,7 @@ impl App {
                                 output_filename: String::new(),
                                 output_subfolder: String::new(),
                                 temp_files: Vec::new(),
+                                mp4_bytes: None,
                             };
                             self.nodes.push(node);
                             self.ref_w = width;
@@ -997,6 +1224,38 @@ impl App {
                 Ev::Status(s) => self.status = s,
                 Ev::Progress { value, max } => {
                     self.progress = Some((value, max));
+                    let now = Instant::now();
+                    if let Some(last_t) = self.last_progress_time {
+                        let elapsed = last_t.elapsed().as_secs_f32();
+                        let step_diff = value.saturating_sub(self.last_progress_val);
+                        if step_diff > 0 {
+                            let per_step = elapsed / step_diff as f32;
+                            if self.step_duration_ema <= 0.0 {
+                                self.step_duration_ema = per_step;
+                            } else {
+                                self.step_duration_ema = self.step_duration_ema * 0.7 + per_step * 0.3;
+                            }
+                            if self.mode == StudioMode::Video {
+                                let vram_exceeded = if let Some(gpu_vram) = engine::detect_gpu_vram_gb() {
+                                    estimate_video_vram_gb(self.video_width, self.video_height, self.video_duration, self.video_fps) > gpu_vram as f32
+                                } else {
+                                    false
+                                };
+                                // Normal video diffusion step for LTX-2.3 is ~6s - 10s.
+                                // Severe shared system memory swapping causes steps to exceed 40s or stall.
+                                if (per_step > 40.0 || (self.step_duration_ema > 35.0 && value > 2)) && (vram_exceeded || per_step > 60.0) {
+                                    self.is_swapping_detected = true;
+                                }
+                            } else {
+                                // Normal image diffusion step is ~0.2s - 1.5s.
+                                if per_step > 8.0 || (self.step_duration_ema > 6.0 && value > 2) {
+                                    self.is_swapping_detected = true;
+                                }
+                            }
+                        }
+                    }
+                    self.last_progress_time = Some(now);
+                    self.last_progress_val = value;
                 }
                 Ev::Preview(img) => {
                     if self.generating {
@@ -1009,6 +1268,7 @@ impl App {
                     self.status = "Idle".into();
                     self.progress = None;
                     self.preview_tex = None;
+                    self.is_swapping_detected = false;
                     let [out_w, out_h] = img.size;
                     let id = self.next_node_id;
                     self.next_node_id += 1;
@@ -1048,6 +1308,7 @@ impl App {
                         output_filename,
                         output_subfolder,
                         temp_files,
+                        mp4_bytes: None,
                     };
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
@@ -1066,7 +1327,83 @@ impl App {
                     // Sequentially process next queued prompt in the chain
                     if !self.queue.is_empty() {
                         let next = self.queue.remove(0);
-                        self.start_generation_with_prompt(ctx, next.prompt);
+                        if self.mode == StudioMode::Video {
+                            self.start_video_generation_with_prompt(ctx, next.prompt);
+                        } else {
+                            self.start_generation_with_prompt(ctx, next.prompt);
+                        }
+                    }
+                }
+                Ev::VideoDone { mp4_bytes, output_filename, output_subfolder, temp_files } => {
+                    self.generating = false;
+                    self.generating_dims = None;
+                    self.status = "Idle".into();
+                    self.progress = None;
+                    self.preview_tex = None;
+                    self.is_swapping_detected = false;
+
+                    match crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone()) {
+                        Ok(player) => {
+                            if let Some(first) = player.frames.first() {
+                                let id = self.next_node_id;
+                                self.next_node_id += 1;
+                                let tex = ctx.load_texture(format!("video_frame_{id}"), first.clone(), egui::TextureOptions::LINEAR);
+                                let parent_id = self.generating_parent_id;
+                                let parent_step = parent_id.and_then(|pid| self.find_node(pid)).map(|n| n.step_num).unwrap_or(0);
+                                let step_num = if parent_id.is_some() { parent_step + 1 } else { 0 };
+                                let prompt_label = if self.generating_prompt.is_empty() {
+                                    format!("Video {}", id)
+                                } else {
+                                    let p = &self.generating_prompt;
+                                    if p.chars().count() > 22 {
+                                        format!("{}...", p.chars().take(22).collect::<String>())
+                                    } else {
+                                        p.clone()
+                                    }
+                                };
+
+                                let mut png_bytes = Vec::new();
+                                if let Some(rgba) = image::RgbaImage::from_raw(
+                                    first.size[0] as u32,
+                                    first.size[1] as u32,
+                                    first.as_raw().to_vec(),
+                                ) {
+                                    let _ = image::DynamicImage::ImageRgba8(rgba)
+                                        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+                                }
+
+                                let node = HistoryNode {
+                                    id,
+                                    parent_id,
+                                    label: prompt_label,
+                                    prompt: self.generating_prompt.clone(),
+                                    png: png_bytes,
+                                    tex,
+                                    width: player.width,
+                                    height: player.height,
+                                    step_num,
+                                    output_filename,
+                                    output_subfolder,
+                                    temp_files,
+                                    mp4_bytes: Some(player.mp4_bytes.clone()),
+                                };
+                                self.nodes.push(node);
+                                self.active_node_id = Some(id);
+                            }
+                            self.video_player = Some(player);
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Failed to decode video: {e}"));
+                        }
+                    }
+
+                    if !self.queue.is_empty() {
+                        let next = self.queue.remove(0);
+                        if self.mode == StudioMode::Video {
+                            self.start_video_generation_with_prompt(ctx, next.prompt);
+                        } else {
+                            self.start_generation_with_prompt(ctx, next.prompt);
+                        }
                     }
                 }
                 Ev::GenErr(e) => {
@@ -1074,9 +1411,16 @@ impl App {
                     self.generating_dims = None;
                     self.progress = None;
                     self.preview_tex = None;
+                    self.is_swapping_detected = false;
                     self.queue.clear();
-                    if e != "Cancelled" {
+                    if e == "Cancelled" {
+                        self.status = "Cancelled".into();
+                    } else {
+                        self.status = "Error".into();
                         self.error = Some(e);
+                    }
+                    if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
+                        self.prompt = self.generating_prompt.clone();
                     }
                 }
             }
@@ -1085,7 +1429,11 @@ impl App {
         let is_ready = matches!(*self.sh.state.lock().unwrap(), EngState::Ready { .. });
         if is_ready && !self.generating && !self.queue.is_empty() {
             let next = self.queue.remove(0);
-            self.start_generation_with_prompt(ctx, next.prompt);
+            if self.mode == StudioMode::Video {
+                self.start_video_generation_with_prompt(ctx, next.prompt);
+            } else {
+                self.start_generation_with_prompt(ctx, next.prompt);
+            }
         }
     }
 
@@ -1238,10 +1586,17 @@ fn is_win_ctrl_v() -> bool {
             EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
             EngState::DownloadingModels { .. } => return Err("Downloading models..."),
             EngState::RepairingEngine { .. } => return Err("Repairing engine..."),
+            EngState::ModelDownloadFailed { .. } => return Err("Model download paused (see Setup)"),
             EngState::Failed(_) => return Err("Engine setup failed (see Setup)"),
         }
-        if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
-            return Err("Downloading model weights...");
+        if self.mode == StudioMode::Video {
+            if !self.has_video_models() {
+                return Err("Video models not downloaded (check Setup)");
+            }
+        } else {
+            if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
+                return Err("Downloading model weights...");
+            }
         }
         Ok(())
     }
@@ -1311,9 +1666,10 @@ fn is_win_ctrl_v() -> bool {
                                 },
                                 GREEN,
                             ),
+                            EngState::ModelDownloadFailed { .. } => ("Model download interrupted".to_string(), AMBER),
                             EngState::Failed(_) => ("Engine setup failed".to_string(), RED),
                         };
-                        egui::Frame::new()
+                        let pill_resp = egui::Frame::new()
                             .fill(col.linear_multiply(0.14))
                             .corner_radius(20)
                             .inner_margin(egui::Margin::symmetric(10, 3))
@@ -1321,9 +1677,18 @@ fn is_win_ctrl_v() -> bool {
                                 ui.horizontal(|ui| {
                                     let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
                                     ui.painter().circle_filled(r.center(), 4.0, col);
-                                    ui.label(RichText::new(txt).color(col).strong().size(12.0));
+                                    ui.label(RichText::new(&txt).color(col).strong().size(12.0));
                                 });
                             });
+                        let pill_rect = pill_resp.response.rect;
+                        let pill_click = ui.interact(pill_rect, egui::Id::new("dl_status_pill"), Sense::click());
+                        if pill_click.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if pill_click.clicked() {
+                            self.show_downloads_menu = !self.show_downloads_menu;
+                        }
+                        pill_click.on_hover_text("Click to view downloads list");
                         ui.label(RichText::new(format!("build {}", env!("BUILD_STAMP"))).size(11.0).color(DIM));
                     });
                 });
@@ -1332,6 +1697,10 @@ fn is_win_ctrl_v() -> bool {
 
     // Left Panel: Compact Reference Strip (+ Docked History if Left)
     fn refs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.mode == StudioMode::Video {
+            self.render_history_ui(ui);
+            return;
+        }
         if self.history_dock == HistoryDock::Left {
             let avail_h = ui.available_height();
             let refs_max_h = (avail_h * 0.40).clamp(110.0, 240.0);
@@ -1452,8 +1821,302 @@ fn is_win_ctrl_v() -> bool {
         }
     }
 
+    fn render_orientation_button(
+        ui: &mut egui::Ui,
+        selected: bool,
+        is_landscape: bool,
+        text: &str,
+        width: f32,
+    ) -> egui::Response {
+        let desired_size = vec2(width, 28.0);
+        let (rect, resp) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ui.is_rect_visible(rect) {
+            let p = ui.painter();
+            let bg_col = if selected {
+                ACCENT
+            } else if resp.hovered() {
+                CARD_HI
+            } else {
+                CARD
+            };
+            let stroke_col = if selected {
+                ACCENT_GLOW
+            } else {
+                LINE
+            };
+            p.rect_filled(rect, 6.0, bg_col);
+            p.rect_stroke(rect, 6.0, Stroke::new(1.0, stroke_col), StrokeKind::Inside);
+
+            // Programmatic vector rectangle icon (16:9 for landscape, 9:16 for portrait)
+            let icon_center = pos2(rect.left() + 20.0, rect.center().y);
+            let icon_size = if is_landscape { vec2(18.0, 11.0) } else { vec2(11.0, 18.0) };
+            let icon_rect = Rect::from_center_size(icon_center, icon_size);
+            let icon_stroke = if selected { Color32::WHITE } else { TEXT };
+            let icon_fill = if selected { Color32::from_white_alpha(50) } else { Color32::from_white_alpha(20) };
+            p.rect_filled(icon_rect, 2.0, icon_fill);
+            p.rect_stroke(icon_rect, 2.0, Stroke::new(1.2, icon_stroke), StrokeKind::Inside);
+
+            // Text
+            let text_col = if selected { Color32::WHITE } else { TEXT };
+            let text_pos = pos2(rect.left() + 38.0, rect.center().y);
+            let font_id = egui::FontId::proportional(12.0);
+            let galley = p.layout_no_wrap(text.to_string(), font_id, text_col);
+            p.galley(pos2(text_pos.x, text_pos.y - galley.size().y * 0.5), galley, text_col);
+        }
+        resp
+    }
+
+    fn render_video_settings(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().id_salt("video_settings_scroll").show(ui, |ui| {
+            card(ui, |ui| {
+                heading(ui, "WORKFLOW");
+                if self.active_node().is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Image-to-Video").strong().color(ACCENT_GLOW));
+                    });
+                    ui.label(RichText::new("Active image/frame on canvas will be used as the starting frame.").size(11.0).color(DIM));
+                    ui.add_space(4.0);
+                    if ui.button("Switch to Text-to-Video (Deselect Image)").clicked() {
+                        self.active_node_id = None;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Text-to-Video").strong().color(GREEN));
+                    });
+                    ui.label(RichText::new("Generates video entirely from your text prompt.").size(11.0).color(DIM));
+                    ui.add_space(4.0);
+                    if ui.button("Load Image for Image-to-Video...").clicked() {
+                        self.pick_images(ui.ctx(), Target::Base, false);
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
+                heading(ui, "ORIENTATION & RESOLUTION");
+
+                // 1. Orientation buttons with programmatic vector rectangles (16:9 Landscape / 9:16 Portrait)
+                ui.horizontal(|ui| {
+                    let is_land = self.video_orientation == VideoOrientation::Landscape;
+                    let is_port = self.video_orientation == VideoOrientation::Portrait;
+                    let half_w = (ui.available_width() - 4.0) * 0.5;
+
+                    let land_btn = Self::render_orientation_button(ui, is_land, true, "Landscape", half_w);
+                    if land_btn.on_hover_text("16:9 Landscape Orientation (Desktop, YouTube, TV)").clicked() && !is_land {
+                        self.video_orientation = VideoOrientation::Landscape;
+                        if self.video_width < self.video_height {
+                            std::mem::swap(&mut self.video_width, &mut self.video_height);
+                            std::mem::swap(&mut self.video_base_w, &mut self.video_base_h);
+                        }
+                    }
+
+                    let port_btn = Self::render_orientation_button(ui, is_port, false, "Portrait", ui.available_width());
+                    if port_btn.on_hover_text("9:16 Vertical Orientation (Reels, Shorts, TikTok)").clicked() && !is_port {
+                        self.video_orientation = VideoOrientation::Portrait;
+                        if self.video_width > self.video_height {
+                            std::mem::swap(&mut self.video_width, &mut self.video_height);
+                            std::mem::swap(&mut self.video_base_w, &mut self.video_base_h);
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // 2. Clean Presets: 360p, 480p, 720p, 1080p, 1440p, 4K
+                let is_portrait = self.video_orientation == VideoOrientation::Portrait;
+                let presets: [(&str, u32, u32, &str); 6] = [
+                    ("360p", 640, 352, "640x352 • Fast preview, minimal VRAM"),
+                    ("480p", 864, 480, "864x480 • Smooth preview, standard definition"),
+                    ("720p", 1280, 720, "1280x720 • Standard HD (Recommended standard)"),
+                    ("1080p", 1920, 1080, "1920x1080 • Full HD (Crisp, requires ~16GB VRAM)"),
+                    ("1440p", 2560, 1440, "2560x1440 • 2K Quad HD (Requires ~22GB VRAM)"),
+                    ("4K", 3840, 2160, "3840x2160 • Ultra HD (Requires 32GB+ VRAM or heavy paging)"),
+                ];
+
+                ui.horizontal_wrapped(|ui| {
+                    for (label, w_land, h_land, desc) in presets {
+                        let (target_w, target_h) = if is_portrait { (h_land, w_land) } else { (w_land, h_land) };
+                        let is_sel = self.video_base_w == target_w && self.video_base_h == target_h;
+                        let btn = egui::Button::new(RichText::new(label).strong().color(if is_sel { Color32::WHITE } else { TEXT }))
+                            .fill(if is_sel { ACCENT } else { CARD_HI })
+                            .stroke(Stroke::new(1.0, if is_sel { ACCENT_GLOW } else { LINE }))
+                            .corner_radius(5);
+                        if ui.add(btn).on_hover_text(format!("{}x{} px • {}", target_w, target_h, desc)).clicked() {
+                            self.video_base_w = target_w;
+                            self.video_base_h = target_h;
+                            self.video_scale = 1.0;
+                            self.video_width = target_w;
+                            self.video_height = target_h;
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // 3. Resolution scale slider (keeps aspect ratio)
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Resolution scale:").size(11.5).color(DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{:.2}x ({:.0}%)", self.video_scale, self.video_scale * 100.0)).size(11.5).strong());
+                    });
+                });
+                let slider = egui::Slider::new(&mut self.video_scale, 0.25..=2.0)
+                    .step_by(0.05)
+                    .show_value(false);
+                let s_resp = ui.add(slider);
+                if s_resp.changed() {
+                    self.video_width = (((self.video_base_w as f32 * self.video_scale) / 32.0).round() as u32 * 32).clamp(256, 4096);
+                    self.video_height = (((self.video_base_h as f32 * self.video_scale) / 32.0).round() as u32 * 32).clamp(256, 4096);
+                }
+
+                ui.add_space(4.0);
+
+                // 4. Custom dimensions & live display
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Custom:").size(11.0).color(DIM));
+                    let w_resp = ui.add(egui::DragValue::new(&mut self.video_width).speed(32).range(256..=4096).prefix("W: "));
+                    let h_resp = ui.add(egui::DragValue::new(&mut self.video_height).speed(32).range(256..=4096).prefix("H: "));
+                    if w_resp.changed() || h_resp.changed() {
+                        self.video_width = (self.video_width / 32) * 32;
+                        self.video_height = (self.video_height / 32) * 32;
+                        self.video_base_w = self.video_width;
+                        self.video_base_h = self.video_height;
+                        self.video_scale = 1.0;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Output: {} × {} px", self.video_width, self.video_height)).size(11.0).color(TEXT).strong());
+                    let ratio = self.video_width as f32 / self.video_height.max(1) as f32;
+                    ui.label(RichText::new(format!("({:.2}:1)", ratio)).size(10.5).color(DIM));
+                });
+
+                // 5. Dynamic VRAM estimate and excessive swap warning card
+                let vram_detected = engine::detect_gpu_vram_gb();
+                let est_vram = estimate_video_vram_gb(self.video_width, self.video_height, self.video_duration, self.video_fps);
+
+                if let Some(gpu_vram) = vram_detected {
+                    if est_vram > gpu_vram as f32 {
+                        ui.add_space(4.0);
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(42, 22, 18))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(220, 90, 40)))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("[!] High VRAM Load Warning").strong().color(AMBER));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(format!("Est: {:.1} GB / {} GB VRAM", est_vram, gpu_vram)).size(10.5).color(AMBER));
+                                    });
+                                });
+                                ui.label(
+                                    RichText::new("This resolution & duration combination exceeds your GPU's dedicated VRAM. Windows will use shared system RAM paging, causing generation steps to slow down by 10x–100x or appear stalled.\n\nTip: Reduce duration, lower the Resolution Scale slider, or choose 480p / 360p for fast generation.")
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(235, 205, 185)),
+                                );
+                            });
+                    } else if est_vram > (gpu_vram as f32 - 1.5) {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("[i] Near VRAM capacity").size(10.5).color(AMBER));
+                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB)", est_vram, gpu_vram)).size(10.5).color(DIM));
+                        });
+                    } else {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("[OK] Within VRAM budget").size(10.5).color(GREEN));
+                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB)", est_vram, gpu_vram)).size(10.5).color(DIM));
+                        });
+                    }
+                } else if est_vram >= 14.0 {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("[!] Heavy load (Est. {:.1} GB VRAM required). May cause RAM swapping on GPUs with <16GB.", est_vram)).size(10.5).color(AMBER));
+                }
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
+                heading(ui, "DURATION & FRAMERATE");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Duration:").size(11.5).color(TEXT));
+                    ui.add(egui::Slider::new(&mut self.video_duration, 1..=15).suffix("s"));
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Framerate:").size(11.5).color(TEXT));
+                    for fps_opt in [24, 25, 30] {
+                        let sel = self.video_fps == fps_opt;
+                        if ui.selectable_label(sel, format!("{fps_opt} fps")).clicked() {
+                            self.video_fps = fps_opt;
+                        }
+                    }
+                });
+
+                let total_frames = self.video_duration * self.video_fps;
+                ui.add_space(2.0);
+                ui.label(RichText::new(format!("Total frames: {} frames ({}s @ {} fps)", total_frames, self.video_duration, self.video_fps)).size(11.0).color(DIM));
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
+                heading(ui, "AI PROMPT ENHANCER");
+                let chk = egui::Checkbox::new(&mut self.video_prompt_enhance, RichText::new("Gemma 3 12B Enhancer").strong());
+                ui.add(chk);
+                if self.video_prompt_enhance {
+                    ui.label(
+                        RichText::new("Active: Expands prompt into a cinematic script via local Gemma 3 (~2 min).")
+                            .size(10.5)
+                            .color(GREEN),
+                    );
+                } else {
+                    ui.label(RichText::new("Off (Fast): Encodes your exact prompt directly in <1s with zero LLM overhead.").size(10.5).color(DIM));
+                }
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
+                heading(ui, "SAMPLING & SEED");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.random_seed, "Random");
+                    if !self.random_seed {
+                        ui.add(egui::DragValue::new(&mut self.seed).speed(1));
+                    }
+                    if ui.small_button("Rnd").on_hover_text("Generate random seed").clicked() {
+                        self.seed = rand_u64();
+                        self.random_seed = false;
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
+                heading(ui, "NEGATIVE PROMPT");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.video_negative)
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .hint_text("e.g. video game, cartoon, CGI, 3D render, ugly, blurry, deformed"),
+                );
+            });
+        });
+    }
+
     // Right Panel: Compact, power-user styled settings
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        if self.mode == StudioMode::Video {
+            self.render_video_settings(ui);
+            return;
+        }
         egui::ScrollArea::vertical().id_salt("settings_scroll").show(ui, |ui| {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1581,7 +2244,7 @@ fn is_win_ctrl_v() -> bool {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Aspect scale:").size(11.5).color(DIM));
+                    ui.label(RichText::new("Resolution scale:").size(11.5).color(DIM));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("{:.2}x ({:.0}%)", self.scale, self.scale * 100.0)).size(11.5).strong());
                     });
@@ -1868,7 +2531,11 @@ fn is_win_ctrl_v() -> bool {
                         );
                         p.galley(pos2(text_left, card_rect.min.y + 5.0), title_galley, Color32::WHITE);
 
-                        let sub = format!("Step {} | {}x{}", node.step_num, node.width, node.height);
+                        let sub = if node.mp4_bytes.is_some() {
+                            format!("Video | {}x{}", node.width, node.height)
+                        } else {
+                            format!("Step {} | {}x{}", node.step_num, node.width, node.height)
+                        };
                         let sub_font = egui::FontId::proportional(10.0);
                         let fitted_sub = Self::fit_single_line_middle(&p, &sub, sub_font.clone(), text_max_w);
                         let sub_galley = p.layout_no_wrap(
@@ -1968,18 +2635,69 @@ fn is_win_ctrl_v() -> bool {
         }
     }
 
+    fn render_model_checkboxes(&self, ui: &mut egui::Ui) {
+        let sh = &self.sh;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(20, 23, 32))
+            .stroke(Stroke::new(1.0, LINE))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut dl_img = sh.dl_image_model.load(Ordering::SeqCst);
+                    let mut dl_vid = sh.dl_video_model.load(Ordering::SeqCst);
+
+                    let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(11.0).strong());
+                    if resp_img.changed() {
+                        sh.dl_image_model.store(dl_img, Ordering::SeqCst);
+                        let mut cfg = sh.cfg.lock().unwrap();
+                        cfg.dl_image_model = dl_img;
+                        cfg.save();
+                        if !dl_img {
+                            sh.cancel_model_dl.store(true, Ordering::SeqCst);
+                        } else {
+                            sh.retry.store(true, Ordering::SeqCst);
+                        }
+                    }
+
+                    ui.add_space(10.0);
+
+                    let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(11.0).strong());
+                    if resp_vid.changed() {
+                        sh.dl_video_model.store(dl_vid, Ordering::SeqCst);
+                        let mut cfg = sh.cfg.lock().unwrap();
+                        cfg.dl_video_model = dl_vid;
+                        cfg.save();
+                        if !dl_vid {
+                            sh.cancel_model_dl.store(true, Ordering::SeqCst);
+                        } else {
+                            sh.retry.store(true, Ordering::SeqCst);
+                        }
+                    }
+                });
+            });
+    }
+
     fn render_setup_card(&mut self, ui: &mut egui::Ui, rect: Rect, state: &EngState) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
         p.rect_stroke(rect, 10, Stroke::new(1.5, LINE), StrokeKind::Inside);
 
-        let is_failed = matches!(state, EngState::Failed(_));
-        let card_w = (if is_failed { 620.0f32 } else { 540.0f32 }).min(rect.width() - 32.0);
-        let card_h = if is_failed { 380.0f32 } else { 240.0f32 };
+        let is_failed = matches!(state, EngState::Failed(_) | EngState::ModelDownloadFailed { .. });
+        let is_model_failed = matches!(state, EngState::ModelDownloadFailed { .. });
+        let card_w = (if is_failed { 620.0f32 } else { 560.0f32 }).min(rect.width() - 32.0);
+        let card_h = if is_model_failed { 320.0f32 } else if is_failed { 380.0f32 } else { 300.0f32 };
         let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, card_h));
 
         p.rect_filled(card_rect, 12, CARD);
-        p.rect_stroke(card_rect, 12, Stroke::new(1.0, if is_failed { RED.linear_multiply(0.4) } else { CARD_HI }), StrokeKind::Inside);
+        let stroke_color = if is_model_failed {
+            AMBER.linear_multiply(0.5)
+        } else if is_failed {
+            RED.linear_multiply(0.4)
+        } else {
+            CARD_HI
+        };
+        p.rect_stroke(card_rect, 12, Stroke::new(1.0, stroke_color), StrokeKind::Inside);
 
         let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
         card_ui.vertical_centered(|ui| {
@@ -1990,14 +2708,14 @@ fn is_win_ctrl_v() -> bool {
                     ui.label(RichText::new("Downloading AI Image Engine").size(18.0).strong().color(TEXT));
                     ui.label(RichText::new(step).size(12.0).color(DIM));
                     ui.label(RichText::new(format!("Step 1 of 2: Portable ComfyUI environment • {:.1} MB/s", speed_mb)).size(12.0).color(DIM));
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
 
                     let bar = egui::ProgressBar::new(*progress)
                         .show_percentage()
                         .fill(ACCENT)
                         .animate(true);
                     ui.add_sized([card_w - 44.0, 14.0], bar);
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
 
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
@@ -2005,32 +2723,36 @@ fn is_win_ctrl_v() -> bool {
                             ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
                         });
                     });
+                    ui.add_space(8.0);
+                    self.render_model_checkboxes(ui);
                 }
                 EngState::ExtractingEngine { step } => {
                     ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new("Extracting Portable Engine").size(18.0).strong().color(TEXT));
                     ui.label(RichText::new("Unpacking runtime components (this takes 1-2 minutes)...").size(12.0).color(DIM));
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
 
                     let spinner_bar = egui::ProgressBar::new(0.5).fill(ACCENT).animate(true);
                     ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.label(RichText::new(step).size(11.5).color(DIM));
+                    ui.add_space(8.0);
+                    self.render_model_checkboxes(ui);
                 }
                 EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
                     ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new(format!("Downloading AI Model Weights ({}/{})", file_index, total_files)).size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(format!("Qwen Image 2.1 Multi-Ref ({})", current_file)).size(11.5).color(DIM));
-                    ui.add_space(10.0);
+                    ui.label(RichText::new(format!("File: {}", current_file)).size(11.5).color(DIM));
+                    ui.add_space(8.0);
 
                     let bar = egui::ProgressBar::new(*file_progress)
                         .show_percentage()
                         .fill(ACCENT)
                         .animate(true);
                     ui.add_sized([card_w - 44.0, 14.0], bar);
-                    ui.add_space(6.0);
+                    ui.add_space(5.0);
 
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
@@ -2038,14 +2760,14 @@ fn is_win_ctrl_v() -> bool {
                             ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
                         });
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(5.0);
 
                     let ov_bar = egui::ProgressBar::new(*overall_progress)
                         .fill(ACCENT.linear_multiply(0.6))
                         .text(format!("Total Download Progress: {:.0}%", overall_progress * 100.0));
                     ui.add_sized([card_w - 44.0, 10.0], ov_bar);
 
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let cur_loc = self.sh.pending_models_dir.lock().unwrap().clone()
                             .unwrap_or_else(|| self.sh.paths.lock().unwrap().models.clone());
@@ -2068,6 +2790,8 @@ fn is_win_ctrl_v() -> bool {
                             }
                         }
                     });
+                    ui.add_space(6.0);
+                    self.render_model_checkboxes(ui);
                 }
                 EngState::Starting { since, attempt } => {
                     ui.label(RichText::new("INITIALIZING BACKEND").size(11.0).color(AMBER).strong());
@@ -2088,6 +2812,61 @@ fn is_win_ctrl_v() -> bool {
 
                     let spinner_bar = egui::ProgressBar::new(0.5).fill(AMBER).animate(true);
                     ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
+                }
+                EngState::ModelDownloadFailed { current_file, error } => {
+                    ui.label(RichText::new("DOWNLOAD PAUSED").size(11.0).color(AMBER).strong());
+                    ui.add_space(3.0);
+                    ui.label(RichText::new("Model Download Interrupted").size(18.0).strong().color(TEXT));
+                    ui.label(RichText::new("The local ComfyUI engine is working properly. A model file download was interrupted or throttled.").size(11.5).color(DIM));
+                    ui.add_space(8.0);
+
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(10, 12, 16))
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("model_dl_err_log_scroll")
+                                .max_height(80.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("File: {current_file}\n{error}"))
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(255, 180, 100)),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                        });
+                    ui.add_space(10.0);
+
+                    let retry_btn = egui::Button::new(
+                        RichText::new("Retry Model Download")
+                            .size(12.5)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .stroke(Stroke::new(1.0, ACCENT_GLOW))
+                    .corner_radius(6);
+                    if ui.add(retry_btn).on_hover_text("Resumes downloading missing models from the fastest available mirror").clicked() {
+                        self.sh.retry.store(true, Ordering::SeqCst);
+                    }
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Open Models Folder").clicked() {
+                            engine::open_models_folder(&self.sh);
+                        }
+
+                        if ui.button("Dismiss / Check Status").clicked() {
+                            self.sh.retry.store(true, Ordering::SeqCst);
+                        }
+                    });
                 }
                 EngState::Failed(msg) => {
                     ui.label(RichText::new("SETUP INTERRUPTED").size(11.0).color(RED).strong());
@@ -2174,9 +2953,328 @@ fn is_win_ctrl_v() -> bool {
         });
     }
 
+    fn render_video_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_size: Vec2) {
+        let player = match self.video_player.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+
+        player.update(ctx);
+
+        let wants_kb = ctx.egui_wants_keyboard_input();
+
+        let space_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::Space));
+        let left_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let right_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+
+        if space_pressed {
+            player.toggle_play();
+        }
+        if left_pressed {
+            let prev = player.current_frame.saturating_sub(1);
+            player.seek(prev);
+        }
+        if right_pressed {
+            let next = (player.current_frame + 1).min(player.frames.len().saturating_sub(1));
+            player.seek(next);
+        }
+
+        let mut close_video = false;
+        let mut save_video = false;
+        let mut extract_frame = false;
+
+        let cur_frame_idx = player.current_frame;
+        let total_frames = player.frames.len();
+        let fps = player.fps.max(1.0);
+        let cur_sec = cur_frame_idx as f32 / fps;
+        let tot_sec = total_frames as f32 / fps;
+        let p_w = player.width;
+        let p_h = player.height;
+
+        ui.horizontal(|ui| {
+            heading(ui, &format!("Video Player   {} × {} px   •   {:.1}s @ {:.0} fps", p_w, p_h, tot_sec, fps));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close Video").on_hover_text("Close player and return to image canvas").clicked() {
+                    close_video = true;
+                }
+                if ui.button("Save MP4 as...").on_hover_text("Export video file").clicked() {
+                    save_video = true;
+                }
+                if ui.button("Use Frame as Base Image").on_hover_text("Extract current video frame as base image and switch to Image mode").clicked() {
+                    extract_frame = true;
+                }
+
+                let zoom_txt = format!("{:.0}%", self.canvas_zoom * 100.0);
+                if ui.button(zoom_txt).on_hover_text("Click to reset zoom and center video").clicked() {
+                    self.canvas_zoom = 1.0;
+                    self.canvas_pan = vec2(0.0, 0.0);
+                }
+            });
+        });
+
+        let canvas_area = max_size - vec2(0.0, 96.0);
+        let (canvas_rect, resp) = ui.allocate_exact_size(canvas_area, Sense::click_and_drag());
+
+        let target_size = vec2(p_w as f32, p_h as f32);
+        let fit_size = fit(target_size, canvas_area);
+
+        // Zoom into cursor position with mouse wheel & trackpad pinch
+        if resp.hovered() {
+            let (scroll_steps, pinch_delta) = ctx.input(|i| {
+                let mut steps = 0.0f32;
+                for ev in &i.raw.events {
+                    if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                        match unit {
+                            egui::MouseWheelUnit::Line => steps += delta.y,
+                            egui::MouseWheelUnit::Point => steps += delta.y / 60.0,
+                            egui::MouseWheelUnit::Page => steps += delta.y * 3.0,
+                        }
+                    }
+                }
+                (steps, i.zoom_delta())
+            });
+
+            let mut zoom_factor = 1.0f32;
+            if scroll_steps != 0.0 {
+                let clamped = scroll_steps.clamp(-4.0, 4.0);
+                zoom_factor *= 1.12f32.powf(clamped);
+            }
+            if (pinch_delta - 1.0).abs() > 0.001 {
+                zoom_factor *= pinch_delta;
+            }
+
+            if (zoom_factor - 1.0).abs() > 0.0005 {
+                let old_zoom = self.canvas_zoom;
+                let new_zoom = (old_zoom * zoom_factor).clamp(0.15, 25.0);
+
+                if let Some(mouse) = resp.hover_pos() {
+                    let center = canvas_rect.center();
+                    let mouse_rel = mouse - (center + self.canvas_pan);
+                    self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
+                }
+                self.canvas_zoom = new_zoom;
+            }
+        }
+
+        // Pan by dragging
+        if resp.dragged() {
+            self.canvas_pan += resp.drag_delta();
+        }
+        if resp.double_clicked() {
+            self.canvas_zoom = 1.0;
+            self.canvas_pan = vec2(0.0, 0.0);
+        } else if resp.clicked() {
+            player.toggle_play();
+        }
+
+        let cur_size = fit_size * self.canvas_zoom;
+        let cur_center = canvas_rect.center() + self.canvas_pan;
+        let image_rect = Rect::from_center_size(cur_center, cur_size);
+
+        let p = ui.painter().with_clip_rect(canvas_rect);
+        p.rect_filled(canvas_rect, 8, Color32::from_rgb(14, 16, 22));
+        p.rect_stroke(canvas_rect, 8, Stroke::new(1.0, LINE), StrokeKind::Inside);
+
+        if let Some(tex) = player.current_texture(ctx) {
+            p.image(tex.id(), image_rect, FULL_UV, Color32::WHITE);
+            p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(30)), StrokeKind::Outside);
+        }
+
+        ui.add_space(6.0);
+
+        // Player Controls Bar at bottom of canvas
+        card(ui, |ui| {
+            ui.vertical(|ui| {
+                // 1. Full-length scrub bar covering the entire width of the player
+                let cur_f = player.current_frame;
+                let max_f = player.frames.len().saturating_sub(1);
+                let full_w = ui.available_width();
+                let (track_rect, scrub_resp) = ui.allocate_exact_size(vec2(full_w, 18.0), Sense::click_and_drag());
+                if ui.is_rect_visible(track_rect) {
+                    let p = ui.painter();
+                    let is_hovered = scrub_resp.hovered();
+                    let is_dragged = scrub_resp.dragged();
+                    if is_hovered || is_dragged {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+
+                    let track_y = track_rect.center().y;
+                    let track_h = if is_hovered || is_dragged { 6.0 } else { 4.0 };
+                    let track_bg_rect = Rect::from_center_size(track_rect.center(), vec2(track_rect.width(), track_h));
+                    p.rect_filled(track_bg_rect, 2.0, Color32::from_rgb(32, 36, 48));
+
+                    let progress_ratio = if max_f > 0 {
+                        (cur_f as f32 / max_f as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let played_w = track_rect.width() * progress_ratio;
+                    let played_rect = Rect::from_min_max(
+                        pos2(track_rect.left(), track_y - track_h * 0.5),
+                        pos2(track_rect.left() + played_w, track_y + track_h * 0.5),
+                    );
+                    p.rect_filled(played_rect, 2.0, ACCENT);
+
+                    let playhead_x = track_rect.left() + played_w;
+                    let thumb_r = if is_dragged { 7.0 } else if is_hovered { 6.0 } else { 4.5 };
+                    let thumb_pos = pos2(playhead_x, track_y);
+                    p.circle_filled(thumb_pos, thumb_r, Color32::WHITE);
+                    p.circle_stroke(thumb_pos, thumb_r, Stroke::new(1.5, ACCENT_GLOW));
+
+                    if scrub_resp.dragged() || scrub_resp.clicked() {
+                        if let Some(pos) = scrub_resp.interact_pointer_pos() {
+                            let rel_x = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
+                            let target_frame = (rel_x * max_f as f32).round() as usize;
+                            player.seek(target_frame);
+                        }
+                    }
+                }
+
+                ui.add_space(2.0);
+
+                // 2. Transport controls, status counters, audio controls and loop
+                ui.horizontal(|ui| {
+                    let play_txt = if player.is_playing { "Pause" } else { "Play" };
+                    let play_btn = egui::Button::new(RichText::new(play_txt).size(12.0).strong().color(Color32::WHITE))
+                        .fill(if player.is_playing { ACCENT } else { CARD_HI })
+                        .stroke(Stroke::new(1.0, if player.is_playing { ACCENT_GLOW } else { LINE }))
+                        .corner_radius(6)
+                        .min_size(vec2(54.0, 28.0));
+                    if ui.add(play_btn).on_hover_text("Play / Pause (Space)").clicked() {
+                        player.toggle_play();
+                    }
+
+                    let step_back_btn = egui::Button::new(RichText::new("< 1f").size(11.5).color(TEXT))
+                        .fill(CARD_HI)
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .min_size(vec2(36.0, 28.0));
+                    if ui.add(step_back_btn).on_hover_text("Step 1 frame back (Left Arrow)").clicked() {
+                        let prev = player.current_frame.saturating_sub(1);
+                        player.seek(prev);
+                    }
+
+                    let step_fwd_btn = egui::Button::new(RichText::new("1f >").size(11.5).color(TEXT))
+                        .fill(CARD_HI)
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .min_size(vec2(36.0, 28.0));
+                    if ui.add(step_fwd_btn).on_hover_text("Step 1 frame forward (Right Arrow)").clicked() {
+                        let next = (player.current_frame + 1).min(player.frames.len().saturating_sub(1));
+                        player.seek(next);
+                    }
+
+                    ui.add_space(6.0);
+
+                    let time_str = format!("{:02}:{:04.1} / {:02}:{:04.1}", (cur_sec / 60.0) as u32, cur_sec % 60.0, (tot_sec / 60.0) as u32, tot_sec % 60.0);
+                    ui.label(RichText::new(time_str).size(12.0).monospace().color(TEXT));
+
+                    let frame_str = format!("(frame {}/{})", cur_frame_idx + 1, total_frames);
+                    ui.label(RichText::new(frame_str).size(10.5).color(DIM));
+
+                    ui.label(RichText::new("• Start frame for next shot").size(10.5).color(ACCENT));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let loop_txt = if player.loop_playback { "Loop: On" } else { "Loop: Off" };
+                        let loop_btn = egui::Button::new(
+                            RichText::new(loop_txt)
+                                .size(11.5)
+                                .strong()
+                                .color(if player.loop_playback { Color32::WHITE } else { DIM }),
+                        )
+                        .fill(if player.loop_playback { ACCENT } else { CARD_HI })
+                        .stroke(Stroke::new(1.0, if player.loop_playback { ACCENT_GLOW } else { LINE }))
+                        .corner_radius(6);
+                        if ui.add(loop_btn).clicked() {
+                            player.loop_playback = !player.loop_playback;
+                        }
+
+                        if let Some(ref mut audio) = player.audio {
+                            let mut vol = audio.volume;
+                            let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
+                            let v_resp = ui.add_sized([64.0, 16.0], vol_slider);
+                            if v_resp.changed() {
+                                audio.set_volume(vol);
+                            }
+
+                            let mute_txt = if audio.is_muted || audio.volume == 0.0 { "Unmute" } else { "Mute" };
+                            let mute_btn = egui::Button::new(RichText::new(mute_txt).size(11.5).color(TEXT))
+                                .fill(CARD_HI)
+                                .stroke(Stroke::new(1.0, LINE))
+                                .corner_radius(6);
+                            if ui.add(mute_btn).on_hover_text("Mute / Unmute audio").clicked() {
+                                audio.toggle_mute();
+                            }
+                            ui.label(RichText::new("Vol:").size(10.5).color(DIM));
+                        } else {
+                            ui.label(RichText::new("No Audio").size(10.5).color(DIM));
+                        }
+                    });
+                });
+            });
+        });
+
+        if close_video {
+            self.video_player = None;
+            return;
+        }
+
+        if save_video {
+            let filename = player.filename.clone();
+            let mp4_data = player.mp4_bytes.clone();
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(&filename)
+                .add_filter("MP4 Video", &["mp4"])
+                .save_file()
+            {
+                if let Err(e) = std::fs::write(&path, &mp4_data) {
+                    self.error = Some(format!("Could not save MP4: {e}"));
+                }
+            }
+        }
+
+        if extract_frame {
+            let cur_img = player.frames[player.current_frame.min(player.frames.len() - 1)].clone();
+            let [f_w, f_h] = cur_img.size;
+            let mut png_bytes = Vec::new();
+            if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
+                let _ = image::DynamicImage::ImageRgba8(rgba)
+                    .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+            }
+            let id = self.next_node_id;
+            self.next_node_id += 1;
+            let tex = ctx.load_texture(format!("extracted_frame_{id}"), cur_img, egui::TextureOptions::LINEAR);
+            let node = HistoryNode {
+                id,
+                parent_id: self.active_node_id,
+                label: format!("Video Frame {}", player.current_frame + 1),
+                prompt: self.prompt.clone(),
+                png: png_bytes,
+                tex,
+                width: f_w as u32,
+                height: f_h as u32,
+                step_num: self.active_node().map(|n| n.step_num + 1).unwrap_or(0),
+                output_filename: String::new(),
+                output_subfolder: String::new(),
+                temp_files: Vec::new(),
+                mp4_bytes: None,
+            };
+            self.nodes.push(node);
+            self.select_node(id);
+            self.mode = StudioMode::Image;
+            self.video_player = None;
+        }
+    }
+
     // Center Hero Canvas (Centered Image + Interactive Zoom & Pan)
     fn center_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let max_size = ui.available_size();
+
+        if self.video_player.is_some() {
+            self.render_video_canvas(ui, ctx, max_size);
+            return;
+        }
 
         if self.active_node().is_some() || self.generating {
             let (active_id, active_w, active_h, active_step, active_label, active_png, active_tex_opt) =
@@ -2203,7 +3301,17 @@ fn is_win_ctrl_v() -> bool {
                     let (p_step, _) = parent_opt.as_ref().unwrap();
                     heading(ui, &format!("Comparison (drag divider)   Step {p_step} vs Step {active_step}"));
                 } else if self.generating && !has_active {
-                    heading(ui, &format!("Generating from scratch   ({} x {} px)", self.custom_w, self.custom_h));
+                    if self.mode == StudioMode::Video {
+                        heading(ui, &format!("Generating video from scratch   ({} x {} px)", self.video_width, self.video_height));
+                    } else {
+                        heading(ui, &format!("Generating from scratch   ({} x {} px)", self.custom_w, self.custom_h));
+                    }
+                } else if self.mode == StudioMode::Video {
+                    if self.generating {
+                        heading(ui, &format!("Generating video from image   Step {}   \"{}\"   ({} x {} px)", active_step, active_label, self.video_width, self.video_height));
+                    } else {
+                        heading(ui, &format!("Initial Frame (Image-to-Video)   Step {}   \"{}\"   ({} x {} px)", active_step, active_label, active_w, active_h));
+                    }
                 } else {
                     heading(ui, &format!("Step {}   \"{}\"   ({} x {} px)", active_step, active_label, active_w, active_h));
                 }
@@ -2261,6 +3369,7 @@ fn is_win_ctrl_v() -> bool {
                 }
                 self.nodes.clear();
                 self.active_node_id = None;
+                self.video_player = None;
                 self.compare_mode = false;
                 self.prompt.clear();
                 return;
@@ -2399,7 +3508,13 @@ fn is_win_ctrl_v() -> bool {
 
                 p.rect_stroke(image_rect, 0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Outside);
 
-                let badge_text = if let Some((v, max)) = self.progress {
+                let badge_text = if self.is_swapping_detected {
+                    if let Some((v, max)) = self.progress {
+                        format!("[!] VRAM SWAPPING SLOWDOWN ({}/{} • {:.1}s/step)", v, max, self.step_duration_ema)
+                    } else {
+                        "[!] VRAM SWAPPING SLOWDOWN".to_string()
+                    }
+                } else if let Some((v, max)) = self.progress {
                     format!("GENERATING (Step {}/{})", v, max)
                 } else {
                     "GENERATING...".to_string()
@@ -2408,7 +3523,7 @@ fn is_win_ctrl_v() -> bool {
                 let badge_pos = image_rect.left_top() + vec2(10.0, 10.0);
                 let r = egui::Align2::LEFT_TOP.anchor_size(badge_pos, g.size()).expand2(vec2(8.0, 4.0));
                 p.rect_filled(r, 4, Color32::from_black_alpha(190));
-                p.rect_stroke(r, 4, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                p.rect_stroke(r, 4, Stroke::new(1.0, if self.is_swapping_detected { AMBER } else { ACCENT }), StrokeKind::Inside);
                 p.galley(r.shrink2(vec2(8.0, 4.0)).min, g, Color32::WHITE);
             } else if let Some(ref a_tex) = active_tex_opt {
                 p.image(a_tex.id(), image_rect, FULL_UV, Color32::WHITE);
@@ -2488,6 +3603,7 @@ fn is_win_ctrl_v() -> bool {
                     | EngState::ExtractingEngine { .. }
                     | EngState::DownloadingModels { .. }
                     | EngState::RepairingEngine { .. }
+                    | EngState::ModelDownloadFailed { .. }
                     | EngState::Failed(_)
             );
             if is_setup_in_progress {
@@ -2499,26 +3615,48 @@ fn is_win_ctrl_v() -> bool {
                 p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
 
                 let c = rect.center();
-                p.text(
-                    c - vec2(0.0, 36.0),
-                    egui::Align2::CENTER_CENTER,
-                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
-                    egui::FontId::proportional(19.0),
-                    TEXT,
-                );
-                p.text(
-                    c - vec2(0.0, 10.0),
-                    egui::Align2::CENTER_CENTER,
-                    "Or simply enter a prompt below to generate an image from scratch!",
-                    egui::FontId::proportional(13.0),
-                    ACCENT_GLOW,
-                );
+                if self.mode == StudioMode::Video {
+                    p.text(
+                        c - vec2(0.0, 36.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Video Generation Mode (LTX-Video 2.3)",
+                        egui::FontId::proportional(19.0),
+                        TEXT,
+                    );
+                    p.text(
+                        c - vec2(0.0, 10.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Enter a prompt below for Text-to-Video, or paste an image for Image-to-Video!",
+                        egui::FontId::proportional(13.0),
+                        ACCENT_GLOW,
+                    );
+                } else {
+                    p.text(
+                        c - vec2(0.0, 36.0),
+                        egui::Align2::CENTER_CENTER,
+                        if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
+                        egui::FontId::proportional(19.0),
+                        TEXT,
+                    );
+                    p.text(
+                        c - vec2(0.0, 10.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Or simply enter a prompt below to generate an image from scratch!",
+                        egui::FontId::proportional(13.0),
+                        ACCENT_GLOW,
+                    );
+                }
 
-                let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(270.0, 34.0));
+                let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0));
                 let paste_hover = btn_rect.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or_default()));
                 p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
                 p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
-                p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, "📋 Paste Image from Clipboard (Ctrl+V)", egui::FontId::proportional(12.5), Color32::WHITE);
+                let btn_label = if self.mode == StudioMode::Video {
+                    "📋 Paste Image for Image-to-Video (Ctrl+V)"
+                } else {
+                    "📋 Paste Image from Clipboard (Ctrl+V)"
+                };
+                p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
 
                 if paste_hover && ui.ctx().input(|i| i.pointer.any_pressed()) {
                     let _ = self.paste_from_clipboard(ctx);
@@ -2585,7 +3723,13 @@ fn is_win_ctrl_v() -> bool {
                     ui.add_space(4.0);
 
                     let prompt_id = egui::Id::new("main_prompt_text_edit");
-                    let hint = if self.active_node().is_some() {
+                    let hint = if self.mode == StudioMode::Video {
+                        if self.active_node().is_some() {
+                            "Describe motion, camera action, or animation for this image... Enter to generate"
+                        } else {
+                            "Describe a video scene, camera motion, and action... Enter to generate"
+                        }
+                    } else if self.active_node().is_some() {
                         "Describe your edit instructions... Enter to generate, Shift+Enter for newline"
                     } else {
                         "Describe an image to generate from scratch, or paste/drop an image..."
@@ -2682,6 +3826,50 @@ fn is_win_ctrl_v() -> bool {
                             resp.on_hover_text(why);
                         }
 
+                        // Segmented pill buttons [ Image | Video ] placed to the LEFT of the generate button:
+                        ui.add_space(8.0);
+                        let is_img = self.mode == StudioMode::Image;
+                        let is_vid = self.mode == StudioMode::Video;
+
+                        egui::Frame::new()
+                            .fill(CARD)
+                            .stroke(Stroke::new(1.0, LINE))
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(3, 2))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+                                    let img_btn = egui::Button::new(
+                                        RichText::new("Image")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(if is_img { Color32::WHITE } else { DIM }),
+                                    )
+                                    .fill(if is_img { ACCENT } else { Color32::TRANSPARENT })
+                                    .corner_radius(6)
+                                    .min_size(vec2(64.0, 28.0));
+                                    if ui.add(img_btn).on_hover_text("Switch to Image Editing (Qwen Image 2.1)").clicked() {
+                                        self.mode = StudioMode::Image;
+                                    }
+
+                                    let vid_btn = egui::Button::new(
+                                        RichText::new("Video")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(if is_vid { Color32::WHITE } else { DIM }),
+                                    )
+                                    .fill(if is_vid { ACCENT } else { Color32::TRANSPARENT })
+                                    .corner_radius(6)
+                                    .min_size(vec2(64.0, 28.0));
+                                    if ui.add(vid_btn).on_hover_text("Switch to Video Generation (LTX-Video 2.3)").clicked() {
+                                        self.mode = StudioMode::Video;
+                                        if !self.has_video_models() && !self.sh.dl_video_model.load(Ordering::SeqCst) {
+                                            self.show_video_dl_modal = true;
+                                        }
+                                    }
+                                });
+                            });
+
                         if self.generating {
                             ui.add_space(6.0);
                             let cancel_btn = egui::Button::new(RichText::new("Cancel").size(13.0).strong().color(RED))
@@ -2693,6 +3881,20 @@ fn is_win_ctrl_v() -> bool {
                                 self.cancel.store(true, Ordering::SeqCst);
                                 self.queue.clear();
                                 self.status = "Cancelling...".into();
+                                if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
+                                    self.prompt = self.generating_prompt.clone();
+                                }
+                                std::thread::spawn(move || {
+                                    let client = reqwest::blocking::Client::builder()
+                                        .timeout(Duration::from_secs(2))
+                                        .build();
+                                    if let Ok(c) = client {
+                                        let base = engine::base_url();
+                                        let _ = c.post(format!("{base}/interrupt")).send();
+                                        let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
+                                        let _ = c.post(format!("{base}/free")).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
+                                    }
+                                });
                             }
                             ui.add_space(4.0);
 
@@ -2717,12 +3919,19 @@ fn is_win_ctrl_v() -> bool {
                                 ui.add_space(4.0);
                             }
 
-                            let status_txt = if let Some((v, max)) = self.progress {
+                            let status_txt = if self.is_swapping_detected {
+                                if let Some((v, max)) = self.progress {
+                                    format!("{}/{} • [!] VRAM paging active (~{:.1}s/step)", v, max, self.step_duration_ema)
+                                } else {
+                                    "[!] VRAM paging active".to_string()
+                                }
+                            } else if let Some((v, max)) = self.progress {
                                 format!("{}/{} ({})", v, max, self.status)
                             } else {
                                 self.status.clone()
                             };
-                            ui.label(RichText::new(status_txt).size(11.5).color(DIM));
+                            let status_col = if self.is_swapping_detected { AMBER } else { DIM };
+                            ui.label(RichText::new(status_txt).size(11.5).color(status_col));
                             ui.spinner();
                         }
                     });
@@ -2778,6 +3987,7 @@ fn is_win_ctrl_v() -> bool {
                     EngState::Ready { ours, gpu } => {
                         format!("Ready on {gpu} ({})", if *ours { "launched by Image Studio" } else { "already running" })
                     }
+                    EngState::ModelDownloadFailed { current_file, error } => format!("Model download failed ({current_file}): {error}"),
                     EngState::Failed(m) => format!("Failed: {m}"),
                 };
                 ui.label(RichText::new(st).strong());
@@ -2855,7 +4065,17 @@ fn is_win_ctrl_v() -> bool {
                 });
 
                 ui.separator();
-                heading(ui, "REQUIRED MODELS");
+                heading(ui, "MODEL DOWNLOAD SELECTION");
+                self.render_model_checkboxes(ui);
+                ui.add_space(4.0);
+
+                ui.separator();
+                heading(ui, "MODEL FILES STATUS");
+                let vid_ok = self.has_video_models();
+                ui.label(
+                    RichText::new(format!("{}  LTX-Video 2.3 Checkpoint (ltx-2.3-22b-dev-fp8.safetensors)", if vid_ok { "found  " } else { "MISSING" }))
+                        .color(if vid_ok { GREEN } else { RED }),
+                );
                 for (name, ok) in self.sh.models_found.lock().unwrap().iter() {
                     ui.label(
                         RichText::new(format!("{}  {}", if *ok { "found  " } else { "MISSING" }, name))
@@ -2970,6 +4190,168 @@ fn is_win_ctrl_v() -> bool {
             });
         self.show_setup = open;
     }
+
+    fn video_dl_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_video_dl_modal;
+        let mut should_close = false;
+        let center = ctx.content_rect().center();
+        egui::Window::new("LTX-Video 2.3 Model Setup")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(center)
+            .fixed_size(vec2(500.0, 240.0))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Download Video Generation Models").size(17.0).strong().color(TEXT));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("LTX-Video 2.3 enables high-fidelity 720p/1080p video generation from text or images.\n\nTotal download size: ~42 GB\n• LTX-2.3 22B Dev Checkpoint (FP8, ~29 GB)\n• Gemma 3 12B IT Text Encoder (~9.4 GB)\n• Spatial Upscaler x2 & Dynamic LoRAs (~4.3 GB)")
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                    ui.add_space(14.0);
+
+                    let is_dl = self.sh.dl_video_model.load(Ordering::SeqCst);
+                    if is_dl {
+                        ui.label(RichText::new("Video models are currently downloading in the background.").color(GREEN).strong());
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            should_close = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            let dl_btn = egui::Button::new(RichText::new("📥 Start Download (~42 GB)").strong().color(Color32::WHITE))
+                                .fill(ACCENT)
+                                .min_size(vec2(180.0, 32.0));
+                            if ui.add(dl_btn).clicked() {
+                                self.sh.dl_video_model.store(true, Ordering::SeqCst);
+                                let mut cfg = self.sh.cfg.lock().unwrap();
+                                cfg.dl_video_model = true;
+                                cfg.save();
+                                self.sh.retry.store(true, Ordering::SeqCst);
+                                should_close = true;
+                            }
+                            let cancel_btn = egui::Button::new("Not Now").min_size(vec2(80.0, 32.0));
+                            if ui.add(cancel_btn).clicked() {
+                                should_close = true;
+                            }
+                        });
+                    }
+                });
+            });
+        self.show_video_dl_modal = open && !should_close;
+    }
+
+    fn downloads_dropdown_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_downloads_menu;
+        let mut should_close = false;
+        let screen_rect = ctx.content_rect();
+        // Position at top-right near the status pill (e.g., right margin 24px, top 48px)
+        let default_pos = egui::pos2((screen_rect.max.x - 390.0).max(10.0), 48.0);
+
+        egui::Window::new("📥 Active Downloads")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(vec2(380.0, 320.0))
+            .default_pos(default_pos)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                let state = self.sh.state.lock().unwrap().clone();
+                match state {
+                    EngState::DownloadingModels { ref current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Downloading Model Files").strong().color(TEXT).size(14.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).strong().color(ACCENT));
+                            });
+                        });
+                        ui.add_space(4.0);
+
+                        // Overall progress bar
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Overall: {:.0}% ({}/{})", overall_progress * 100.0, file_index, total_files)).size(11.0).color(DIM));
+                        });
+                        let bar = egui::ProgressBar::new(overall_progress).show_percentage().fill(ACCENT);
+                        ui.add_sized([ui.available_width(), 12.0], bar);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // Current active file card
+                        card(ui, |ui| {
+                            ui.label(RichText::new(format!("Current: {current_file}")).strong().color(TEXT).size(12.0));
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{} / {}", engine::format_bytes(bytes_done), engine::format_bytes(bytes_total))).size(11.0).color(DIM));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(format!("{:.1}%", file_progress * 100.0)).size(11.0).color(AMBER));
+                                });
+                            });
+                            let file_bar = egui::ProgressBar::new(file_progress).fill(AMBER);
+                            ui.add_sized([ui.available_width(), 10.0], file_bar);
+                        });
+
+                        ui.add_space(6.0);
+                        heading(ui, "MODEL QUEUE");
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            let missing = engine::Profile::missing_models(&self.sh);
+                            if missing.is_empty() {
+                                ui.label(RichText::new("All remaining models ready.").size(11.0).color(GREEN));
+                            } else {
+                                for (i, m) in missing.iter().enumerate() {
+                                    let is_active = m.filename == *current_file;
+                                    let (col, badge) = if is_active {
+                                        (AMBER, "DOWNLOADING")
+                                    } else if i < file_index {
+                                        (GREEN, "COMPLETED")
+                                    } else {
+                                        (DIM, "QUEUED")
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&m.filename).size(11.0).color(if is_active { TEXT } else { DIM }));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(RichText::new(badge).size(10.0).color(col).strong());
+                                            ui.label(RichText::new(engine::format_bytes(m.size_bytes)).size(10.0).color(DIM));
+                                        });
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    EngState::DownloadingEngine { ref step, progress, bytes_done, bytes_total, speed_mb } => {
+                        ui.label(RichText::new("Downloading Engine Component").strong().color(TEXT).size(14.0));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(step).size(11.5).color(DIM));
+                        ui.add_space(4.0);
+                        let bar = egui::ProgressBar::new(progress).show_percentage().fill(ACCENT);
+                        ui.add_sized([ui.available_width(), 14.0], bar);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} / {}", engine::format_bytes(bytes_done), engine::format_bytes(bytes_total))).size(11.0).color(DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).strong().color(ACCENT));
+                            });
+                        });
+                    }
+                    _ => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(RichText::new("No active background downloads.").size(13.0).color(DIM));
+                            ui.add_space(8.0);
+                            if ui.button("Open Settings").clicked() {
+                                self.show_setup = true;
+                                should_close = true;
+                            }
+                        });
+                    }
+                }
+            });
+        self.show_downloads_menu = open && !should_close;
+    }
 }
 
 impl eframe::App for App {
@@ -2989,6 +4371,16 @@ impl eframe::App for App {
         );
         if starting || self.generating || self.loading > 0 {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+
+        // Detect excessive stalling during generation
+        if self.generating {
+            if let Some(last_t) = self.last_progress_time {
+                let stall_limit_secs = if self.mode == StudioMode::Video { 50 } else { 15 };
+                if last_t.elapsed().as_secs() > stall_limit_secs && self.progress.map(|(v, m)| v > 0 && v < m).unwrap_or(false) {
+                    self.is_swapping_detected = true;
+                }
+            }
         }
 
         // Top Header
@@ -3033,6 +4425,12 @@ impl eframe::App for App {
         // Floating Windows: Setup and Floating History (if undocked)
         self.setup_window(&ctx);
         self.floating_history_window(&ctx);
+        if self.show_video_dl_modal {
+            self.video_dl_window(&ctx);
+        }
+        if self.show_downloads_menu {
+            self.downloads_dropdown_window(&ctx);
+        }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
@@ -3065,5 +4463,21 @@ mod tests {
         assert!(resized_base.width() <= 4096);
         assert!(resized_base.height() <= 4096);
         assert_eq!(resized_base.width(), 4096);
+    }
+
+    #[test]
+    fn test_estimate_video_vram_gb() {
+        use super::estimate_video_vram_gb;
+        let vram_720p_5s = estimate_video_vram_gb(1280, 720, 5, 24);
+        assert!(vram_720p_5s <= 12.5, "720p 5s should fit within ~12GB VRAM");
+
+        let vram_720p_9s = estimate_video_vram_gb(1280, 720, 9, 24);
+        assert!(vram_720p_9s > 13.0, "720p 9s should exceed 12GB VRAM and trigger warning");
+
+        let vram_360p_5s = estimate_video_vram_gb(640, 352, 5, 24);
+        assert!(vram_360p_5s < 10.5, "360p 5s should require minimal VRAM");
+
+        let vram_4k_5s = estimate_video_vram_gb(3840, 2160, 5, 24);
+        assert!(vram_4k_5s > 30.0, "4K 5s should require >30GB VRAM");
     }
 }

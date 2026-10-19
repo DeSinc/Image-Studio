@@ -55,10 +55,18 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to upload version.json via SCP"
 }
 
+scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new $versionJsonPath "${remoteHost}:${remoteDir}/manifest.json"
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to upload manifest.json via SCP"
+}
+
 # 5. Verify live endpoint
 Write-Host "Verifying live endpoint https://desinc.my.to/image-studio/version.json..." -ForegroundColor Yellow
 Start-Sleep -Seconds 1
 $liveResp = curl.exe -s https://desinc.my.to/image-studio/version.json
-Write-Host "Live endpoint response: $liveResp" -ForegroundColor Green
+Write-Host "Live endpoint response (version.json): $liveResp" -ForegroundColor Green
+
+$liveManifest = curl.exe -s https://desinc.my.to/image-studio/manifest.json
+Write-Host "Live endpoint response (manifest.json): $liveManifest" -ForegroundColor Green
 
 Write-Host "=== Deployment Completed Successfully! ===" -ForegroundColor Cyan

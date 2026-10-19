@@ -99,6 +99,53 @@
           "modelscope_url": "https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1/resolve/master/vae/qwen_image_2.1_vae_bf16.safetensors"
         }
       ]
+    },
+    {
+      "id": "ltx_2.3",
+      "name": "LTX-Video 2.3 (Audio + Video, 22B Dev FP8)",
+      "description": "High-fidelity text-to-video and image-to-video generation with spatial latent upscaler and Gemma 3 text encoder.",
+      "recommended_vram_gb": 16,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "models": [
+        {
+          "category": "checkpoints",
+          "filename": "ltx-2.3-22b-dev-fp8.safetensors",
+          "size_bytes": 29145431166,
+          "hf_url": "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Lightricks/LTX-2.3-fp8/resolve/master/ltx-2.3-22b-dev-fp8.safetensors"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma_3_12B_it_fp4_mixed.safetensors",
+          "size_bytes": 9447702218,
+          "hf_url": "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/ltx-2/resolve/master/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+          "size_bytes": 995743560,
+          "hf_url": "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Lightricks/LTX-2.3/resolve/master/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+        },
+        {
+          "category": "loras",
+          "filename": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+          "size_bytes": 2741024390,
+          "hf_url": "https://huggingface.co/Comfy-Org/ltx-2.3/resolve/main/split_files/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/ltx-2.3/resolve/master/split_files/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors"
+        },
+        {
+          "category": "loras",
+          "filename": "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
+          "size_bytes": 628203616,
+          "hf_url": "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/Comfy-Org/ltx-2/resolve/master/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors"
+        }
+      ]
     }
   ]
 }
