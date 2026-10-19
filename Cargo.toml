@@ -1,6 +1,6 @@
 [package]
 name = "image-studio"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2024"
 build = "build.rs"
 
@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "native-tls", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "6.0"
@@ -19,6 +19,9 @@ rfd = "0.15"
 arboard = "3.4"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 sevenz-rust2 = "0.24.0"
+openh264 = "0.9.9"
+mp4 = "0.14.0"
+rodio = "0.23.0"
 
 [build-dependencies]
 winres = "0.1"

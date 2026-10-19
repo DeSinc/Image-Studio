@@ -20,9 +20,14 @@ Fast, native desktop app for image editing using open-weights diffusion models (
 
 ![Material Transformation](assets/demo_material_transform.gif)
 
+### Video Studio (Text-to-Video & Image-to-Video)
+Cinematic AI video generation powered by Lightricks LTX-Video 2.3 (22B Dev FP8) with built-in audio synthesis, spatial upscaling, and an integrated native player.
+
 ## Features
 
 - **Pure Native Rust UI**: Built with `egui` / `eframe` - zero WebView, zero Chromium, zero web frameworks. Instant startup and responsive native performance.
+- **Video Studio with LTX-Video 2.3**: High-fidelity text-to-video and image-to-video generation with integrated spatial latent upscaler, audio VAE, and optional Gemma 3 12B cinematic prompt enhancer.
+- **Native Video Player & Multi-Shot History**: Custom video player using OpenH264 decoding and Rodio audio playback rendered directly into egui textures with scrubbing, playback speed, looping, and instant frame extraction to branch the next shot.
 - **Background Engine Supervisor**: Automatically detects, bootstraps, and supervises ComfyUI in the background without terminal clutter.
 - **Model Manifest & On-Demand Downloader**: Verifies required model weights on startup (`models.json`) and downloads missing weights from Hugging Face with live progress.
 - **Hardware-Aware Quantization**: Auto-detects available VRAM to choose between standard INT8 (12GB+ GPUs) and 4-bit W4A8 quantized text encoders (8GB GPUs) to prevent CUDA Out-Of-Memory errors.

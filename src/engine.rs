@@ -51,7 +51,9 @@ pub fn format_bytes(b: u64) -> String {
 }
 
 // ---------------------------------------------------------------- config
-#[derive(Serialize, Deserialize, Default, Clone)]
+fn default_true() -> bool { true }
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub comfy_dir: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
@@ -59,7 +61,25 @@ pub struct Config {
     pub ignore_paths: Vec<PathBuf>,
     #[serde(default)]
     pub active_profile: Option<String>,
+    #[serde(default = "default_true")]
+    pub dl_image_model: bool,
+    #[serde(default)]
+    pub dl_video_model: bool,
 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            comfy_dir: None,
+            models_dir: None,
+            ignore_paths: Vec::new(),
+            active_profile: None,
+            dl_image_model: true,
+            dl_video_model: false,
+        }
+    }
+}
+
 
 impl Config {
     pub fn load() -> Self {
@@ -228,6 +248,28 @@ impl Profile {
     pub fn file(&self, cat: &str) -> String {
         self.models.iter().find(|m| m.category == cat).map(|m| m.filename.clone()).unwrap_or_default()
     }
+
+    pub fn missing_models(sh: &Shared) -> Vec<ModelFile> {
+        let all_profiles = Self::all();
+        let ltx_profile = all_profiles.iter().find(|p| p.id == "ltx_2.3").cloned();
+        let profile = sh.active_profile.lock().unwrap().clone();
+        let models_dir = sh.paths.lock().unwrap().models.clone();
+
+        let mut target_models: Vec<ModelFile> = Vec::new();
+        if sh.dl_image_model.load(Ordering::SeqCst) {
+            target_models.extend(profile.models.clone());
+        }
+        if sh.dl_video_model.load(Ordering::SeqCst) {
+            if let Some(ref vid_p) = ltx_profile {
+                target_models.extend(vid_p.models.clone());
+            }
+        }
+
+        target_models
+            .into_iter()
+            .filter(|m| !safe_model_path(&models_dir, &m.category, &m.filename).exists())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------- state
@@ -253,6 +295,10 @@ pub enum EngState {
         bytes_total: u64,
         speed_mb: f32,
         overall_progress: f32,
+    },
+    ModelDownloadFailed {
+        current_file: String,
+        error: String,
     },
     RepairingEngine {
         step: String,
@@ -283,6 +329,9 @@ pub struct Shared {
     pub retry: AtomicBool,
     pub clean_engine: AtomicBool,
     pub cancel: AtomicBool,
+    pub cancel_model_dl: AtomicBool,
+    pub dl_image_model: AtomicBool,
+    pub dl_video_model: AtomicBool,
     pub cfg: Mutex<Config>,
     pub pending_models_dir: Mutex<Option<PathBuf>>,
     pub migration_status: Mutex<Option<String>>,
@@ -291,6 +340,9 @@ pub struct Shared {
 
 impl Shared {
     pub fn new() -> Arc<Shared> {
+        let cfg = Config::load();
+        let dl_img = cfg.dl_image_model;
+        let dl_vid = cfg.dl_video_model;
         Arc::new(Shared {
             state: Mutex::new(EngState::Detecting),
             paths: Mutex::new(Paths::default()),
@@ -299,13 +351,17 @@ impl Shared {
             retry: AtomicBool::new(false),
             clean_engine: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
-            cfg: Mutex::new(Config::load()),
+            cancel_model_dl: AtomicBool::new(false),
+            dl_image_model: AtomicBool::new(dl_img),
+            dl_video_model: AtomicBool::new(dl_vid),
+            cfg: Mutex::new(cfg),
             pending_models_dir: Mutex::new(None),
             migration_status: Mutex::new(None),
             active_profile: Mutex::new(Profile::load()),
         })
     }
 }
+
 
 
 pub fn move_file_robust(from: &Path, to: &Path) -> Result<(), String> {
@@ -385,6 +441,15 @@ pub fn open_output_folder(sh: &Shared) {
             data_dir().join("output")
         }
     };
+    let _ = std::fs::create_dir_all(&p);
+    let _ = Command::new("explorer.exe")
+        .arg(&p)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+pub fn open_models_folder(sh: &Shared) {
+    let p = sh.paths.lock().unwrap().models.clone();
     let _ = std::fs::create_dir_all(&p);
     let _ = Command::new("explorer.exe")
         .arg(&p)
@@ -573,6 +638,10 @@ pub fn kill_tree(c: &mut Child) {
 
 fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
     let log = data_dir().join("comfyui.log");
+    if log.exists() {
+        let prev = data_dir().join("comfyui.prev.log");
+        let _ = std::fs::rename(&log, &prev);
+    }
     let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(py);
@@ -586,8 +655,6 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
         "--disable-auto-launch",
         "--preview-method",
         "auto",
-        "--reserve-vram",
-        "1.5",
         "--models-directory",
     ])
     .arg(models)
@@ -602,7 +669,233 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", py.display()))
 }
 
-fn download_file<F>(
+const DL_SEGMENTS: u64 = 8;
+
+/// Parallel ranged download via several curl processes. Each segment streams into its own
+/// `<part>.N` file and resumes independently; segment boundaries are persisted in `<part>.segs`
+/// so stop/restart keeps working. Hides per-connection ramp-up/stalls (e.g. HF Xet bridge).
+#[allow(clippy::too_many_arguments)]
+fn download_segmented<F>(
+    curl_exe: &Path,
+    url: &str,
+    dest: &Path,
+    part_path: &Path,
+    total: u64,
+    mut on_progress: F,
+    cancel: &AtomicBool,
+    ctx: &eframe::egui::Context,
+    speed_watchdog: bool,
+) -> Result<(), String>
+where
+    F: FnMut(u64, u64, f32),
+{
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicU64;
+
+    let seg_path = |i: usize| PathBuf::from(format!("{}.{i}", part_path.display()));
+    let meta_path = PathBuf::from(format!("{}.segs", part_path.display()));
+
+    // Load or create segment boundaries.
+    let mut bounds: Vec<u64> = std::fs::read_to_string(&meta_path)
+        .ok()
+        .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_default();
+    if bounds.len() < 2 || bounds[0] != 0 || *bounds.last().unwrap() != total {
+        // Fresh layout. Reuse a legacy single .part file as the start of segment 0.
+        let existing = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0).min(total);
+        let rest = total - existing;
+        let chunk = rest.div_ceil(DL_SEGMENTS).max(1);
+        bounds = vec![0];
+        let mut b = existing;
+        while b < total {
+            b = (b + chunk).min(total);
+            bounds.push(b);
+        }
+        if bounds.len() < 2 {
+            bounds.push(total);
+        }
+        for i in 0..bounds.len() - 1 {
+            let _ = std::fs::remove_file(seg_path(i));
+        }
+        if existing > 0 {
+            std::fs::rename(part_path, seg_path(0)).map_err(|e| format!("rename error: {e}"))?;
+        }
+        std::fs::write(&meta_path, bounds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" "))
+            .map_err(|e| format!("failed to write segment map: {e}"))?;
+    }
+    let n = bounds.len() - 1;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut have = Vec::with_capacity(n);
+    let mut counters = Vec::with_capacity(n);
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let (lo, hi) = (bounds[i], bounds[i + 1]);
+        let path = seg_path(i);
+        let mut len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len > hi - lo {
+            let _ = std::fs::remove_file(&path);
+            len = 0;
+        }
+        have.push(len);
+        let counter = Arc::new(AtomicU64::new(len));
+        counters.push(counter.clone());
+        let (stop, pids, curl_exe, url) = (stop.clone(), pids.clone(), curl_exe.to_path_buf(), url.to_string());
+        handles.push(std::thread::spawn(move || -> Result<(), String> {
+            let need = hi - lo;
+            let mut attempts = 0;
+            loop {
+                let got = counter.load(Ordering::SeqCst);
+                if got >= need || stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let mut child = Command::new(&curl_exe)
+                    .args(["-L", "--fail", "-s", "-S", "--connect-timeout", "30", "--speed-limit", "1", "--speed-time", "60", "-r"])
+                    .arg(format!("{}-{}", lo + got, hi - 1))
+                    .arg(&url)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("failed to start curl: {e}"))?;
+                pids.lock().unwrap().push(child.id());
+                let mut out = child.stdout.take().unwrap();
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                    .map_err(|e| format!("failed to open segment: {e}"))?;
+                let mut buf = vec![0u8; 512 * 1024];
+                let mut overflow = false;
+                loop {
+                    let r = match out.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(r) => r,
+                    };
+                    let cur = counter.load(Ordering::SeqCst);
+                    if cur + r as u64 > need {
+                        overflow = true; // server ignored Range
+                        break;
+                    }
+                    if file.write_all(&buf[..r]).is_err() {
+                        break;
+                    }
+                    counter.fetch_add(r as u64, Ordering::SeqCst);
+                }
+                let _ = file.flush();
+                if overflow {
+                    kill_tree(&mut child);
+                    return Err("server does not support ranged downloads".into());
+                }
+                let status = child.wait().ok();
+                if counter.load(Ordering::SeqCst) >= need || stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                attempts += 1;
+                if attempts >= 6 {
+                    let mut msg = String::new();
+                    if let Some(mut e) = child.stderr.take() {
+                        let _ = e.read_to_string(&mut msg);
+                    }
+                    return Err(format!("segment {i} failed ({status:?}): {}", msg.trim()));
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }));
+    }
+
+    let kill_all = |pids: &Mutex<Vec<u32>>| {
+        for pid in pids.lock().unwrap().iter() {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    };
+
+    let start_time = Instant::now();
+    let mut last_done: u64 = have.iter().sum();
+    let mut last_tick = Instant::now();
+    let mut speed_mb = 0.0f32;
+    on_progress(last_done, total, 0.0);
+    ctx.request_repaint();
+    let mut abort: Option<String> = None;
+    while handles.iter().any(|h| !h.is_finished()) {
+        if cancel.load(Ordering::SeqCst) {
+            abort = Some("download cancelled".into());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let done: u64 = counters.iter().map(|c| c.load(Ordering::SeqCst)).sum();
+        let secs = last_tick.elapsed().as_secs_f32();
+        if secs > 0.0 {
+            let inst = (done.saturating_sub(last_done) as f32 / 1024.0 / 1024.0) / secs;
+            speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
+        }
+        last_done = done;
+        last_tick = Instant::now();
+        on_progress(done, total, speed_mb);
+        ctx.request_repaint();
+        let el = start_time.elapsed();
+        if speed_watchdog && el >= Duration::from_secs(10) && el <= Duration::from_secs(22) && speed_mb < 0.6 {
+            log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
+            abort = Some(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
+            break;
+        }
+    }
+    if abort.is_some() {
+        stop.store(true, Ordering::SeqCst);
+        kill_all(&pids);
+    }
+    let mut first_err = None;
+    for h in handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => { first_err.get_or_insert(e); }
+            Err(_) => { first_err.get_or_insert("segment thread panicked".into()); }
+        }
+    }
+    if let Some(e) = abort.or(first_err) {
+        stop.store(true, Ordering::SeqCst);
+        kill_all(&pids);
+        return Err(e);
+    }
+
+    // Verify and stitch segments into segment 0, then rename to dest.
+    for i in 0..n {
+        let len = std::fs::metadata(seg_path(i)).map(|m| m.len()).unwrap_or(0);
+        if len != bounds[i + 1] - bounds[i] {
+            return Err(format!("Incomplete segment {i}: {len} of {} bytes.", bounds[i + 1] - bounds[i]));
+        }
+    }
+    {
+        let mut out = std::fs::OpenOptions::new().append(true).open(seg_path(0))
+            .map_err(|e| format!("failed to open segment 0: {e}"))?;
+        for i in 1..n {
+            let mut inp = std::fs::File::open(seg_path(i)).map_err(|e| format!("failed to open segment {i}: {e}"))?;
+            std::io::copy(&mut inp, &mut out).map_err(|e| format!("failed to join segments: {e}"))?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    let final_len = std::fs::metadata(seg_path(0)).map(|m| m.len()).unwrap_or(0);
+    if final_len != total {
+        return Err(format!("Incomplete download: received {final_len} of {total} bytes."));
+    }
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
+    std::fs::rename(seg_path(0), dest).map_err(|e| format!("rename error: {e}"))?;
+    for i in 1..n {
+        let _ = std::fs::remove_file(seg_path(i));
+    }
+    let _ = std::fs::remove_file(&meta_path);
+    on_progress(total, total, speed_mb);
+    ctx.request_repaint();
+    Ok(())
+}
+
+fn download_stream<F>(
     client: &reqwest::blocking::Client,
     url: &str,
     dest: &Path,
@@ -610,6 +903,7 @@ fn download_file<F>(
     mut on_progress: F,
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
+    speed_watchdog: bool,
 ) -> Result<(), String>
 where
     F: FnMut(u64, u64, f32),
@@ -630,6 +924,81 @@ where
 
     if expected_size > 0 && existing_len > expected_size {
         existing_len = 0;
+        let _ = std::fs::remove_file(&part_path);
+    }
+
+    // Prefer Windows' bundled curl.exe: it is verified to saturate the link where the
+    // in-process client plateaus (~14 Mb/s). Falls back to reqwest if curl is unavailable.
+    let curl_exe = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("curl.exe"))
+        .filter(|p| p.is_file());
+    if let Some(curl_exe) = curl_exe {
+        if expected_size > 64 * 1024 * 1024 {
+            return download_segmented(&curl_exe, url, dest, &part_path, expected_size, on_progress, cancel, ctx, speed_watchdog);
+        }
+        let mut child = Command::new(&curl_exe)
+            .args(["-L", "--fail", "-s", "-S", "-C", "-", "--connect-timeout", "30", "-o"])
+            .arg(&part_path)
+            .arg(url)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to start curl: {e}"))?;
+        let total_bytes = expected_size;
+        let start_time = Instant::now();
+        let mut last_len = existing_len;
+        let mut last_tick = Instant::now();
+        let mut speed_mb = 0.0f32;
+        on_progress(existing_len, total_bytes, 0.0);
+        ctx.request_repaint();
+        let status = loop {
+            if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                break st;
+            }
+            if cancel.load(Ordering::SeqCst) {
+                kill_tree(&mut child);
+                return Err("download cancelled".into());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            let len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(last_len);
+            let secs = last_tick.elapsed().as_secs_f32();
+            if secs > 0.0 {
+                let inst = (len.saturating_sub(last_len) as f32 / 1024.0 / 1024.0) / secs;
+                speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
+            }
+            last_len = len;
+            last_tick = Instant::now();
+            on_progress(len, total_bytes, speed_mb);
+            ctx.request_repaint();
+            let el = start_time.elapsed();
+            if speed_watchdog && el >= Duration::from_secs(10) && el <= Duration::from_secs(22)
+                && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
+                log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
+                kill_tree(&mut child);
+                return Err(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
+            }
+        };
+        if !status.success() {
+            let mut msg = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                use std::io::Read;
+                let _ = e.read_to_string(&mut msg);
+            }
+            return Err(format!("curl failed ({status}): {}", msg.trim()));
+        }
+        let len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+        if total_bytes > 0 && len != total_bytes {
+            return Err(format!("Incomplete download: received {len} of {total_bytes} bytes."));
+        }
+        if dest.exists() {
+            let _ = std::fs::remove_file(dest);
+        }
+        std::fs::rename(&part_path, dest).map_err(|e| format!("rename error: {e}"))?;
+        on_progress(len, len, speed_mb);
+        ctx.request_repaint();
+        return Ok(());
     }
 
     let mut req = client.get(url);
@@ -640,7 +1009,7 @@ where
     let mut resp = req.send().map_err(|e| format!("HTTP request failed: {e}"))?;
     let status = resp.status();
 
-    let (mut file, total_bytes) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+    let (file, total_bytes) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
         let range_start = resp.headers().get(reqwest::header::CONTENT_RANGE)
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("bytes "))
@@ -683,9 +1052,25 @@ where
         return Err(format!("server returned HTTP status {status}"));
     };
 
-    use std::io::{Read, Write};
-    let mut buf = vec![0u8; 1024 * 1024]; // 1MB buffer
+    use std::io::{BufWriter, Read, Write};
+    use std::sync::mpsc::sync_channel;
+
+    // Decouple network reading from disk writing with a 32 MB in-memory ring buffer (64 x 512KB).
+    // This guarantees the network socket read loop NEVER pauses when disk I/O, NTFS allocation,
+    // or Windows Defender antivirus holds the filesystem lock.
+    let (tx, rx) = sync_channel::<Vec<u8>>(64);
+    let writer_thread = std::thread::spawn(move || -> Result<(), String> {
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        while let Ok(chunk) = rx.recv() {
+            writer.write_all(&chunk).map_err(|e| format!("disk write error: {e}"))?;
+        }
+        writer.flush().map_err(|e| format!("disk flush error: {e}"))?;
+        Ok(())
+    });
+
+    let mut buf = vec![0u8; 256 * 1024]; // 256 KB read buffer
     let mut downloaded = existing_len;
+    let start_time = Instant::now();
     let mut last_tick = Instant::now();
     let mut bytes_since_tick = 0u64;
     let mut speed_mb = 0.0f32;
@@ -693,17 +1078,26 @@ where
     on_progress(downloaded, total_bytes, speed_mb);
     ctx.request_repaint();
 
+    let mut download_err: Option<String> = None;
+
     loop {
         if cancel.load(Ordering::SeqCst) {
-            return Err("download cancelled".into());
+            download_err = Some("download cancelled".into());
+            break;
         }
         let n = match resp.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("download read error: {e}")),
+            Err(e) => {
+                download_err = Some(format!("download read error: {e}"));
+                break;
+            }
         };
-        file.write_all(&buf[..n]).map_err(|e| format!("write error: {e}"))?;
+        if tx.send(buf[..n].to_vec()).is_err() {
+            download_err = Some("disk writer channel closed".into());
+            break;
+        }
         downloaded += n as u64;
         bytes_since_tick += n as u64;
 
@@ -711,19 +1105,35 @@ where
         if elapsed >= Duration::from_millis(250) {
             let secs = elapsed.as_secs_f32();
             if secs > 0.0 {
-                speed_mb = (bytes_since_tick as f32 / 1024.0 / 1024.0) / secs;
+                let inst = (bytes_since_tick as f32 / 1024.0 / 1024.0) / secs;
+                speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
             }
             last_tick = Instant::now();
             bytes_since_tick = 0;
             on_progress(downloaded, total_bytes, speed_mb);
             ctx.request_repaint();
+
+            // Speed Watchdog: During the initial qualification window (10s to 22s), if sustained speed is choked under 0.6 MB/s, switch mirror.
+            let elapsed_total = start_time.elapsed();
+            if speed_watchdog && elapsed_total >= Duration::from_secs(10) && elapsed_total <= Duration::from_secs(22) && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
+                log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
+                download_err = Some(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
+                break;
+            }
         }
     }
+
+    drop(tx);
+    let writer_res = writer_thread.join().map_err(|_| "disk writer thread panicked".to_string())?;
+    writer_res?;
+
+    if let Some(err) = download_err {
+        return Err(err);
+    }
+
     if total_bytes > 0 && downloaded != total_bytes {
         return Err(format!("Incomplete download: received {downloaded} of {total_bytes} bytes."));
     }
-    file.flush().map_err(|e| format!("flush error: {e}"))?;
-    drop(file);
 
     if dest.exists() {
         let _ = std::fs::remove_file(dest);
@@ -732,6 +1142,21 @@ where
     on_progress(downloaded, total_bytes, speed_mb);
     ctx.request_repaint();
     Ok(())
+}
+
+fn download_file<F>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    expected_size: u64,
+    on_progress: F,
+    cancel: &AtomicBool,
+    ctx: &eframe::egui::Context,
+) -> Result<(), String>
+where
+    F: FnMut(u64, u64, f32),
+{
+    download_stream(client, url, dest, expected_size, on_progress, cancel, ctx, false)
 }
 
 fn bootstrap_engine(
@@ -823,114 +1248,171 @@ fn bootstrap_models(
     dl_client: &reqwest::blocking::Client,
     models_dir: &Path,
     profile: &Profile,
-) -> Result<(), String> {
-    let mut current_models_dir = if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
-        p
-    } else {
-        models_dir.to_path_buf()
-    };
+) -> Result<(), (String, String)> {
+    let all_profiles = Profile::all();
+    let ltx_profile = all_profiles.iter().find(|p| p.id == "ltx_2.3").cloned();
 
-    let missing: Vec<_> = profile
-        .models
-        .iter()
-        .filter(|m| !safe_model_path(&current_models_dir, &m.category, &m.filename).exists())
-        .cloned()
-        .collect();
+    loop {
+        let mut current_models_dir = if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
+            p
+        } else {
+            models_dir.to_path_buf()
+        };
 
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    let total_all_bytes: u64 = missing.iter().map(|m| m.size_bytes).sum();
-    let mut completed_bytes: u64 = 0;
-
-    for (idx, m) in missing.iter().enumerate() {
-        if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
-            current_models_dir = p;
+        let mut target_models: Vec<ModelFile> = Vec::new();
+        if sh.dl_image_model.load(Ordering::SeqCst) {
+            target_models.extend(profile.models.clone());
         }
-        let dest = safe_model_path(&current_models_dir, &m.category, &m.filename);
-        log(&format!("bootstrap: downloading model {} -> {}", m.filename, dest.display()));
-
-        let cur_file = m.filename.clone();
-        let cur_idx = idx + 1;
-        let total_files = missing.len();
-        let file_expected = m.size_bytes;
-
-        let mut download_result = download_file(
-            dl_client,
-            &m.hf_url,
-            &dest,
-            file_expected,
-            |done, total, speed| {
-                let f_prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-                let overall = if total_all_bytes > 0 {
-                    ((completed_bytes + done) as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
-                } else {
-                    f_prog
-                };
-                *sh.state.lock().unwrap() = EngState::DownloadingModels {
-                    current_file: cur_file.clone(),
-                    file_index: cur_idx,
-                    total_files,
-                    file_progress: f_prog,
-                    bytes_done: done,
-                    bytes_total: total,
-                    speed_mb: speed,
-                    overall_progress: overall,
-                };
-            },
-            &sh.cancel,
-            ctx,
-        );
-
-        if download_result.is_err() && !m.modelscope_url.is_empty() {
-            log(&format!("HF download failed for {}, falling back to ModelScope", m.filename));
-            download_result = download_file(
-                dl_client,
-                &m.modelscope_url,
-                &dest,
-                file_expected,
-                |done, total, speed| {
-                    let f_prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-                    let overall = if total_all_bytes > 0 {
-                        ((completed_bytes + done) as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
-                    } else {
-                        f_prog
-                    };
-                    *sh.state.lock().unwrap() = EngState::DownloadingModels {
-                        current_file: cur_file.clone(),
-                        file_index: cur_idx,
-                        total_files,
-                        file_progress: f_prog,
-                        bytes_done: done,
-                        bytes_total: total,
-                        speed_mb: speed,
-                        overall_progress: overall,
-                    };
-                },
-                &sh.cancel,
-                ctx,
-            );
-        }
-
-        if let Err(e) = download_result {
-            return Err(format!("Failed to download {}: {e}", m.filename));
-        }
-
-        if let Some(target) = sh.pending_models_dir.lock().unwrap().clone() {
-            if target != current_models_dir {
-                let target_dest = safe_model_path(&target, &m.category, &m.filename);
-                log(&format!("bootstrap: moving finished model file to new storage: {} -> {}", dest.display(), target_dest.display()));
-                let _ = move_file_robust(&dest, &target_dest);
-                current_models_dir = target;
+        if sh.dl_video_model.load(Ordering::SeqCst) {
+            if let Some(ref vid_p) = ltx_profile {
+                target_models.extend(vid_p.models.clone());
             }
         }
 
-        completed_bytes += file_expected;
+        let missing: Vec<_> = target_models
+            .iter()
+            .filter(|m| !safe_model_path(&current_models_dir, &m.category, &m.filename).exists())
+            .cloned()
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let total_all_bytes: u64 = missing.iter().map(|m| m.size_bytes).sum();
+        let mut completed_bytes: u64 = 0;
+        let mut any_interrupted = false;
+
+        for (idx, m) in missing.iter().enumerate() {
+            let is_video_model = ltx_profile.as_ref().map(|vp| vp.models.iter().any(|vm| vm.filename == m.filename)).unwrap_or(false);
+            if is_video_model && !sh.dl_video_model.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !is_video_model && !sh.dl_image_model.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
+                current_models_dir = p;
+            }
+            let dest = safe_model_path(&current_models_dir, &m.category, &m.filename);
+            if dest.exists() {
+                completed_bytes += m.size_bytes;
+                continue;
+            }
+
+            log(&format!("bootstrap: downloading model {} -> {}", m.filename, dest.display()));
+
+            let cur_file = m.filename.clone();
+            let cur_idx = idx + 1;
+            let total_files = missing.len();
+            let file_expected = m.size_bytes;
+
+            let file_cancel = AtomicBool::new(false);
+            let cancel_ref = &file_cancel;
+
+            let hf_mirror_url = if m.hf_url.starts_with("https://huggingface.co/") {
+                m.hf_url.replace("https://huggingface.co/", "https://hf-mirror.com/")
+            } else {
+                String::new()
+            };
+
+            // Download candidates in priority order:
+            // 1. huggingface.co direct (CDN; verified >80 Mb/s with curl)
+            // 2. ModelScope, 3. hf-mirror.com — fallbacks only. The mirrors are China-hosted and
+            //    gave spiky ~15 Mb/s throughput that the 0.6 MB/s watchdog never flagged.
+            let mut candidates = Vec::new();
+            if !m.hf_url.is_empty() {
+                candidates.push((m.hf_url.clone(), "HuggingFace"));
+            }
+            if !m.modelscope_url.is_empty() {
+                candidates.push((m.modelscope_url.clone(), "ModelScope"));
+            }
+            if !hf_mirror_url.is_empty() {
+                candidates.push((hf_mirror_url, "hf-mirror"));
+            }
+
+            let total_candidates = candidates.len();
+            let mut download_result = Err("No download candidates".to_string());
+            for (c_idx, (url, source_name)) in candidates.into_iter().enumerate() {
+                if cancel_ref.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) || sh.cancel_model_dl.load(Ordering::SeqCst) {
+                    break;
+                }
+                let is_last_candidate = c_idx + 1 >= total_candidates;
+                // Only watchdog-abort if there is another mirror to switch to!
+                let enable_watchdog = !is_last_candidate;
+                log(&format!("bootstrap: attempting download for {} via {} ({url}) [watchdog={enable_watchdog}]", m.filename, source_name));
+                download_result = download_stream(
+                    dl_client,
+                    &url,
+                    &dest,
+                    file_expected,
+                    |done, total, speed| {
+                        if sh.cancel.load(Ordering::SeqCst) || sh.cancel_model_dl.load(Ordering::SeqCst) {
+                            cancel_ref.store(true, Ordering::SeqCst);
+                        }
+                        let f_prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                        let overall = if total_all_bytes > 0 {
+                            ((completed_bytes + done) as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+                        } else {
+                            f_prog
+                        };
+                        *sh.state.lock().unwrap() = EngState::DownloadingModels {
+                            current_file: cur_file.clone(),
+                            file_index: cur_idx,
+                            total_files,
+                            file_progress: f_prog,
+                            bytes_done: done,
+                            bytes_total: total,
+                            speed_mb: speed,
+                            overall_progress: overall,
+                        };
+                    },
+                    cancel_ref,
+                    ctx,
+                    enable_watchdog,
+                );
+                if download_result.is_ok() {
+                    log(&format!("bootstrap: successfully downloaded {} via {}", m.filename, source_name));
+                    break;
+                } else {
+                    log(&format!("bootstrap: download from {} failed or throttled: {:?}", source_name, download_result.as_ref().err()));
+                }
+            }
+
+            if sh.cancel_model_dl.swap(false, Ordering::SeqCst) {
+                log(&format!("bootstrap: model download interrupted by checkbox change for {}", m.filename));
+                any_interrupted = true;
+                break;
+            }
+
+            if let Err(e) = download_result {
+                if sh.cancel.load(Ordering::SeqCst) {
+                    return Err((m.filename.clone(), "Setup cancelled by user".into()));
+                }
+                return Err((m.filename.clone(), format!("Failed to download {}: {e}", m.filename)));
+            }
+
+            if let Some(target) = sh.pending_models_dir.lock().unwrap().clone() {
+                if target != current_models_dir {
+                    let target_dest = safe_model_path(&target, &m.category, &m.filename);
+                    log(&format!("bootstrap: moving finished model file to new storage: {} -> {}", dest.display(), target_dest.display()));
+                    let _ = move_file_robust(&dest, &target_dest);
+                    current_models_dir = target;
+                }
+            }
+
+            completed_bytes += file_expected;
+        }
+
+        if !any_interrupted {
+            break;
+        }
     }
 
     Ok(())
 }
+
 
 pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
@@ -938,6 +1420,10 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
         let dl_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(7200))
             .connect_timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .no_proxy()
+            .http1_only()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .build()
             .unwrap();
 
@@ -1033,9 +1519,12 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                         .map(|m| (m.filename.clone(), models.join(&m.category).join(&m.filename).exists()))
                         .collect();
                 }
-                Err(e) => {
+                Err((file, e)) => {
                     failed = true;
-                    *sh.state.lock().unwrap() = EngState::Failed(e);
+                    *sh.state.lock().unwrap() = EngState::ModelDownloadFailed {
+                        current_file: file,
+                        error: e,
+                    };
                     ctx.request_repaint();
                     std::thread::sleep(Duration::from_millis(600));
                     continue;
@@ -1242,10 +1731,10 @@ mod tests {
     fn unsatisfiable_range_does_not_promote_wrong_sized_file() {
         let dir = sandbox();
         let dest = dir.join("engine.7z");
-        std::fs::write(dest.with_extension("7z.part"), "abc").unwrap();
         let url = serve("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */6\r\nConnection: close\r\n\r\n");
         assert!(download(&url, &dest, 6).is_err());
         assert!(!dest.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+

@@ -3,6 +3,7 @@ mod app;
 mod comfy;
 mod engine;
 mod updater;
+pub mod video;
 
 fn load_app_icon() -> Option<eframe::egui::IconData> {
     let bytes = include_bytes!("../assets/icon.png");
