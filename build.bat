@@ -7,6 +7,7 @@ cargo build --release
 if %ERRORLEVEL% neq 0 (
     echo.
     echo [ERROR] Build failed!
+    timeout /t 3 2>nul
     pause
     exit /b %ERRORLEVEL%
 )
@@ -15,11 +16,12 @@ echo [2/2] Updating ImageStudio.exe in workspace root...
 copy /y "target\release\ImageStudio.exe" "ImageStudio.exe" >nul
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo [WARNING] Could not overwrite root ImageStudio.exe (it might be currently running).
+    echo [WARNING] Could not overwrite root ImageStudio.exe - it might be currently running.
     echo You can still find the built executable at: target\release\ImageStudio.exe
 ) else (
     echo [SUCCESS] Build complete! Executable updated at ImageStudio.exe
 )
 
 echo.
-pause
+timeout /t 3 2>nul
+

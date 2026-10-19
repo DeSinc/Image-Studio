@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -669,18 +669,136 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", py.display()))
 }
 
-const DL_SEGMENTS: u64 = 8;
+static PEAK_DOWNLOAD_SPEED_BPS: AtomicU64 = AtomicU64::new(0);
 
-/// Parallel ranged download via several curl processes. Each segment streams into its own
-/// `<part>.N` file and resumes independently; segment boundaries are persisted in `<part>.segs`
-/// so stop/restart keeps working. Hides per-connection ramp-up/stalls (e.g. HF Xet bridge).
-#[allow(clippy::too_many_arguments)]
-fn download_segmented<F>(
+fn update_peak_speed(speed_mb: f32) {
+    if speed_mb <= 0.0 {
+        return;
+    }
+    let bps = (speed_mb * 1024.0 * 1024.0) as u64;
+    let mut cur = PEAK_DOWNLOAD_SPEED_BPS.load(Ordering::Relaxed);
+    while bps > cur {
+        match PEAK_DOWNLOAD_SPEED_BPS.compare_exchange_weak(cur, bps, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Lightweight parallel probe that measures curl's network download speed into memory without disk writes.
+struct CurlSpeedProbe {
+    stop: Arc<AtomicBool>,
+    child_id: Arc<AtomicU32>,
+    speed_bps: Arc<AtomicU64>,
+    start_time: Instant,
+}
+
+impl CurlSpeedProbe {
+    fn start(curl_exe: &Path, url: &str, probe_start: u64, probe_len: u64) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let child_id = Arc::new(AtomicU32::new(0));
+        let speed_bps = Arc::new(AtomicU64::new(0));
+
+        let stop_clone = stop.clone();
+        let child_id_clone = child_id.clone();
+        let speed_bps_clone = speed_bps.clone();
+        let curl_path = curl_exe.to_path_buf();
+        let url_str = url.to_string();
+
+        let _ = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut cmd = Command::new(&curl_path);
+            cmd.args(["-L", "--fail", "-s", "-S", "--connect-timeout", "10", "--max-time", "16", "-o", "-"]);
+            if probe_len > 0 {
+                cmd.arg("-r").arg(format!("{}-{}", probe_start, probe_start + probe_len));
+            }
+            cmd.arg(&url_str)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            child_id_clone.store(child.id(), Ordering::SeqCst);
+
+            let mut stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => {
+                    kill_tree(&mut child);
+                    return;
+                }
+            };
+
+            let mut buf = [0u8; 64 * 1024];
+            let mut last_tick = Instant::now();
+            let mut bytes_since = 0u64;
+            let mut smoothed_bps = 0.0f32;
+
+            loop {
+                if stop_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes_since += n as u64;
+                        let elapsed = last_tick.elapsed();
+                        if elapsed >= Duration::from_millis(250) {
+                            let secs = elapsed.as_secs_f32();
+                            if secs > 0.0 {
+                                let inst = bytes_since as f32 / secs;
+                                smoothed_bps = if smoothed_bps == 0.0 { inst } else { smoothed_bps * 0.7 + inst * 0.3 };
+                                speed_bps_clone.store(smoothed_bps as u64, Ordering::SeqCst);
+                            }
+                            last_tick = Instant::now();
+                            bytes_since = 0;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            kill_tree(&mut child);
+        });
+
+        Some(Self {
+            stop,
+            child_id,
+            speed_bps,
+            start_time: Instant::now(),
+        })
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let pid = self.child_id.load(Ordering::SeqCst);
+        if pid > 0 {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+impl Drop for CurlSpeedProbe {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Seamless single-stream curl download that resumes on an existing partial file (`-C -`).
+fn download_curl_resume<F>(
     curl_exe: &Path,
     url: &str,
     dest: &Path,
     part_path: &Path,
-    total: u64,
+    total_bytes: u64,
+    existing_len: u64,
     mut on_progress: F,
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
@@ -689,208 +807,73 @@ fn download_segmented<F>(
 where
     F: FnMut(u64, u64, f32),
 {
-    use std::io::{Read, Write};
-    use std::sync::atomic::AtomicU64;
+    let mut child = Command::new(curl_exe)
+        .args(["-L", "--fail", "-s", "-S", "-C", "-", "--connect-timeout", "30", "-o"])
+        .arg(part_path)
+        .arg(url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start curl: {e}"))?;
 
-    let seg_path = |i: usize| PathBuf::from(format!("{}.{i}", part_path.display()));
-    let meta_path = PathBuf::from(format!("{}.segs", part_path.display()));
+    let start_time = Instant::now();
+    let mut last_len = existing_len;
+    let mut last_tick = Instant::now();
+    let mut speed_mb = 0.0f32;
 
-    // Load or create segment boundaries.
-    let mut bounds: Vec<u64> = std::fs::read_to_string(&meta_path)
-        .ok()
-        .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
-        .unwrap_or_default();
-    if bounds.len() < 2 || bounds[0] != 0 || *bounds.last().unwrap() != total {
-        // Fresh layout. Reuse a legacy single .part file as the start of segment 0.
-        let existing = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0).min(total);
-        let rest = total - existing;
-        let chunk = rest.div_ceil(DL_SEGMENTS).max(1);
-        bounds = vec![0];
-        let mut b = existing;
-        while b < total {
-            b = (b + chunk).min(total);
-            bounds.push(b);
-        }
-        if bounds.len() < 2 {
-            bounds.push(total);
-        }
-        for i in 0..bounds.len() - 1 {
-            let _ = std::fs::remove_file(seg_path(i));
-        }
-        if existing > 0 {
-            std::fs::rename(part_path, seg_path(0)).map_err(|e| format!("rename error: {e}"))?;
-        }
-        std::fs::write(&meta_path, bounds.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" "))
-            .map_err(|e| format!("failed to write segment map: {e}"))?;
-    }
-    let n = bounds.len() - 1;
+    on_progress(existing_len, total_bytes, 0.0);
+    ctx.request_repaint();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut have = Vec::with_capacity(n);
-    let mut counters = Vec::with_capacity(n);
-    let mut handles = Vec::with_capacity(n);
-    for i in 0..n {
-        let (lo, hi) = (bounds[i], bounds[i + 1]);
-        let path = seg_path(i);
-        let mut len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if len > hi - lo {
-            let _ = std::fs::remove_file(&path);
-            len = 0;
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st;
         }
-        have.push(len);
-        let counter = Arc::new(AtomicU64::new(len));
-        counters.push(counter.clone());
-        let (stop, pids, curl_exe, url) = (stop.clone(), pids.clone(), curl_exe.to_path_buf(), url.to_string());
-        handles.push(std::thread::spawn(move || -> Result<(), String> {
-            let need = hi - lo;
-            let mut attempts = 0;
-            loop {
-                let got = counter.load(Ordering::SeqCst);
-                if got >= need || stop.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                let mut child = Command::new(&curl_exe)
-                    .args(["-L", "--fail", "-s", "-S", "--connect-timeout", "30", "--speed-limit", "1", "--speed-time", "60", "-r"])
-                    .arg(format!("{}-{}", lo + got, hi - 1))
-                    .arg(&url)
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("failed to start curl: {e}"))?;
-                pids.lock().unwrap().push(child.id());
-                let mut out = child.stdout.take().unwrap();
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-                    .map_err(|e| format!("failed to open segment: {e}"))?;
-                let mut buf = vec![0u8; 512 * 1024];
-                let mut overflow = false;
-                loop {
-                    let r = match out.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(r) => r,
-                    };
-                    let cur = counter.load(Ordering::SeqCst);
-                    if cur + r as u64 > need {
-                        overflow = true; // server ignored Range
-                        break;
-                    }
-                    if file.write_all(&buf[..r]).is_err() {
-                        break;
-                    }
-                    counter.fetch_add(r as u64, Ordering::SeqCst);
-                }
-                let _ = file.flush();
-                if overflow {
-                    kill_tree(&mut child);
-                    return Err("server does not support ranged downloads".into());
-                }
-                let status = child.wait().ok();
-                if counter.load(Ordering::SeqCst) >= need || stop.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                attempts += 1;
-                if attempts >= 6 {
-                    let mut msg = String::new();
-                    if let Some(mut e) = child.stderr.take() {
-                        let _ = e.read_to_string(&mut msg);
-                    }
-                    return Err(format!("segment {i} failed ({status:?}): {}", msg.trim()));
-                }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }));
-    }
+        if cancel.load(Ordering::SeqCst) {
+            kill_tree(&mut child);
+            return Err("download cancelled".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        let len = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(last_len);
+        let secs = last_tick.elapsed().as_secs_f32();
+        if secs > 0.0 {
+            let inst = (len.saturating_sub(last_len) as f32 / 1024.0 / 1024.0) / secs;
+            speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
+            update_peak_speed(speed_mb);
+        }
+        last_len = len;
+        last_tick = Instant::now();
+        on_progress(len, total_bytes, speed_mb);
+        ctx.request_repaint();
 
-    let kill_all = |pids: &Mutex<Vec<u32>>| {
-        for pid in pids.lock().unwrap().iter() {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let el = start_time.elapsed();
+        if speed_watchdog && el >= Duration::from_secs(10) && el <= Duration::from_secs(22)
+            && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
+            log(&format!("Download watchdog: curl stream is throttled at {speed_mb:.2} MB/s, switching mirror"));
+            kill_tree(&mut child);
+            return Err(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
         }
     };
 
-    let start_time = Instant::now();
-    let mut last_done: u64 = have.iter().sum();
-    let mut last_tick = Instant::now();
-    let mut speed_mb = 0.0f32;
-    on_progress(last_done, total, 0.0);
-    ctx.request_repaint();
-    let mut abort: Option<String> = None;
-    while handles.iter().any(|h| !h.is_finished()) {
-        if cancel.load(Ordering::SeqCst) {
-            abort = Some("download cancelled".into());
-            break;
+    if !status.success() {
+        let mut msg = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut msg);
         }
-        std::thread::sleep(Duration::from_millis(250));
-        let done: u64 = counters.iter().map(|c| c.load(Ordering::SeqCst)).sum();
-        let secs = last_tick.elapsed().as_secs_f32();
-        if secs > 0.0 {
-            let inst = (done.saturating_sub(last_done) as f32 / 1024.0 / 1024.0) / secs;
-            speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
-        }
-        last_done = done;
-        last_tick = Instant::now();
-        on_progress(done, total, speed_mb);
-        ctx.request_repaint();
-        let el = start_time.elapsed();
-        if speed_watchdog && el >= Duration::from_secs(10) && el <= Duration::from_secs(22) && speed_mb < 0.6 {
-            log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
-            abort = Some(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
-            break;
-        }
-    }
-    if abort.is_some() {
-        stop.store(true, Ordering::SeqCst);
-        kill_all(&pids);
-    }
-    let mut first_err = None;
-    for h in handles {
-        match h.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => { first_err.get_or_insert(e); }
-            Err(_) => { first_err.get_or_insert("segment thread panicked".into()); }
-        }
-    }
-    if let Some(e) = abort.or(first_err) {
-        stop.store(true, Ordering::SeqCst);
-        kill_all(&pids);
-        return Err(e);
+        return Err(format!("curl failed ({status}): {}", msg.trim()));
     }
 
-    // Verify and stitch segments into segment 0, then rename to dest.
-    for i in 0..n {
-        let len = std::fs::metadata(seg_path(i)).map(|m| m.len()).unwrap_or(0);
-        if len != bounds[i + 1] - bounds[i] {
-            return Err(format!("Incomplete segment {i}: {len} of {} bytes.", bounds[i + 1] - bounds[i]));
-        }
-    }
-    {
-        let mut out = std::fs::OpenOptions::new().append(true).open(seg_path(0))
-            .map_err(|e| format!("failed to open segment 0: {e}"))?;
-        for i in 1..n {
-            let mut inp = std::fs::File::open(seg_path(i)).map_err(|e| format!("failed to open segment {i}: {e}"))?;
-            std::io::copy(&mut inp, &mut out).map_err(|e| format!("failed to join segments: {e}"))?;
-        }
-        out.flush().map_err(|e| e.to_string())?;
-    }
-    let final_len = std::fs::metadata(seg_path(0)).map(|m| m.len()).unwrap_or(0);
-    if final_len != total {
-        return Err(format!("Incomplete download: received {final_len} of {total} bytes."));
+    let len = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
+    if total_bytes > 0 && len != total_bytes {
+        return Err(format!("Incomplete download: received {len} of {total_bytes} bytes."));
     }
     if dest.exists() {
         let _ = std::fs::remove_file(dest);
     }
-    std::fs::rename(seg_path(0), dest).map_err(|e| format!("rename error: {e}"))?;
-    for i in 1..n {
-        let _ = std::fs::remove_file(seg_path(i));
-    }
-    let _ = std::fs::remove_file(&meta_path);
-    on_progress(total, total, speed_mb);
+    std::fs::rename(part_path, dest).map_err(|e| format!("rename error: {e}"))?;
+    on_progress(len, len, speed_mb);
     ctx.request_repaint();
     Ok(())
 }
@@ -927,79 +910,9 @@ where
         let _ = std::fs::remove_file(&part_path);
     }
 
-    // Prefer Windows' bundled curl.exe: it is verified to saturate the link where the
-    // in-process client plateaus (~14 Mb/s). Falls back to reqwest if curl is unavailable.
     let curl_exe = std::env::var_os("SystemRoot")
         .map(|r| PathBuf::from(r).join("System32").join("curl.exe"))
         .filter(|p| p.is_file());
-    if let Some(curl_exe) = curl_exe {
-        if expected_size > 64 * 1024 * 1024 {
-            return download_segmented(&curl_exe, url, dest, &part_path, expected_size, on_progress, cancel, ctx, speed_watchdog);
-        }
-        let mut child = Command::new(&curl_exe)
-            .args(["-L", "--fail", "-s", "-S", "-C", "-", "--connect-timeout", "30", "-o"])
-            .arg(&part_path)
-            .arg(url)
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("failed to start curl: {e}"))?;
-        let total_bytes = expected_size;
-        let start_time = Instant::now();
-        let mut last_len = existing_len;
-        let mut last_tick = Instant::now();
-        let mut speed_mb = 0.0f32;
-        on_progress(existing_len, total_bytes, 0.0);
-        ctx.request_repaint();
-        let status = loop {
-            if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
-                break st;
-            }
-            if cancel.load(Ordering::SeqCst) {
-                kill_tree(&mut child);
-                return Err("download cancelled".into());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-            let len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(last_len);
-            let secs = last_tick.elapsed().as_secs_f32();
-            if secs > 0.0 {
-                let inst = (len.saturating_sub(last_len) as f32 / 1024.0 / 1024.0) / secs;
-                speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
-            }
-            last_len = len;
-            last_tick = Instant::now();
-            on_progress(len, total_bytes, speed_mb);
-            ctx.request_repaint();
-            let el = start_time.elapsed();
-            if speed_watchdog && el >= Duration::from_secs(10) && el <= Duration::from_secs(22)
-                && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
-                log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
-                kill_tree(&mut child);
-                return Err(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
-            }
-        };
-        if !status.success() {
-            let mut msg = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                use std::io::Read;
-                let _ = e.read_to_string(&mut msg);
-            }
-            return Err(format!("curl failed ({status}): {}", msg.trim()));
-        }
-        let len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-        if total_bytes > 0 && len != total_bytes {
-            return Err(format!("Incomplete download: received {len} of {total_bytes} bytes."));
-        }
-        if dest.exists() {
-            let _ = std::fs::remove_file(dest);
-        }
-        std::fs::rename(&part_path, dest).map_err(|e| format!("rename error: {e}"))?;
-        on_progress(len, len, speed_mb);
-        ctx.request_repaint();
-        return Ok(());
-    }
 
     let mut req = client.get(url);
     if existing_len > 0 {
@@ -1079,6 +992,10 @@ where
     ctx.request_repaint();
 
     let mut download_err: Option<String> = None;
+    let mut should_swap_to_curl = false;
+    let mut probe_attempted = false;
+    let mut curl_probe: Option<CurlSpeedProbe> = None;
+    let mut consecutive_faster_time = Duration::ZERO;
 
     loop {
         if cancel.load(Ordering::SeqCst) {
@@ -1107,15 +1024,70 @@ where
             if secs > 0.0 {
                 let inst = (bytes_since_tick as f32 / 1024.0 / 1024.0) / secs;
                 speed_mb = if speed_mb == 0.0 { inst } else { speed_mb * 0.7 + inst * 0.3 };
+                update_peak_speed(speed_mb);
             }
             last_tick = Instant::now();
             bytes_since_tick = 0;
             on_progress(downloaded, total_bytes, speed_mb);
             ctx.request_repaint();
 
-            // Speed Watchdog: During the initial qualification window (10s to 22s), if sustained speed is choked under 0.6 MB/s, switch mirror.
             let elapsed_total = start_time.elapsed();
-            if speed_watchdog && elapsed_total >= Duration::from_secs(10) && elapsed_total <= Duration::from_secs(22) && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
+
+            // Parallel curl speed test:
+            // If download is large (> 50 MB), has been running >= 15s to let TCP ramp up,
+            // and is failing to break max speed observed on this connection (or slow < 2.5 MB/s),
+            // start a 15-second parallel test of curl in the background without interrupting reqwest.
+            if !probe_attempted && curl_probe.is_none() && curl_exe.is_some() && total_bytes > 50 * 1024 * 1024 && elapsed_total >= Duration::from_secs(15) {
+                let peak_bps = PEAK_DOWNLOAD_SPEED_BPS.load(Ordering::Relaxed);
+                let cur_bps = (speed_mb * 1024.0 * 1024.0) as u64;
+                let is_slow = if peak_bps >= 5 * 1024 * 1024 {
+                    cur_bps < peak_bps / 2
+                } else {
+                    speed_mb < 2.5
+                };
+                if is_slow {
+                    probe_attempted = true;
+                    let probe_start = (downloaded + 50 * 1024 * 1024).min(total_bytes.saturating_sub(150 * 1024 * 1024));
+                    let probe_len = 100 * 1024 * 1024;
+                    log(&format!(
+                        "Download probe: reqwest running at {speed_mb:.2} MB/s (connection peak: {:.2} MB/s). Starting 15s curl probe in parallel...",
+                        peak_bps as f32 / 1024.0 / 1024.0
+                    ));
+                    curl_probe = CurlSpeedProbe::start(curl_exe.as_ref().unwrap(), url, probe_start, probe_len);
+                }
+            }
+
+            // Monitor parallel curl probe
+            if let Some(ref probe) = curl_probe {
+                let curl_bps = probe.speed_bps.load(Ordering::SeqCst);
+                let curl_mb = curl_bps as f32 / 1024.0 / 1024.0;
+                let cur_bps = (speed_mb * 1024.0 * 1024.0) as u64;
+
+                // Check if curl exceeds reqwest speed significantly (> 1.25x and > 1.5 MB/s)
+                if curl_bps > (cur_bps as f32 * 1.25) as u64 && curl_mb > 1.5 {
+                    consecutive_faster_time += elapsed;
+                    if consecutive_faster_time >= Duration::from_secs(3) {
+                        log(&format!(
+                            "Download live swap: curl exceeded reqwest ({curl_mb:.2} MB/s vs {speed_mb:.2} MB/s) for 3 consecutive seconds. Swapping over to curl live!"
+                        ));
+                        should_swap_to_curl = true;
+                        break;
+                    }
+                } else {
+                    consecutive_faster_time = Duration::ZERO;
+                }
+
+                if probe.start_time.elapsed() >= Duration::from_secs(15) {
+                    log(&format!(
+                        "Download probe: curl 15s test completed (curl maxed at {curl_mb:.2} MB/s vs reqwest {speed_mb:.2} MB/s). Retaining original reqwest method."
+                    ));
+                    probe.stop();
+                    curl_probe = None;
+                }
+            }
+
+            // Speed Watchdog: During the initial qualification window (10s to 22s), if sustained speed is choked under 0.6 MB/s, switch mirror.
+            if speed_watchdog && curl_probe.is_none() && elapsed_total >= Duration::from_secs(10) && elapsed_total <= Duration::from_secs(22) && speed_mb < 0.6 && total_bytes > 50 * 1024 * 1024 {
                 log(&format!("Download watchdog: current stream is throttled at {speed_mb:.2} MB/s, switching to faster mirror"));
                 download_err = Some(format!("Download throttled at {speed_mb:.2} MB/s; switching mirror"));
                 break;
@@ -1123,9 +1095,30 @@ where
         }
     }
 
+    if let Some(probe) = curl_probe.take() {
+        probe.stop();
+    }
+
     drop(tx);
     let writer_res = writer_thread.join().map_err(|_| "disk writer thread panicked".to_string())?;
     writer_res?;
+
+    if should_swap_to_curl {
+        let flushed_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(downloaded);
+        log(&format!("Download live swap: resuming with curl from byte offset {flushed_len} / {total_bytes}"));
+        return download_curl_resume(
+            curl_exe.as_ref().unwrap(),
+            url,
+            dest,
+            &part_path,
+            total_bytes,
+            flushed_len,
+            on_progress,
+            cancel,
+            ctx,
+            speed_watchdog,
+        );
+    }
 
     if let Some(err) = download_err {
         return Err(err);

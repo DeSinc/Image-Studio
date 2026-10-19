@@ -31,6 +31,8 @@ const DIM: Color32 = Color32::from_rgb(138, 146, 170);
 const GREEN: Color32 = Color32::from_rgb(52, 211, 153);
 const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
+const DISCORD_GREEN: Color32 = Color32::from_rgb(35, 165, 90);
+const DISCORD_GREEN_HOVER: Color32 = Color32::from_rgb(43, 190, 104);
 const MAX_REFS: usize = 15;
 const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
@@ -324,6 +326,39 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).strong().color(DIM));
     ui.add_space(2.0);
+}
+
+fn draw_update_arrow_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.8, color);
+    // Vertical stem:
+    p.line_segment([center - vec2(0.0, 5.0), center + vec2(0.0, 2.0)], stroke);
+    // Chevron pointing down:
+    p.line_segment([center + vec2(-4.0, -1.5), center + vec2(0.0, 2.5)], stroke);
+    p.line_segment([center + vec2(4.0, -1.5), center + vec2(0.0, 2.5)], stroke);
+    // Horizontal tray bar beneath arrow:
+    p.line_segment([center + vec2(-5.0, 6.0), center + vec2(5.0, 6.0)], Stroke::new(1.5, color));
+}
+
+fn draw_restart_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    let r = 5.0;
+    let n_pts = 12;
+    let start_angle = 0.8f32;
+    let end_angle = 5.6f32;
+    let pts: Vec<egui::Pos2> = (0..=n_pts)
+        .map(|i| {
+            let t = i as f32 / n_pts as f32;
+            let a = start_angle + t * (end_angle - start_angle);
+            center + vec2(r * a.cos(), r * a.sin())
+        })
+        .collect();
+    for w in pts.windows(2) {
+        p.line_segment([w[0], w[1]], stroke);
+    }
+    if let Some(&tip) = pts.last() {
+        p.line_segment([tip, tip + vec2(2.5, -2.5)], stroke);
+        p.line_segment([tip, tip + vec2(-2.5, -1.0)], stroke);
+    }
 }
 
 impl App {
@@ -1648,6 +1683,8 @@ fn is_win_ctrl_v() -> bool {
                             p.circle_stroke(badge_pos, 4.0, Stroke::new(1.0, Color32::from_rgb(18, 21, 29)));
                         }
 
+                        self.render_update_button(ui, &ui.ctx().clone());
+
                         if ui.button("Outputs").on_hover_text("Open Image Studio output folder in Windows File Explorer").clicked() {
                             engine::open_output_folder(&self.sh);
                         }
@@ -1693,6 +1730,93 @@ fn is_win_ctrl_v() -> bool {
                     });
                 });
             });
+    }
+
+    fn render_update_button(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (up_avail, latest, is_dl, dl_prog, applied, checked) = {
+            let st = self.updater.lock().unwrap();
+            (
+                st.update_available,
+                st.latest_version.clone(),
+                st.downloading,
+                st.download_progress,
+                st.update_applied,
+                st.checked,
+            )
+        };
+
+        if applied {
+            let (rect, resp) = ui.allocate_exact_size(vec2(80.0, 24.0), Sense::click());
+            let bg = if resp.hovered() {
+                DISCORD_GREEN_HOVER
+            } else {
+                DISCORD_GREEN
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, bg);
+            draw_restart_icon(&p, rect.left_center() + vec2(14.0, 0.0), Color32::WHITE);
+            p.text(
+                rect.center() + vec2(8.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                "Restart",
+                egui::FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+            let resp = resp.on_hover_text("Update ready! Click to restart Image Studio now");
+            if resp.clicked() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).spawn();
+                    std::process::exit(0);
+                }
+            }
+        } else if is_dl {
+            let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 24.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, Color32::from_rgb(20, 24, 34));
+            p.rect_stroke(rect, 12.0, Stroke::new(1.0, DISCORD_GREEN), StrokeKind::Inside);
+            draw_update_arrow_icon(&p, rect.left_center() + vec2(14.0, 0.0), DISCORD_GREEN);
+            p.text(
+                rect.center() + vec2(8.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.0}%", dl_prog * 100.0),
+                egui::FontId::proportional(11.5),
+                Color32::WHITE,
+            );
+            let _ = resp.on_hover_text(format!("Downloading update: {:.0}%", dl_prog * 100.0));
+        } else if up_avail {
+            let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 24.0), Sense::click());
+            let bg = if resp.hovered() {
+                DISCORD_GREEN_HOVER
+            } else {
+                DISCORD_GREEN
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, bg);
+            draw_update_arrow_icon(&p, rect.center(), Color32::WHITE);
+            let resp = resp.on_hover_text(format!("Update v{latest} available! Click to update now"));
+            if resp.clicked() {
+                crate::updater::download_and_install_update(self.updater.clone(), ctx.clone());
+            }
+        } else {
+            let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::click());
+            let bg = if resp.hovered() { CARD_HI } else { Color32::TRANSPARENT };
+            let p = ui.painter();
+            if resp.hovered() {
+                p.rect_filled(rect, 4.0, bg);
+            }
+            let icon_col = if resp.hovered() { TEXT } else { DIM };
+            draw_update_arrow_icon(&p, rect.center(), icon_col);
+            let cur_ver = env!("CARGO_PKG_VERSION");
+            let tip = if checked {
+                format!("Image Studio v{cur_ver} (Up to date)\nClick to check for updates")
+            } else {
+                format!("Image Studio v{cur_ver}\nClick to check for updates")
+            };
+            let resp = resp.on_hover_text(tip);
+            if resp.clicked() {
+                crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
+            }
+        }
     }
 
     // Left Panel: Compact Reference Strip (+ Docked History if Left)
@@ -3969,224 +4093,237 @@ fn is_win_ctrl_v() -> bool {
         let mut open = self.show_setup;
         egui::Window::new("Setup & diagnostics")
             .open(&mut open)
-            .default_width(620.0)
+            .default_width(640.0)
+            .default_height(580.0)
+            .max_height(ctx.content_rect().height() - 60.0)
+            .resizable(true)
             .show(ctx, |ui| {
-                let paths = self.sh.paths.lock().unwrap().clone();
-                let state = self.sh.state.lock().unwrap().clone();
-                let st = match &state {
-                    EngState::Detecting => "Detecting engine...".to_string(),
-                    EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
-                        format!("{step} ({:.1}%) - {} / {} @ {:.1} MB/s", progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
-                    }
-                    EngState::ExtractingEngine { step } => step.clone(),
-                    EngState::RepairingEngine { step } => format!("Repairing: {step}"),
-                    EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, .. } => {
-                        format!("Downloading Model [{}/{}] {} ({:.1}%) - {} / {} @ {:.1} MB/s", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
-                    }
-                    EngState::Starting { since, attempt } => format!("Starting (attempt {}, {}s)", attempt + 1, since.elapsed().as_secs()),
-                    EngState::Ready { ours, gpu } => {
-                        format!("Ready on {gpu} ({})", if *ours { "launched by Image Studio" } else { "already running" })
-                    }
-                    EngState::ModelDownloadFailed { current_file, error } => format!("Model download failed ({current_file}): {error}"),
-                    EngState::Failed(m) => format!("Failed: {m}"),
-                };
-                ui.label(RichText::new(st).strong());
-                ui.separator();
-                heading(ui, "HARDWARE & MODEL PROFILE");
-                let vram_detected = engine::detect_gpu_vram_gb();
-                ui.horizontal(|ui| {
-                    ui.label("Detected GPU VRAM:");
-                    if let Some(vram) = vram_detected {
-                        ui.label(RichText::new(format!("~{vram} GB")).strong().color(GREEN));
-                        if vram <= 8 {
-                            ui.label(RichText::new("(8GB GPU detected - 8GB W4A8 profile recommended)").size(11.0).color(AMBER));
-                        }
-                    } else {
-                        ui.label(RichText::new("Auto-detecting...").color(DIM));
-                    }
-                });
-
-                let all_profiles = engine::Profile::all();
-                let cur_profile_id = self.profile.id.clone();
-                for p in all_profiles {
-                    let active = p.id == cur_profile_id;
-                    ui.horizontal(|ui| {
-                        let b = egui::Button::new(
-                            RichText::new(&p.name).size(12.0).color(if active { Color32::WHITE } else { TEXT })
-                        )
-                        .fill(if active { ACCENT } else { CARD_HI })
-                        .stroke(Stroke::new(1.0, if active { ACCENT_GLOW } else { LINE }))
-                        .corner_radius(4);
-
-                        if ui.add(b).clicked() && !active {
-                            let mut cfg = self.sh.cfg.lock().unwrap();
-                            cfg.active_profile = Some(p.id.clone());
-                            cfg.save();
-                            *self.sh.active_profile.lock().unwrap() = p.clone();
-                            self.profile = p.clone();
-                            self.sh.retry.store(true, Ordering::SeqCst);
-                        }
-                        ui.label(RichText::new(format!("(Rec: {}GB VRAM)", p.recommended_vram_gb)).size(11.0).color(DIM));
-                    });
-                    ui.label(RichText::new(&p.description).size(10.5).color(DIM));
-                    ui.add_space(2.0);
-                }
-
-                ui.separator();
-                heading(ui, "DIRECTORIES & PATHS");
-                egui::Grid::new("paths").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("ComfyUI");
-                    ui.label(RichText::new(paths.comfy.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
-                    if ui.button("Browse...").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                            let mut c = self.sh.cfg.lock().unwrap();
-                            c.comfy_dir = Some(d);
-                            c.save();
-                            self.sh.restart.store(true, Ordering::SeqCst);
-                        }
-                    }
-                    ui.end_row();
-
-                    ui.label("Python");
-                    ui.label(RichText::new(paths.python.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
-                    ui.label("");
-                    ui.end_row();
-
-                    ui.label("Models");
-                    ui.label(RichText::new(paths.models.display().to_string()).color(DIM));
-                    if ui.button("Browse...").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                            let mut c = self.sh.cfg.lock().unwrap();
-                            c.models_dir = Some(d);
-                            c.save();
-                        }
-                    }
-                    ui.end_row();
-                });
-
-                ui.separator();
-                heading(ui, "MODEL DOWNLOAD SELECTION");
-                self.render_model_checkboxes(ui);
-                ui.add_space(4.0);
-
-                ui.separator();
-                heading(ui, "MODEL FILES STATUS");
-                let vid_ok = self.has_video_models();
-                ui.label(
-                    RichText::new(format!("{}  LTX-Video 2.3 Checkpoint (ltx-2.3-22b-dev-fp8.safetensors)", if vid_ok { "found  " } else { "MISSING" }))
-                        .color(if vid_ok { GREEN } else { RED }),
-                );
-                for (name, ok) in self.sh.models_found.lock().unwrap().iter() {
-                    ui.label(
-                        RichText::new(format!("{}  {}", if *ok { "found  " } else { "MISSING" }, name))
-                            .color(if *ok { GREEN } else { RED }),
-                    );
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Retry Setup / Restart Engine").clicked() {
-                        self.sh.retry.store(true, Ordering::SeqCst);
-                        self.sh.restart.store(true, Ordering::SeqCst);
-                    }
-                    if ui.button("Switch to Clean Managed Engine").on_hover_text("Bypasses custom/old ComfyUI folders and downloads the official portable engine").clicked() {
-                        engine::reset_to_clean_engine(&self.sh);
-                    }
-                });
-
-                ui.separator();
-                heading(ui, "COMFYUI LOG (tail)");
                 egui::ScrollArea::vertical()
-                    .id_salt("l1")
-                    .max_height(160.0)
-                    .stick_to_bottom(true)
+                    .id_salt("setup_window_scroll")
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(engine::tail(&engine::data_dir().join("comfyui.log"), 40))
-                                    .monospace()
-                                    .size(12.0),
-                            )
-                            .selectable(true),
-                        );
-                    });
+                        let paths = self.sh.paths.lock().unwrap().clone();
+                        let state = self.sh.state.lock().unwrap().clone();
+                        let st = match &state {
+                            EngState::Detecting => "Detecting engine...".to_string(),
+                            EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
+                                format!("{step} ({:.1}%) - {} / {} @ {:.1} MB/s", progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
+                            }
+                            EngState::ExtractingEngine { step } => step.clone(),
+                            EngState::RepairingEngine { step } => format!("Repairing: {step}"),
+                            EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, .. } => {
+                                format!("Downloading Model [{}/{}] {} ({:.1}%) - {} / {} @ {:.1} MB/s", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
+                            }
+                            EngState::Starting { since, attempt } => format!("Starting (attempt {}, {}s)", attempt + 1, since.elapsed().as_secs()),
+                            EngState::Ready { ours, gpu } => {
+                                format!("Ready on {gpu} ({})", if *ours { "launched by Image Studio" } else { "already running" })
+                            }
+                            EngState::ModelDownloadFailed { current_file, error } => format!("Model download failed ({current_file}): {error}"),
+                            EngState::Failed(m) => format!("Failed: {m}"),
+                        };
+                        ui.label(RichText::new(st).strong());
+                        ui.separator();
 
-                heading(ui, "APP LOG (tail)");
-                egui::ScrollArea::vertical()
-                    .id_salt("l2")
-                    .max_height(100.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(engine::tail(&engine::data_dir().join("app.log"), 15))
-                                    .monospace()
-                                    .size(12.0),
-                            )
-                            .selectable(true),
-                        );
-                    });
+                        heading(ui, "SOFTWARE UPDATES");
+                        let cur_ver = env!("CARGO_PKG_VERSION");
+                        let (up_avail, latest, is_dl, dl_prog, applied, err) = {
+                            let st = self.updater.lock().unwrap();
+                            (st.update_available, st.latest_version.clone(), st.downloading, st.download_progress, st.update_applied, st.error.clone())
+                        };
 
-                ui.separator();
-                heading(ui, "STORAGE & DATA LOCATION");
-                if let Some(ref msg) = *self.sh.migration_status.lock().unwrap() {
-                    ui.label(RichText::new(msg).color(AMBER).size(12.0));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Migrate Models to Another Drive...").on_hover_text("Move models (~17GB) to another drive/partition (e.g. D:\\ImageStudio\\models)").clicked() {
-                        if let Some(target) = rfd::FileDialog::new().pick_folder() {
-                            let src = self.sh.paths.lock().unwrap().models.clone();
-                            engine::migrate_storage(self.sh.clone(), src, target.join("models"), true, ctx.clone());
+                        card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("Installed version: v{cur_ver}")).size(12.0).color(TEXT));
+                                if up_avail {
+                                    ui.label(RichText::new(format!("* Update available: v{latest}")).size(12.0).color(DISCORD_GREEN).strong());
+                                } else if !latest.is_empty() {
+                                    ui.label(RichText::new("(Up to date)").size(12.0).color(DIM));
+                                }
+                            });
+
+                            if let Some(ref e) = err {
+                                ui.label(RichText::new(format!("Update check: {e}")).size(11.5).color(RED));
+                            }
+
+                            if applied {
+                                ui.label(RichText::new("Update installed successfully! Restart Image Studio to use the new version.").color(DISCORD_GREEN).strong());
+                                if ui.button("Restart Image Studio Now").clicked() {
+                                    if let Ok(exe) = std::env::current_exe() {
+                                        let _ = std::process::Command::new(exe).spawn();
+                                        std::process::exit(0);
+                                    }
+                                }
+                            } else if is_dl {
+                                ui.label(RichText::new(format!("Downloading update: {:.0}%", dl_prog * 100.0)).size(12.0).color(ACCENT));
+                                let bar = egui::ProgressBar::new(dl_prog).show_percentage().fill(ACCENT);
+                                ui.add_sized([ui.available_width() - 20.0, 14.0], bar);
+                            } else if up_avail {
+                                let btn = egui::Button::new(RichText::new(format!("Download & Install Update (v{latest})")).size(12.0).strong().color(Color32::WHITE))
+                                    .fill(DISCORD_GREEN);
+                                if ui.add(btn).clicked() {
+                                    crate::updater::download_and_install_update(self.updater.clone(), ctx.clone());
+                                }
+                            } else {
+                                if ui.button("Check for Updates").clicked() {
+                                    crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
+                                }
+                            }
+                        });
+
+                        ui.separator();
+                        heading(ui, "HARDWARE & MODEL PROFILE");
+                        let vram_detected = engine::detect_gpu_vram_gb();
+                        ui.horizontal(|ui| {
+                            ui.label("Detected GPU VRAM:");
+                            if let Some(vram) = vram_detected {
+                                ui.label(RichText::new(format!("~{vram} GB")).strong().color(GREEN));
+                                if vram <= 8 {
+                                    ui.label(RichText::new("(8GB GPU detected - 8GB W4A8 profile recommended)").size(11.0).color(AMBER));
+                                }
+                            } else {
+                                ui.label(RichText::new("Auto-detecting...").color(DIM));
+                            }
+                        });
+
+                        let all_profiles = engine::Profile::all();
+                        let cur_profile_id = self.profile.id.clone();
+                        for p in all_profiles {
+                            let active = p.id == cur_profile_id;
+                            ui.horizontal(|ui| {
+                                let b = egui::Button::new(
+                                    RichText::new(&p.name).size(12.0).color(if active { Color32::WHITE } else { TEXT })
+                                )
+                                .fill(if active { ACCENT } else { CARD_HI })
+                                .stroke(Stroke::new(1.0, if active { ACCENT_GLOW } else { LINE }))
+                                .corner_radius(4);
+
+                                if ui.add(b).clicked() && !active {
+                                    let mut cfg = self.sh.cfg.lock().unwrap();
+                                    cfg.active_profile = Some(p.id.clone());
+                                    cfg.save();
+                                    *self.sh.active_profile.lock().unwrap() = p.clone();
+                                    self.profile = p.clone();
+                                    self.sh.retry.store(true, Ordering::SeqCst);
+                                }
+                                ui.label(RichText::new(format!("(Recommended: {}GB VRAM)", p.recommended_vram_gb)).size(11.0).color(DIM));
+                            });
+                            ui.label(RichText::new(&p.description).size(10.5).color(DIM));
+                            ui.add_space(2.0);
                         }
-                    }
-                    if ui.button("Open Outputs Folder").on_hover_text("Open Image Studio output images folder in Windows File Explorer").clicked() {
-                        engine::open_output_folder(&self.sh);
-                    }
-                });
 
-                ui.separator();
-                heading(ui, "SOFTWARE UPDATES");
-                let cur_ver = env!("CARGO_PKG_VERSION");
-                let (up_avail, latest, is_dl, dl_prog, applied, err) = {
-                    let st = self.updater.lock().unwrap();
-                    (st.update_available, st.latest_version.clone(), st.downloading, st.download_progress, st.update_applied, st.error.clone())
-                };
+                        ui.separator();
+                        heading(ui, "DIRECTORIES & PATHS");
+                        egui::Grid::new("paths").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                            ui.label("ComfyUI");
+                            ui.label(RichText::new(paths.comfy.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
+                            if ui.button("Browse...").clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    let mut c = self.sh.cfg.lock().unwrap();
+                                    c.comfy_dir = Some(d);
+                                    c.save();
+                                    self.sh.restart.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            ui.end_row();
 
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Installed version: v{cur_ver}")).size(12.0).color(TEXT));
-                    if up_avail {
-                        ui.label(RichText::new(format!("* Update available: v{latest}")).size(12.0).color(GREEN).strong());
-                    } else if !latest.is_empty() {
-                        ui.label(RichText::new("(Up to date)").size(12.0).color(DIM));
-                    }
-                });
+                            ui.label("Python");
+                            ui.label(RichText::new(paths.python.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
+                            ui.label("");
+                            ui.end_row();
 
-                if let Some(ref e) = err {
-                    ui.label(RichText::new(format!("Update check: {e}")).size(11.5).color(RED));
-                }
+                            ui.label("Models");
+                            ui.label(RichText::new(paths.models.display().to_string()).color(DIM));
+                            if ui.button("Browse...").clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    let mut c = self.sh.cfg.lock().unwrap();
+                                    c.models_dir = Some(d);
+                                    c.save();
+                                }
+                            }
+                            ui.end_row();
+                        });
 
-                if applied {
-                    ui.label(RichText::new("Update installed successfully! Restart Image Studio to use the new version.").color(GREEN).strong());
-                    if ui.button("Restart Image Studio Now").clicked() {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new(exe).spawn();
-                            std::process::exit(0);
+                        ui.separator();
+                        heading(ui, "MODEL DOWNLOAD SELECTION");
+                        self.render_model_checkboxes(ui);
+                        ui.add_space(4.0);
+
+                        ui.separator();
+                        heading(ui, "MODEL FILES STATUS");
+                        let vid_ok = self.has_video_models();
+                        ui.label(
+                            RichText::new(format!("{}  LTX-Video 2.3 Checkpoint (ltx-2.3-22b-dev-fp8.safetensors)", if vid_ok { "found  " } else { "MISSING" }))
+                                .color(if vid_ok { GREEN } else { RED }),
+                        );
+                        for (name, ok) in self.sh.models_found.lock().unwrap().iter() {
+                            ui.label(
+                                RichText::new(format!("{}  {}", if *ok { "found  " } else { "MISSING" }, name))
+                                    .color(if *ok { GREEN } else { RED }),
+                            );
                         }
-                    }
-                } else if is_dl {
-                    ui.label(RichText::new(format!("Downloading update: {:.0}%", dl_prog * 100.0)).size(12.0).color(ACCENT));
-                    let bar = egui::ProgressBar::new(dl_prog).show_percentage().fill(ACCENT);
-                    ui.add_sized([ui.available_width() - 20.0, 14.0], bar);
-                } else if up_avail {
-                    let btn = egui::Button::new("Download & Install Update").fill(ACCENT); if ui.add(btn).clicked() {
-                        crate::updater::download_and_install_update(self.updater.clone(), ctx.clone());
-                    }
-                } else {
-                    if ui.button("Check for Updates").clicked() {
-                        crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
-                    }
-                }
+                        ui.horizontal(|ui| {
+                            if ui.button("Retry Setup / Restart Engine").clicked() {
+                                self.sh.retry.store(true, Ordering::SeqCst);
+                                self.sh.restart.store(true, Ordering::SeqCst);
+                            }
+                            if ui.button("Switch to Clean Managed Engine").on_hover_text("Bypasses custom/old ComfyUI folders and downloads the official portable engine").clicked() {
+                                engine::reset_to_clean_engine(&self.sh);
+                            }
+                        });
 
-                ui.add_space(4.0);
-                ui.label(RichText::new(format!("Logs folder: {}", engine::data_dir().display())).size(12.0).color(DIM));
+                        ui.separator();
+                        heading(ui, "COMFYUI LOG (tail)");
+                        egui::ScrollArea::vertical()
+                            .id_salt("l1")
+                            .max_height(160.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(engine::tail(&engine::data_dir().join("comfyui.log"), 40))
+                                            .monospace()
+                                            .size(12.0),
+                                    )
+                                    .selectable(true),
+                                );
+                            });
+
+                        heading(ui, "APP LOG (tail)");
+                        egui::ScrollArea::vertical()
+                            .id_salt("l2")
+                            .max_height(100.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(engine::tail(&engine::data_dir().join("app.log"), 15))
+                                            .monospace()
+                                            .size(12.0),
+                                    )
+                                    .selectable(true),
+                                );
+                            });
+
+                        ui.separator();
+                        heading(ui, "STORAGE & DATA LOCATION");
+                        if let Some(ref msg) = *self.sh.migration_status.lock().unwrap() {
+                            ui.label(RichText::new(msg).color(AMBER).size(12.0));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Migrate Models to Another Drive...").on_hover_text("Move models (~17GB) to another drive/partition (e.g. D:\\ImageStudio\\models)").clicked() {
+                                if let Some(target) = rfd::FileDialog::new().pick_folder() {
+                                    let src = self.sh.paths.lock().unwrap().models.clone();
+                                    engine::migrate_storage(self.sh.clone(), src, target.join("models"), true, ctx.clone());
+                                }
+                            }
+                            if ui.button("Open Outputs Folder").on_hover_text("Open Image Studio output images folder in Windows File Explorer").clicked() {
+                                engine::open_output_folder(&self.sh);
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Logs folder: {}", engine::data_dir().display())).size(12.0).color(DIM));
+                    });
             });
         self.show_setup = open;
     }
