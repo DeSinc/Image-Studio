@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "image-studio"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "arboard",
  "dirs",

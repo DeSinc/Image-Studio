@@ -292,6 +292,7 @@ pub struct App {
     pub last_progress_val: u32,
     pub step_duration_ema: f32,
     pub is_swapping_detected: bool,
+    pub generation_retries: u32,
 }
 
 fn rand_u64() -> u64 {
@@ -464,7 +465,7 @@ impl App {
             video_fps: 24,
             video_width: 1280,
             video_height: 720,
-            video_prompt_enhance: false,
+            video_prompt_enhance: true,
             video_negative: String::new(),
             show_video_dl_modal: false,
             show_downloads_menu: false,
@@ -472,6 +473,7 @@ impl App {
             last_progress_val: 0,
             step_duration_ema: 0.0,
             is_swapping_detected: false,
+            generation_retries: 0,
         }
     }
 
@@ -920,6 +922,7 @@ impl App {
     }
 
     fn start_generation(&mut self, ctx: &egui::Context) {
+        self.generation_retries = 0;
         let p = self.prompt.trim().to_string();
         self.prompt.clear();
         if self.mode == StudioMode::Video {
@@ -1348,6 +1351,7 @@ impl App {
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
                     self.compare_mode = false;
+                    self.generation_retries = 0;
 
                     // Maintain newly generated resolution while resetting scale slider to 100% (1.0x) in the middle
                     self.custom_w = out_w as u32;
@@ -1376,6 +1380,7 @@ impl App {
                     self.progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
+                    self.generation_retries = 0;
 
                     match crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone()) {
                         Ok(player) => {
@@ -1450,7 +1455,23 @@ impl App {
                     self.queue.clear();
                     if e == "Cancelled" {
                         self.status = "Cancelled".into();
+                        self.generation_retries = 0;
+                    } else if (e.contains("stalled") || e.contains("stopped") || e.contains("without producing")) && self.generation_retries < 1 {
+                        self.generation_retries += 1;
+                        self.status = "Engine stalled; automatically retrying generation (1/1)...".into();
+                        let retry_prompt = if !self.generating_prompt.trim().is_empty() {
+                            self.generating_prompt.clone()
+                        } else {
+                            self.prompt.clone()
+                        };
+                        if self.mode == StudioMode::Video {
+                            self.start_video_generation_with_prompt(ctx, retry_prompt);
+                        } else {
+                            self.start_generation_with_prompt(ctx, retry_prompt);
+                        }
+                        return;
                     } else {
+                        self.generation_retries = 0;
                         self.status = "Error".into();
                         self.error = Some(e);
                     }
@@ -3926,8 +3947,25 @@ fn is_win_ctrl_v() -> bool {
                     let enter_submit = text_resp.has_focus()
                         && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     if enter_submit {
-                        while self.prompt.ends_with('\n') || self.prompt.ends_with('\r') {
-                            self.prompt.pop();
+                        // egui inserts a newline at the caret on Enter (and advances the caret past
+                        // it) regardless of caret position: text end, mid-text, or over a selection.
+                        // So the Enter newline is NOT necessarily trailing; it lands where the caret
+                        // was. Remove exactly that inserted newline at caret-1. A real newline typed
+                        // with Shift+Enter never reaches this branch (enter_submit requires no shift).
+                        let caret = egui::text_edit::TextEditState::load(ctx, prompt_id)
+                            .and_then(|s| s.cursor.char_range())
+                            .map(|r| r.primary.index.0)
+                            .unwrap_or(0);
+                        if caret >= 1 {
+                            let i = caret - 1;
+                            let inserted = self.prompt.chars().nth(i);
+                            if inserted == Some('\n') || inserted == Some('\r') {
+                                self.prompt = self.prompt.chars()
+                                    .enumerate()
+                                    .filter(|(k, _)| *k != i)
+                                    .map(|(_, c)| c)
+                                    .collect::<String>();
+                            }
                         }
                         let p_text = self.prompt.trim().to_string();
                         if !p_text.is_empty() {
@@ -4045,6 +4083,7 @@ fn is_win_ctrl_v() -> bool {
                             if ui.add(cancel_btn).clicked() {
                                 self.cancel.store(true, Ordering::SeqCst);
                                 self.queue.clear();
+                                self.generation_retries = 0;
                                 self.status = "Cancelling...".into();
                                 if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
                                     self.prompt = self.generating_prompt.clone();

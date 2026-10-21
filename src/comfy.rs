@@ -46,7 +46,7 @@ impl Default for VideoParams {
             duration: 5,
             fps: 24,
             seed: 42,
-            prompt_enhance: false,
+            prompt_enhance: true,
             ckpt_name: "ltx-2.3-22b-dev-fp8.safetensors".to_string(),
             text_encoder: "gemma_3_12B_it_fp4_mixed.safetensors".to_string(),
             latent_upscale_model: "ltx-2.3-spatial-upscaler-x2-1.1.safetensors".to_string(),
@@ -124,7 +124,6 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
         "317": { "class_type": "LTXAVTextEncoderLoader", "inputs": { "text_encoder": p.text_encoder, "ckpt_name": p.ckpt_name, "device": "default" } },
         "279": { "class_type": "LTXVAudioVAELoader", "inputs": { "ckpt_name": p.ckpt_name } },
         "285": { "class_type": "LoraLoaderModelOnly", "inputs": { "model": ["316", 0], "lora_name": p.distilled_lora, "strength_model": 0.5 } },
-        "324": { "class_type": "LoraLoader", "inputs": { "model": ["285", 0], "clip": ["317", 0], "lora_name": p.gemma_lora, "strength_model": 1.0, "strength_clip": 1.0 } },
 
         "277": { "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } },
         "276": { "class_type": "RandomNoise", "inputs": { "noise_seed": 42 } },
@@ -201,6 +200,7 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
     }
 
     if p.prompt_enhance {
+        g["324"] = json!({ "class_type": "LoraLoader", "inputs": { "model": ["285", 0], "clip": ["317", 0], "lora_name": p.gemma_lora, "strength_model": 1.0, "strength_clip": 1.0 } });
         g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": ["325", 0] } });
     } else {
         g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": p.prompt } });
@@ -254,101 +254,131 @@ fn spawn_ws_progress(
     on_preview: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
 ) {
     std::thread::spawn(move || {
-        let stream = match std::net::TcpStream::connect(format!("127.0.0.1:{}", crate::engine::PORT)) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(350)));
-        use std::io::{BufRead, Read, Write};
-        let mut reader = std::io::BufReader::new(stream);
-        let req = format!(
-            "GET /ws?clientId=image-studio HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            crate::engine::PORT
-        );
-        if reader.get_mut().write_all(req.as_bytes()).is_err() {
-            return;
-        }
-        let mut line = String::new();
-        while let Ok(n) = reader.read_line(&mut line) {
-            if n == 0 || line == "\r\n" || line == "\n" {
-                break;
-            }
-            line.clear();
-        }
         while !stop.load(Ordering::SeqCst) {
-            let mut header = [0u8; 2];
-            if reader.read_exact(&mut header).is_err() {
+            let stream = match std::net::TcpStream::connect(format!("127.0.0.1:{}", crate::engine::PORT)) {
+                Ok(s) => s,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(350)));
+            use std::io::{BufRead, Read, Write};
+            let mut reader = std::io::BufReader::new(stream);
+            let req = format!(
+                "GET /ws?clientId=image-studio HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                crate::engine::PORT
+            );
+            if reader.get_mut().write_all(req.as_bytes()).is_err() {
+                std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            let opcode = header[0] & 0x0F;
-            if opcode == 0x8 {
-                break;
+            let mut line = String::new();
+            let mut upgraded = false;
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    upgraded = true;
+                    break;
+                }
+                line.clear();
             }
-            let mut len = (header[1] & 0x7F) as usize;
-            if len == 126 {
-                let mut ext = [0u8; 2];
-                if reader.read_exact(&mut ext).is_err() { break; }
-                len = u16::from_be_bytes(ext) as usize;
-            } else if len == 127 {
-                let mut ext = [0u8; 8];
-                if reader.read_exact(&mut ext).is_err() { break; }
-                len = u64::from_be_bytes(ext) as usize;
+            if !upgraded {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
-            let mut payload = vec![0u8; len];
-            if reader.read_exact(&mut payload).is_err() {
-                break;
-            }
-            if opcode == 0x1 {
-                if let Ok(text) = std::str::from_utf8(&payload) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                        match val["type"].as_str() {
-                            Some("progress") => {
-                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
-                                if let (Some(cur), Some(max)) = (val["data"]["value"].as_u64(), val["data"]["max"].as_u64()) {
-                                    on_progress(cur as u32, max as u32);
-                                }
-                            }
-                            Some("executing") => {
-                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
-                                let node = val["data"]["node"].as_str().map(|s| s.to_string());
-                                *tracker.executing_node.lock().unwrap() = node;
-                            }
-                            Some("execution_error") => {
-                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
-                                let err = format!(
-                                    "{}: {}",
-                                    val["data"]["node_type"].as_str().unwrap_or("Engine"),
-                                    val["data"]["exception_message"].as_str().unwrap_or("Execution error")
-                                );
-                                *tracker.execution_error.lock().unwrap() = Some(err);
-                            }
-                            Some("execution_interrupted") => {
-                                tracker.execution_interrupted.store(true, Ordering::SeqCst);
-                            }
-                            Some("executed") => {
-                                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
-                            }
-                            _ => {}
-                        }
+            while !stop.load(Ordering::SeqCst) {
+                let mut header = [0u8; 2];
+                match reader.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+                let opcode = header[0] & 0x0F;
+                if opcode == 0x8 {
+                    break;
+                }
+                let mut len = (header[1] & 0x7F) as usize;
+                if len == 126 {
+                    let mut ext = [0u8; 2];
+                    if reader.read_exact(&mut ext).is_err() { break; }
+                    len = u16::from_be_bytes(ext) as usize;
+                } else if len == 127 {
+                    let mut ext = [0u8; 8];
+                    if reader.read_exact(&mut ext).is_err() { break; }
+                    len = u64::from_be_bytes(ext) as usize;
+                }
+                let mut payload = vec![0u8; len];
+                let mut read_bytes = 0;
+                let mut read_err = false;
+                while read_bytes < len {
+                    if stop.load(Ordering::SeqCst) { break; }
+                    match reader.read(&mut payload[read_bytes..]) {
+                        Ok(0) => { read_err = true; break; }
+                        Ok(n) => read_bytes += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => { read_err = true; break; }
                     }
                 }
-            } else if opcode == 0x2 && payload.len() > 8 {
-                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
-                let event = u32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
-                let img_bytes = if event == 1 {
-                    Some(&payload[8..])
-                } else if event == 4 {
-                    let meta_len = u32::from_be_bytes(payload[4..8].try_into().unwrap_or_default()) as usize;
-                    if payload.len() > 8 + meta_len {
-                        Some(&payload[8 + meta_len..])
-                    } else {
-                        None
+                if read_err || read_bytes < len {
+                    break;
+                }
+                if opcode == 0x9 {
+                    continue;
+                }
+                if opcode == 0x1 {
+                    if let Ok(text) = std::str::from_utf8(&payload) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                            match val["type"].as_str() {
+                                Some("progress") => {
+                                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                    if let (Some(cur), Some(max)) = (val["data"]["value"].as_u64(), val["data"]["max"].as_u64()) {
+                                        on_progress(cur as u32, max as u32);
+                                    }
+                                }
+                                Some("executing") => {
+                                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                    let node = val["data"]["node"].as_str().map(|s| s.to_string());
+                                    *tracker.executing_node.lock().unwrap() = node;
+                                }
+                                Some("execution_error") => {
+                                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                    let err = format!(
+                                        "{}: {}",
+                                        val["data"]["node_type"].as_str().unwrap_or("Engine"),
+                                        val["data"]["exception_message"].as_str().unwrap_or("Execution error")
+                                    );
+                                    *tracker.execution_error.lock().unwrap() = Some(err);
+                                }
+                                Some("execution_interrupted") => {
+                                    tracker.execution_interrupted.store(true, Ordering::SeqCst);
+                                }
+                                Some("executed") => {
+                                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                } else {
-                    Some(&payload[8..])
-                };
-                if let Some(bytes) = img_bytes {
-                    on_preview(bytes.to_vec());
+                } else if opcode == 0x2 && payload.len() > 8 {
+                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                    let event = u32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
+                    let img_bytes = if event == 1 {
+                        Some(&payload[8..])
+                    } else if event == 4 {
+                        let meta_len = u32::from_be_bytes(payload[4..8].try_into().unwrap_or_default()) as usize;
+                        if payload.len() > 8 + meta_len {
+                            Some(&payload[8 + meta_len..])
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(&payload[8..])
+                    };
+                    if let Some(bytes) = img_bytes {
+                        on_preview(bytes.to_vec());
+                    }
                 }
             }
         }
@@ -395,6 +425,7 @@ pub fn run(
         if cancel.load(Ordering::SeqCst) || tracker.execution_interrupted.load(Ordering::SeqCst) {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Cancelled".into());
         }
@@ -402,6 +433,7 @@ pub fn run(
         if let Some(err) = tracker.execution_error.lock().unwrap().take() {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err(err);
         }
@@ -415,6 +447,7 @@ pub fn run(
         if inactive_secs > 120 {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err(format!("Engine stalled (no progress for {inactive_secs}s). Queue cleared."));
         }
@@ -548,6 +581,7 @@ pub fn run_video(
         if cancel.load(Ordering::SeqCst) || tracker.execution_interrupted.load(Ordering::SeqCst) {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err("Cancelled".into());
         }
@@ -555,6 +589,7 @@ pub fn run_video(
         if let Some(err) = tracker.execution_error.lock().unwrap().take() {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             return Err(err);
         }
@@ -562,24 +597,42 @@ pub fn run_video(
         std::thread::sleep(Duration::from_millis(500));
         let secs = t0.elapsed().as_secs();
 
-        // Stall Watchdog: detect genuine hangs and automatically abort & clear queue
+        // Stall Watchdog: detect genuine hangs per stage and automatically abort & clear queue
         let active_node = tracker.executing_node.lock().unwrap().clone();
         let last_act = tracker.last_activity.lock().unwrap().unwrap_or(t0);
         let inactive_secs = last_act.elapsed().as_secs();
-        let max_inactive = if active_node.as_deref() == Some("325") { 150 } else { 180 };
+        let max_inactive = match active_node.as_deref() {
+            Some("325") => 180, // Gemma 3 prompt expansion (takes ~90-120s)
+            Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => 90, // Model weight staging
+            Some("303") | Some("313") => 60, // Prompt conditioning encoding
+            Some("304") | Some("314") | Some("284") | Some("282") => 45, // Conditioning and guiders setup
+            Some("295") | Some("305") | Some("318") | Some("278") | Some("277") | Some("276") | Some("291") | Some("280") | Some("306") | Some("281") => 45, // Latent initialization
+            Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => 60, // Reference frame processing
+            Some("283") | Some("308") => 90, // Diffusion steps (each step updates last_act)
+            Some("287") => 90, // Spatial 2x upscaling
+            Some("315") | Some("297") => 90, // VAE decoding
+            Some("310") | Some("75") => 60, // Video encoding & saving
+            _ => 90,
+        };
         if inactive_secs > max_inactive {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
+            let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
             let stage_name = match active_node.as_deref() {
                 Some("325") => "prompt expansion (Gemma 3 12B)",
+                Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => "model weight staging",
+                Some("303") | Some("313") => "prompt conditioning encoding",
+                Some("304") | Some("314") | Some("284") | Some("282") => "conditioning and guidance setup",
+                Some("295") | Some("305") | Some("318") | Some("278") => "latent initialization",
+                Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => "reference frame processing",
                 Some("283") => "Stage 1 video diffusion",
                 Some("287") => "spatial 2x upscaling",
                 Some("308") => "Stage 2 detail refinement",
                 Some("315") => "tiled VAE decoding",
                 Some("297") => "audio VAE decoding",
                 Some("310") | Some("75") => "MP4 video encoding",
-                _ => "pipeline execution",
+                _ => "generation pipeline",
             };
             return Err(format!("Engine stalled during {stage_name} (no activity for {inactive_secs}s). Queue cleared automatically."));
         }
@@ -674,18 +727,29 @@ pub fn run_video(
             Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => {
                 format!("Staging model weights into VRAM... {secs}s")
             }
+            Some("303") | Some("313") => format!("Encoding prompt conditionings... {secs}s"),
+            Some("304") | Some("314") | Some("284") | Some("282") => {
+                format!("Configuring conditioning & guiders... {secs}s")
+            }
+            Some("295") | Some("305") | Some("318") | Some("278") | Some("277") | Some("276") | Some("291") | Some("280") | Some("306") | Some("281") => {
+                format!("Initializing latents & noise schedules... {secs}s")
+            }
+            Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => {
+                format!("Processing reference frame... {secs}s")
+            }
             Some("283") => format!("Generating video (Stage 1 diffusion)... {secs}s"),
+            Some("307") => format!("Splitting AV latents... {secs}s"),
             Some("287") => format!("Upscaling video latents (2x spatial)... {secs}s"),
             Some("308") => format!("Refining video details (Stage 2 diffusion)... {secs}s"),
+            Some("309") => format!("Extracting refined video & audio latents... {secs}s"),
             Some("315") => format!("Decoding video frames (tiled VAE)... {secs}s"),
             Some("297") => format!("Decoding audio track... {secs}s"),
             Some("310") | Some("75") => format!("Assembling final MP4 video... {secs}s"),
-            Some(other) => format!("Processing node {other}... {secs}s"),
-            None => {
+            _ => {
                 if pending {
                     format!("Waiting in queue... {secs}s")
                 } else if running {
-                    format!("Preparing video generation... {secs}s")
+                    format!("Generating video... {secs}s")
                 } else {
                     format!("Finalizing output... {secs}s")
                 }
@@ -705,7 +769,10 @@ fn prepare_clean_slate(c: &Client, status: &dyn Fn(String)) {
     // 1. Clear residual queue
     let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
 
-    // 2. Wait up to 3 seconds if an old job is currently finishing its abort/unwind
+    // 2. Free unused models & memory cache from previous runs
+    let _ = c.post(format!("{base}/free")).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
+
+    // 3. Wait up to 3 seconds if an old job is currently finishing its abort/unwind
     let t0 = Instant::now();
     let mut notified = false;
     while t0.elapsed() < Duration::from_millis(3000) {
@@ -720,6 +787,7 @@ fn prepare_clean_slate(c: &Client, status: &dyn Fn(String)) {
         }
         let _ = c.post(format!("{base}/interrupt")).send();
         let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
+        let _ = c.post(format!("{base}/free")).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
         std::thread::sleep(Duration::from_millis(150));
     }
 }

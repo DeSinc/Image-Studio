@@ -655,13 +655,15 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
         "--disable-auto-launch",
         "--preview-method",
         "auto",
+        "--disable-smart-memory",
+        "--vram-headroom",
+        "1.0",
         "--models-directory",
     ])
     .arg(models)
     .current_dir(comfy)
     .env("PYTHONUNBUFFERED", "1")
     .env("PYTHONIOENCODING", "utf-8")
-    .env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     .stdin(Stdio::null())
     .stdout(out)
     .stderr(err)
@@ -1409,7 +1411,7 @@ fn bootstrap_models(
 
 pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
-        let ping_client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(1200)).build().unwrap();
+        let ping_client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(3500)).build().unwrap();
         let dl_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(7200))
             .connect_timeout(Duration::from_secs(30))
@@ -1571,7 +1573,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
             } else {
                 if let Some(c) = child.as_mut() {
                     let exited = matches!(c.try_wait(), Ok(Some(_)));
-                    if exited || started.elapsed() > Duration::from_secs(180) {
+                    if exited || (!ever_ready && started.elapsed() > Duration::from_secs(180)) {
                         log(&format!("comfyui attempt {attempt} ended (exited={exited}, ever_ready={ever_ready})"));
                         if !exited {
                             kill_tree(c);
@@ -1592,7 +1594,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                         } else {
                             attempt += 1;
                         }
-                    } else {
+                    } else if !ever_ready {
                         *sh.state.lock().unwrap() = EngState::Starting { since: started, attempt };
                     }
                 }
