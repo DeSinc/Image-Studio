@@ -1,12 +1,26 @@
 //! Finds, downloads (if needed), launches (hidden) and supervises ComfyUI.
 //! Runs on its own thread and never touches the UI thread; the UI only reads `Shared`.
 use serde::{Deserialize, Serialize};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(not(windows))]
+pub trait CommandExtCompat {
+    fn creation_flags(&mut self, flags: u32) -> &mut Self;
+}
+
+#[cfg(not(windows))]
+impl CommandExtCompat for Command {
+    fn creation_flags(&mut self, _flags: u32) -> &mut Self {
+        self
+    }
+}
 
 pub const PORT: u16 = 8188;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -437,6 +451,24 @@ pub fn migrate_storage(
     });
 }
 
+pub fn open_path(p: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("explorer.exe")
+            .arg(p)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(p).spawn();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(p).spawn();
+    }
+}
+
 pub fn open_output_folder(sh: &Shared) {
     let p = {
         let paths = sh.paths.lock().unwrap();
@@ -447,19 +479,13 @@ pub fn open_output_folder(sh: &Shared) {
         }
     };
     let _ = std::fs::create_dir_all(&p);
-    let _ = Command::new("explorer.exe")
-        .arg(&p)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    open_path(&p);
 }
 
 pub fn open_models_folder(sh: &Shared) {
     let p = sh.paths.lock().unwrap().models.clone();
     let _ = std::fs::create_dir_all(&p);
-    let _ = Command::new("explorer.exe")
-        .arg(&p)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    open_path(&p);
 }
 
 pub fn reset_to_clean_engine(sh: &Shared) {
@@ -526,15 +552,20 @@ pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
 }
 
 fn detect_gpu_vendor() -> &'static str {
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let out = if cfg!(windows) {
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+    } else {
+        Command::new("lspci").output()
+    };
+
     if let Ok(o) = out {
         let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
         if s.contains("nvidia") || s.contains("geforce") || s.contains("quadro") || s.contains("rtx") {
             return "nvidia";
-        } else if s.contains("amd") || s.contains("radeon") {
+        } else if s.contains("amd") || s.contains("radeon") || s.contains("advanced micro devices") {
             return "amd";
         } else if s.contains("intel") || s.contains("arc") {
             return "intel";
@@ -587,6 +618,18 @@ pub fn find_comfy(cfg: &Config) -> Option<PathBuf> {
     })
 }
 
+fn find_in_path(bin_name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let p = dir.join(bin_name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
     let parent = comfy.parent().map(Path::to_path_buf).unwrap_or_default();
     let grand = parent.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -597,15 +640,25 @@ fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
         parent.join("python_embeded/python.exe"),
         grand.join("python_embeded/python.exe"),
         parent.join("standalone-env/python.exe"),
+        comfy.join(".venv/bin/python"),
+        comfy.join(".venv/bin/python3"),
+        comfy.join("venv/bin/python"),
+        comfy.join("venv/bin/python3"),
+        parent.join(".venv/bin/python"),
+        parent.join(".venv/bin/python3"),
+        parent.join("bin/python"),
+        parent.join("bin/python3"),
     ]
     .into_iter()
     .filter(|p| p.exists())
     .collect();
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let python = dir.join("python.exe");
-            if python.is_file() && !candidates.contains(&python) {
-                candidates.push(python);
+            for name in ["python.exe", "python3", "python"] {
+                let python = dir.join(name);
+                if python.is_file() && !candidates.contains(&python) {
+                    candidates.push(python);
+                }
             }
         }
     }
@@ -630,13 +683,33 @@ fn ping(client: &reqwest::blocking::Client) -> Option<String> {
     Some(v["devices"][0]["name"].as_str().unwrap_or("GPU").to_string())
 }
 
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("pkill")
+            .args(["-9", "-P", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 pub fn kill_tree(c: &mut Child) {
-    let _ = Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &c.id().to_string()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    kill_pid(c.id());
     let _ = c.kill();
     let _ = c.wait();
 }
@@ -782,12 +855,7 @@ impl CurlSpeedProbe {
         self.stop.store(true, Ordering::SeqCst);
         let pid = self.child_id.load(Ordering::SeqCst);
         if pid > 0 {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            kill_pid(pid);
         }
     }
 }
@@ -917,9 +985,17 @@ where
         let _ = std::fs::remove_file(&part_path);
     }
 
-    let curl_exe = std::env::var_os("SystemRoot")
-        .map(|r| PathBuf::from(r).join("System32").join("curl.exe"))
-        .filter(|p| p.is_file());
+    let curl_exe = if cfg!(windows) {
+        std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32").join("curl.exe"))
+            .filter(|p| p.is_file())
+            .or_else(|| find_in_path("curl.exe"))
+    } else {
+        find_in_path("curl").or_else(|| {
+            let p = PathBuf::from("/usr/bin/curl");
+            if p.is_file() { Some(p) } else { None }
+        })
+    };
 
     let mut req = client.get(url);
     if existing_len > 0 {
@@ -1628,6 +1704,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
 // ---------------------------------------------------------------- job object
 /// Puts *this* process in a kill-on-close job. Children (ComfyUI and its python
 /// grandchildren) inherit it, so they die whenever the app exits or crashes.
+#[cfg(windows)]
 pub fn adopt_into_kill_job() {
     use windows_sys::Win32::System::JobObjects::*;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1648,6 +1725,11 @@ pub fn adopt_into_kill_job() {
         let ok2 = AssignProcessToJobObject(job, GetCurrentProcess());
         log(&format!("kill-on-close job: set={ok1} assign={ok2}"));
     }
+}
+
+#[cfg(not(windows))]
+pub fn adopt_into_kill_job() {
+    // No-op on non-Windows
 }
 
 /// Checks if the primary network connection is metered to prevent unconfirmed large downloads.
@@ -1795,4 +1877,3 @@ mod tests {
         println!("Metered connection: {is_metered}");
     }
 }
-

@@ -5,12 +5,18 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");
 
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_else(|| "unknown".into());
+    let out = if cfg!(windows) {
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"])
+            .output()
+    } else {
+        Command::new("date")
+            .arg("+%Y-%m-%d %H:%M:%S")
+            .output()
+    }
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=BUILD_STAMP={}", out.trim());
 
     #[cfg(windows)]
