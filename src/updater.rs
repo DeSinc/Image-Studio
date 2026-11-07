@@ -13,6 +13,8 @@ pub struct RemoteVersion {
     pub version: String,
     pub download_url: String,
     #[serde(default)]
+    pub download_url_linux: Option<String>,
+    #[serde(default)]
     pub changelog: Option<String>,
 }
 
@@ -74,32 +76,36 @@ pub fn parse_github_release(json_text: &str) -> Result<RemoteVersion, String> {
     let release: GithubRelease = serde_json::from_str(json_text)
         .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))?;
     let version = release.tag_name.trim_start_matches('v').trim().to_string();
+
+    let win_asset = release.assets.iter().find(|a| {
+        a.name.eq_ignore_ascii_case("ImageStudio.exe") || a.name.ends_with(".exe")
+    }).map(|a| a.browser_download_url.clone());
+
+    let linux_asset = release.assets.iter().find(|a| {
+        let name = a.name.to_lowercase();
+        (name.contains("linux") || name == "imagestudio") && !name.ends_with(".exe") && !name.ends_with(".json")
+    }).map(|a| a.browser_download_url.clone());
+
     let download_url = if cfg!(windows) {
-        release
-            .assets
-            .into_iter()
-            .find(|a| a.name.eq_ignore_ascii_case("ImageStudio.exe") || a.name.ends_with(".exe"))
-            .map(|a| a.browser_download_url)
-            .unwrap_or_else(|| {
-                format!(
-                    "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio.exe",
-                    release.tag_name
-                )
-            })
+        win_asset.unwrap_or_else(|| {
+            format!(
+                "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio.exe",
+                release.tag_name
+            )
+        })
     } else {
-        release
-            .assets
-            .into_iter()
-            .find(|a| {
-                let name = a.name.to_lowercase();
-                (name.contains("linux") || name == "imagestudio") && !name.ends_with(".exe") && !name.ends_with(".json")
-            })
-            .map(|a| a.browser_download_url)
-            .unwrap_or_default()
+        linux_asset.clone().unwrap_or_else(|| {
+            format!(
+                "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio-linux-x86_64",
+                release.tag_name
+            )
+        })
     };
+
     Ok(RemoteVersion {
         version,
         download_url,
+        download_url_linux: linux_asset,
         changelog: release.body,
     })
 }
@@ -107,8 +113,14 @@ pub fn parse_github_release(json_text: &str) -> Result<RemoteVersion, String> {
 /// Parses server version.json content, handling possible BOM prefixes
 pub fn parse_server_version(json_text: &str) -> Result<RemoteVersion, String> {
     let clean = json_text.trim_start_matches('\u{feff}').trim();
-    serde_json::from_str::<RemoteVersion>(clean)
-        .map_err(|e| format!("Failed to parse server version JSON: {e}"))
+    let mut rv: RemoteVersion = serde_json::from_str(clean)
+        .map_err(|e| format!("Failed to parse server version JSON: {e}"))?;
+    if !cfg!(windows) {
+        if let Some(ref l_url) = rv.download_url_linux {
+            rv.download_url = l_url.clone();
+        }
+    }
+    Ok(rv)
 }
 
 /// Fetches the latest release from GitHub API
@@ -349,11 +361,12 @@ mod tests {
 
     #[test]
     fn test_parse_version_with_bom() {
-        let raw_with_bom = "\u{feff}{\"version\": \"0.2.8\", \"download_url\": \"https://desinc.my.to/image-studio/ImageStudio.exe\"}";
+        let raw_with_bom = "\u{feff}{\"version\": \"0.2.8\", \"download_url\": \"https://desinc.my.to/image-studio/ImageStudio.exe\", \"download_url_linux\": \"https://desinc.my.to/image-studio/ImageStudio-linux-x86_64\"}";
         let parsed = parse_server_version(raw_with_bom);
         assert!(parsed.is_ok());
         let info = parsed.unwrap();
         assert_eq!(info.version, "0.2.8");
+        assert_eq!(info.download_url_linux, Some("https://desinc.my.to/image-studio/ImageStudio-linux-x86_64".into()));
     }
 
     #[test]
@@ -379,16 +392,19 @@ mod tests {
         let gh_older = Some(RemoteVersion {
             version: "0.3.5".into(),
             download_url: "https://github.com/.../0.3.5.exe".into(),
+            download_url_linux: None,
             changelog: None,
         });
         let srv_newer = Some(RemoteVersion {
             version: "0.3.6".into(),
             download_url: "https://desinc.ax/.../0.3.6.exe".into(),
+            download_url_linux: None,
             changelog: None,
         });
         let gh_newer = Some(RemoteVersion {
             version: "0.3.7".into(),
             download_url: "https://github.com/.../0.3.7.exe".into(),
+            download_url_linux: None,
             changelog: None,
         });
 
@@ -404,6 +420,7 @@ mod tests {
         let srv_same = Some(RemoteVersion {
             version: "0.3.5".into(),
             download_url: "https://desinc.ax/.../0.3.5.exe".into(),
+            download_url_linux: None,
             changelog: None,
         });
         let res = select_best_version(gh_older.clone(), srv_same);
