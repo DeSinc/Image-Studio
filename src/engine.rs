@@ -944,12 +944,12 @@ pub fn kill_tree(c: &mut Child) {
 }
 
 fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
-    let log = data_dir().join("comfyui.log");
-    if log.exists() {
+    let log_file = data_dir().join("comfyui.log");
+    if log_file.exists() {
         let prev = data_dir().join("comfyui.prev.log");
-        let _ = std::fs::rename(&log, &prev);
+        let _ = std::fs::rename(&log_file, &prev);
     }
-    let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let out = std::fs::File::create(&log_file).map_err(|e| e.to_string())?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(py);
     cmd.args([
