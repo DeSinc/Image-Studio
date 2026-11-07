@@ -4102,6 +4102,9 @@ fn is_win_ctrl_v() -> bool {
                                 self.sh.retry.store(true, Ordering::SeqCst);
                                 self.sh.restart.store(true, Ordering::SeqCst);
                             }
+                            if ui.button("Repair Python Dependencies").on_hover_text("Re-installs missing Python packages (PyTorch, comfy-aimdo, requirements.txt) into the engine environment").clicked() {
+                                engine::repair_environment(self.sh.clone(), ui.ctx().clone());
+                            }
                             if ui.button("Switch to Clean Managed Engine").on_hover_text("Bypasses custom/old ComfyUI folders and downloads the official portable engine").clicked() {
                                 engine::reset_to_clean_engine(&self.sh);
                             }

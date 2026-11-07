@@ -517,19 +517,13 @@ pub fn reset_to_clean_engine(sh: &Shared) {
     log("reset to clean managed engine requested");
 }
 
-#[allow(dead_code)]
 pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let paths = sh.paths.lock().unwrap().clone();
-        let py = match paths.python {
-            Some(p) => p,
-            None => {
-                *sh.state.lock().unwrap() = EngState::Failed("Cannot repair: No Python executable found in detected folder.".into());
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let comfy = match paths.comfy {
+        let comfy = match paths.comfy.or_else(|| {
+            let cfg = sh.cfg.lock().unwrap();
+            find_comfy(&cfg)
+        }) {
             Some(c) => c,
             None => {
                 *sh.state.lock().unwrap() = EngState::Failed("Cannot repair: No ComfyUI folder found.".into());
@@ -537,37 +531,174 @@ pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
                 return;
             }
         };
-
-        *sh.state.lock().unwrap() = EngState::RepairingEngine {
-            step: "Running pip install to fix dependencies (async-timeout, aiohttp, requirements.txt)...".into(),
+        let py = match paths.python.or_else(|| {
+            let cfg = sh.cfg.lock().unwrap();
+            find_pythons(&cfg, &comfy).into_iter().next()
+        }) {
+            Some(p) => p,
+            None => {
+                *sh.state.lock().unwrap() = EngState::Failed("Cannot repair: No Python executable found in detected folder.".into());
+                ctx.request_repaint();
+                return;
+            }
         };
-        ctx.request_repaint();
 
-        log(&format!("repair: running pip via {} in {}", py.display(), comfy.display()));
-        let mut cmd = Command::new(&py);
-        cmd.args(["-m", "pip", "install", "async-timeout", "aiohttp", "-r", "requirements.txt"])
-            .current_dir(&comfy)
-            .creation_flags(CREATE_NO_WINDOW);
-
-        match cmd.output() {
-            Ok(out) => {
-                if out.status.success() {
-                    log("repair: pip finished successfully");
-                    sh.retry.store(true, Ordering::SeqCst);
-                } else {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    let out_txt = String::from_utf8_lossy(&out.stdout);
-                    log(&format!("repair failed: {err}\n{out_txt}"));
-                    *sh.state.lock().unwrap() = EngState::Failed(format!("Pip repair exited with error:\n{}", if err.is_empty() { out_txt } else { err }));
-                }
+        match install_or_repair_dependencies(&py, &comfy, &sh, &ctx) {
+            Ok(()) => {
+                log("repair: dependencies installed successfully; restarting supervisor");
+                sh.retry.store(true, Ordering::SeqCst);
             }
             Err(e) => {
-                log(&format!("repair: failed to spawn pip: {e}"));
-                *sh.state.lock().unwrap() = EngState::Failed(format!("Failed to execute pip: {e}"));
+                log(&format!("repair: failed to install dependencies: {e}"));
+                *sh.state.lock().unwrap() = EngState::Failed(format!("Environment repair failed:\n{e}"));
             }
         }
         ctx.request_repaint();
     });
+}
+
+pub fn install_or_repair_dependencies(
+    py: &Path,
+    comfy: &Path,
+    sh: &Shared,
+    ctx: &eframe::egui::Context,
+) -> Result<(), String> {
+    let (_, vendor_name) = get_comfy_portable_url();
+    log(&format!("repair: inspecting/repairing dependencies for {vendor_name} via {} in {}", py.display(), comfy.display()));
+
+    *sh.state.lock().unwrap() = EngState::RepairingEngine {
+        step: "Configuring pip package manager in virtual environment...".into(),
+    };
+    ctx.request_repaint();
+
+    // Ensure pip exists and is functional
+    let _ = Command::new(py)
+        .args(["-m", "ensurepip", "--default-pip"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+
+    let _ = Command::new(py)
+        .args(["-m", "pip", "install", "--upgrade", "pip"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+
+    // Check if PyTorch can be imported
+    let torch_probe = Command::new(py)
+        .args(["-c", "import torch"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let torch_ok = torch_probe.map(|o| o.status.success()).unwrap_or(false);
+
+    if !torch_ok {
+        let (torch_args, torch_desc) = match vendor_name {
+            "AMD" => (
+                vec!["install", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/rocm6.2"],
+                "PyTorch (ROCm 6.2 for AMD)",
+            ),
+            "Intel" => (
+                vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cpu"],
+                "PyTorch (Intel / CPU)",
+            ),
+            _ => (
+                vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu124"],
+                "PyTorch (CUDA 12.4 for NVIDIA)",
+            ),
+        };
+
+        *sh.state.lock().unwrap() = EngState::RepairingEngine {
+            step: format!("Installing {torch_desc}..."),
+        };
+        ctx.request_repaint();
+        log(&format!("repair: installing {torch_desc} via pip"));
+
+        let mut cmd = Command::new(py);
+        cmd.args(["-m", "pip"])
+            .args(&torch_args)
+            .current_dir(comfy)
+            .creation_flags(CREATE_NO_WINDOW);
+
+        let out = cmd.output().map_err(|e| format!("Failed to spawn pip for PyTorch: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let out_txt = String::from_utf8_lossy(&out.stdout);
+            log(&format!("repair: PyTorch installation warning/error:\n{err}\n{out_txt}"));
+        } else {
+            log(&format!("repair: {torch_desc} installed successfully"));
+        }
+    }
+
+    // Install ComfyUI requirements from PyPI
+    *sh.state.lock().unwrap() = EngState::RepairingEngine {
+        step: "Installing ComfyUI requirements and comfy-aimdo...".into(),
+    };
+    ctx.request_repaint();
+    log("repair: installing ComfyUI requirements and comfy-aimdo via pip");
+
+    let mut cmd = Command::new(py);
+    cmd.args(["-m", "pip", "install", "-r", "requirements.txt", "comfy-aimdo", "aiohttp", "async-timeout"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().map_err(|e| format!("Failed to spawn pip for requirements: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let out_txt = String::from_utf8_lossy(&out.stdout);
+        log(&format!("repair: pip requirements warning/error:\n{err}\n{out_txt}"));
+    } else {
+        log("repair: requirements installed successfully");
+    }
+
+    // Explicitly ensure comfy-aimdo is installed & upgraded
+    let aimdo_probe = Command::new(py)
+        .args(["-c", "import comfy_aimdo"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let aimdo_ok = aimdo_probe.map(|o| o.status.success()).unwrap_or(false);
+
+    if !aimdo_ok {
+        *sh.state.lock().unwrap() = EngState::RepairingEngine {
+            step: "Installing comfy-aimdo dynamic VRAM manager...".into(),
+        };
+        ctx.request_repaint();
+        log("repair: installing comfy-aimdo directly via pip");
+
+        let mut cmd = Command::new(py);
+        cmd.args(["-m", "pip", "install", "--upgrade", "comfy-aimdo"])
+            .current_dir(comfy)
+            .creation_flags(CREATE_NO_WINDOW);
+
+        let out = cmd.output().map_err(|e| format!("Failed to install comfy-aimdo: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let out_txt = String::from_utf8_lossy(&out.stdout);
+            log(&format!("repair: comfy-aimdo install failed:\n{err}\n{out_txt}"));
+            return Err(format!("Failed to install comfy-aimdo:\n{}", if !err.is_empty() { err } else { out_txt }));
+        }
+    }
+
+    // Verify both comfy_aimdo and torch are working
+    let verify = Command::new(py)
+        .args(["-c", "import comfy_aimdo; import torch"])
+        .current_dir(comfy)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    if let Ok(o) = verify {
+        if o.status.success() {
+            log("repair: dependencies verified successfully (comfy_aimdo and torch ready)");
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&o.stderr);
+            log(&format!("repair: dependency verification failed: {err}"));
+            Err(format!("Python dependency verification failed:\n{err}"))
+        }
+    } else {
+        Err("Failed to execute verification probe.".into())
+    }
 }
 
 fn detect_gpu_vendor() -> &'static str {
@@ -844,6 +975,23 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
     .stdout(out)
     .stderr(err)
     .creation_flags(CREATE_NO_WINDOW);
+
+    #[cfg(not(windows))]
+    {
+        if std::env::var("HSA_OVERRIDE_GFX_VERSION").is_err() {
+            if let Ok(o) = Command::new("rocminfo").output() {
+                let s = String::from_utf8_lossy(&o.stdout);
+                if s.contains("gfx1031") || s.contains("gfx1032") || s.contains("gfx1033") || s.contains("gfx1034") || s.contains("gfx1035") || s.contains("gfx1036") {
+                    cmd.env("HSA_OVERRIDE_GFX_VERSION", "10.3.0");
+                    log("ROCm: auto-set HSA_OVERRIDE_GFX_VERSION=10.3.0 for RDNA2 target");
+                } else if s.contains("gfx1102") || s.contains("gfx1103") {
+                    cmd.env("HSA_OVERRIDE_GFX_VERSION", "11.0.0");
+                    log("ROCm: auto-set HSA_OVERRIDE_GFX_VERSION=11.0.0 for RDNA3 target");
+                }
+            }
+        }
+    }
+
     cmd.spawn().map_err(|e| format!("could not start {}: {e}", py.display()))
 }
 
@@ -1465,37 +1613,39 @@ fn bootstrap_engine(
             return Err("ComfyUI download finished but main.py was not found. Please specify ComfyUI directory in Settings.".into());
         }
 
-        // Initialize virtualenv if python3 is present
+        // Initialize virtualenv
         *sh.state.lock().unwrap() = EngState::ExtractingEngine {
             step: "Creating Python virtual environment (.venv)...".into(),
         };
         ctx.request_repaint();
 
-        let venv_cmd = Command::new("python3")
+        let venv_status = Command::new("python3")
             .args(["-m", "venv", ".venv"])
             .current_dir(&comfy_target)
-            .status();
-
-        if let Ok(st) = venv_cmd {
-            if st.success() {
-                log("bootstrap: created .venv; installing PyTorch and ComfyUI requirements via pip");
-                *sh.state.lock().unwrap() = EngState::ExtractingEngine {
-                    step: "Installing PyTorch and dependencies into .venv...".into(),
-                };
-                ctx.request_repaint();
-
-                let py_venv = comfy_target.join(".venv/bin/python");
-                let pip_wheel_args: Vec<&str> = match vendor_name {
-                    "AMD" => vec!["install", "--pre", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/rocm6.2", "-r", "requirements.txt"],
-                    _ => vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu124", "-r", "requirements.txt"],
-                };
-                let _ = Command::new(&py_venv)
-                    .args(&["-m", "pip"])
-                    .args(&pip_wheel_args)
+            .status()
+            .or_else(|_| {
+                Command::new("python")
+                    .args(["-m", "venv", ".venv"])
                     .current_dir(&comfy_target)
-                    .status();
-            }
+                    .status()
+            });
+
+        let venv_ok = venv_status.map(|s| s.success()).unwrap_or(false);
+        if !venv_ok {
+            return Err("Failed to create Python virtual environment (.venv). Please ensure python3 and python3-venv are installed (e.g. 'sudo apt install python3 python3-venv python3-pip').".into());
         }
+
+        let py_venv = if comfy_target.join(".venv/bin/python").is_file() {
+            comfy_target.join(".venv/bin/python")
+        } else if comfy_target.join(".venv/bin/python3").is_file() {
+            comfy_target.join(".venv/bin/python3")
+        } else {
+            return Err("Virtual environment created but .venv/bin/python was not found.".into());
+        };
+
+        log(&format!("bootstrap: virtual environment created at {}; configuring dependencies", py_venv.display()));
+        install_or_repair_dependencies(&py_venv, &comfy_target, sh, ctx)
+            .map_err(|e| format!("ComfyUI dependency installation failed on Linux ({vendor_name}):\n{e}"))?;
 
         return Ok(comfy_target);
     }
@@ -1831,6 +1981,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
         let mut started = Instant::now();
         let mut failed = false;
         let mut isolated_attempted = false;
+        let mut auto_repair_attempted = false;
         let mut ever_ready = false;
         let mut consecutive_crashes = 0usize;
 
@@ -1847,6 +1998,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 attempt = 0;
                 consecutive_crashes = 0;
                 failed = false;
+                auto_repair_attempted = false;
                 sh.cancel.store(false, Ordering::SeqCst);
                 log("retry/restart supervisor cycle");
             }
@@ -1992,6 +2144,21 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                                 *sh.state.lock().unwrap() = EngState::Failed(format!("Existing engine failed and isolated setup failed: {e}"));
                             }
                         }
+                    } else if !auto_repair_attempted && !pys.is_empty() {
+                        log(&format!("all Python candidates failed in {}; attempting dependency repair on primary python\n{t}", cd.display()));
+                        auto_repair_attempted = true;
+                        let primary_py = &pys[0];
+                        match install_or_repair_dependencies(primary_py, cd, &sh, &ctx) {
+                            Ok(()) => {
+                                log("automated repair succeeded; retrying primary python");
+                                attempt = 0;
+                                continue;
+                            }
+                            Err(e) => {
+                                failed = true;
+                                *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start and repair failed: {e}\n{t}"));
+                            }
+                        }
                     } else {
                         failed = true;
                         *sh.state.lock().unwrap() = EngState::Failed(format!("ComfyUI failed to start.\n{t}"));
@@ -1999,6 +2166,26 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 } else {
                     let py = &pys[attempt];
                     sh.paths.lock().unwrap().python = Some(py.clone());
+
+                    // If attempt 0, check if this is a managed/local environment and probe for critical dependencies
+                    let is_managed = cd.starts_with(data_dir());
+                    let is_local_env = py.starts_with(cd);
+                    if attempt == 0 && !auto_repair_attempted && (is_managed || is_local_env) {
+                        let probe = Command::new(py)
+                            .args(["-c", "import comfy_aimdo; import torch"])
+                            .current_dir(cd)
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .output();
+                        let deps_ok = probe.map(|o| o.status.success()).unwrap_or(false);
+                        if !deps_ok {
+                            log(&format!("dependency probe in {} detected missing modules (comfy_aimdo/torch); initiating auto-repair", py.display()));
+                            auto_repair_attempted = true;
+                            if let Err(e) = install_or_repair_dependencies(py, cd, &sh, &ctx) {
+                                log(&format!("pre-launch dependency repair failed: {e}"));
+                            }
+                        }
+                    }
+
                     log(&format!("launching {} (attempt {attempt})", py.display()));
                     match spawn(py, cd, &models) {
                         Ok(c) => {
@@ -2034,6 +2221,19 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                                 continue;
                             }
                         } else {
+                            let log_tail = tail(&data_dir().join("comfyui.log"), 25);
+                            let has_module_err = log_tail.contains("ModuleNotFoundError") || log_tail.contains("No module named") || log_tail.contains("ImportError");
+                            let pys = find_pythons(&cfg, cd);
+                            if has_module_err && !auto_repair_attempted && !pys.is_empty() {
+                                log(&format!("detected missing Python module in comfyui.log; attempting dependency repair on primary python:\n{log_tail}"));
+                                auto_repair_attempted = true;
+                                let primary_py = &pys[0];
+                                if let Ok(()) = install_or_repair_dependencies(primary_py, cd, &sh, &ctx) {
+                                    log("repair succeeded after module crash; retrying primary python");
+                                    attempt = 0;
+                                    continue;
+                                }
+                            }
                             attempt += 1;
                         }
                     } else if !ever_ready {

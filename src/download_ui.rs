@@ -376,6 +376,10 @@ impl DownloadPaneState {
                     ui.label(RichText::new("Repairing Environment").size(12.0).color(AMBER).strong());
                     ui.label(RichText::new(step).size(11.5).color(DIM));
                 }
+                EngState::Failed(msg) => {
+                    ui.label(RichText::new("Engine Startup Failed").size(12.5).color(RED).strong());
+                    ui.label(RichText::new(msg).size(11.0).color(DIM));
+                }
                 _ => {
                     ui.label(RichText::new("All models ready.").size(12.0).color(GREEN));
                 }
@@ -396,7 +400,8 @@ impl DownloadPaneState {
             // 5. Action Controls (Pause / Resume / Retry / Begin Download)
             let is_paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
             let is_downloading = matches!(st, EngState::DownloadingModels { .. } | EngState::DownloadingEngine { .. });
-            let is_failed = matches!(st, EngState::ModelDownloadFailed { .. });
+            let is_dl_failed = matches!(st, EngState::ModelDownloadFailed { .. });
+            let is_eng_failed = matches!(st, EngState::Failed(_));
             let is_awaiting = matches!(st, EngState::AwaitingDownloadConfirmation { .. });
 
             ui.horizontal(|ui| {
@@ -427,12 +432,20 @@ impl DownloadPaneState {
                         sh.download_paused.store(true, Ordering::SeqCst);
                         self.user_acknowledged = true;
                     }
-                } else if is_failed {
+                } else if is_dl_failed {
                     let retry_btn = egui::Button::new(RichText::new("Retry Download").size(12.0).strong().color(Color32::WHITE))
                         .fill(ACCENT)
-                        .min_size(vec2(120.0, 28.0));
+                        .min_size(vec2(130.0, 28.0));
                     if ui.add(retry_btn).clicked() {
                         sh.retry.store(true, Ordering::SeqCst);
+                        self.user_acknowledged = true;
+                    }
+                } else if is_eng_failed {
+                    let repair_btn = egui::Button::new(RichText::new("Repair Dependencies & Retry").size(12.0).strong().color(Color32::WHITE))
+                        .fill(ACCENT)
+                        .min_size(vec2(180.0, 28.0));
+                    if ui.add(repair_btn).clicked() {
+                        crate::engine::repair_environment(sh.clone(), ui.ctx().clone());
                         self.user_acknowledged = true;
                     }
                 }
