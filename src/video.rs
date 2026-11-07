@@ -248,6 +248,8 @@ fn find_ffmpeg() -> Option<PathBuf> {
     let candidates = [
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
         r"C:\ffmpeg\bin\ffmpeg.exe",
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
     ];
     for c in candidates {
         let p = Path::new(c);

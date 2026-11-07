@@ -74,17 +74,29 @@ pub fn parse_github_release(json_text: &str) -> Result<RemoteVersion, String> {
     let release: GithubRelease = serde_json::from_str(json_text)
         .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))?;
     let version = release.tag_name.trim_start_matches('v').trim().to_string();
-    let download_url = release
-        .assets
-        .into_iter()
-        .find(|a| a.name.eq_ignore_ascii_case("ImageStudio.exe") || a.name.ends_with(".exe"))
-        .map(|a| a.browser_download_url)
-        .unwrap_or_else(|| {
-            format!(
-                "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio.exe",
-                release.tag_name
-            )
-        });
+    let download_url = if cfg!(windows) {
+        release
+            .assets
+            .into_iter()
+            .find(|a| a.name.eq_ignore_ascii_case("ImageStudio.exe") || a.name.ends_with(".exe"))
+            .map(|a| a.browser_download_url)
+            .unwrap_or_else(|| {
+                format!(
+                    "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio.exe",
+                    release.tag_name
+                )
+            })
+    } else {
+        release
+            .assets
+            .into_iter()
+            .find(|a| {
+                let name = a.name.to_lowercase();
+                (name.contains("linux") || name == "imagestudio") && !name.ends_with(".exe") && !name.ends_with(".json")
+            })
+            .map(|a| a.browser_download_url)
+            .unwrap_or_default()
+    };
     Ok(RemoteVersion {
         version,
         download_url,
@@ -186,6 +198,7 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
             Some(info) => {
                 let is_new = is_newer(&info.version, current_ver);
                 let is_metered = crate::engine::is_metered_connection();
+                let dl_valid = !info.download_url.is_empty() && (cfg!(windows) || !info.download_url.ends_with(".exe"));
                 let should_auto_dl = {
                     let mut st = state.lock().unwrap();
                     st.checked = true;
@@ -193,8 +206,8 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
                     st.download_url = info.download_url.clone();
                     st.changelog = info.changelog;
                     st.error = None;
-                    st.update_available = is_new;
-                    is_new && !st.downloading && !st.update_applied && !is_metered
+                    st.update_available = is_new && dl_valid;
+                    is_new && dl_valid && !st.downloading && !st.update_applied && !is_metered
                 };
                 if should_auto_dl {
                     download_and_install_update(state.clone(), ctx.clone());
@@ -297,6 +310,12 @@ pub fn download_and_install_update(state: Arc<Mutex<UpdaterState>>, ctx: eframe:
                 let _ = std::fs::rename(&old_exe, &exe_path);
                 format!("Failed to activate new executable: {e}")
             })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755));
+            }
 
             Ok(())
         })();
