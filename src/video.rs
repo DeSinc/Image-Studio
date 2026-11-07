@@ -537,32 +537,47 @@ mod tests {
         wav.extend_from_slice(&data_len.to_le_bytes());
         wav.resize(wav.len() + data_len as usize, 0);
 
-        if let Some(mut player) = AudioPlayer::new(wav) {
-            player.pause();
-            player.set_volume(0.8);
-            assert!((player.volume - 0.8).abs() < 0.01);
-            player.toggle_mute();
-            assert!(player.is_muted);
-            player.toggle_mute();
-            assert!(!player.is_muted);
-            player.seek(Duration::from_millis(50), false);
-            player.restart();
-        }
+        // Ensure the test WAV PCM data decodes properly
+        let dec = rodio::Decoder::new(Cursor::new(wav.clone()));
+        assert!(dec.is_ok(), "Test WAV PCM must be decodable by rodio: {:?}", dec.err());
+
+        // AudioPlayer::new should initialize correctly when an audio device is available;
+        // do not silently false-positive if player creation fails.
+        let mut player = AudioPlayer::new(wav)
+            .expect("AudioPlayer failed to initialise");
+        player.pause();
+        player.set_volume(0.8);
+        assert!((player.volume - 0.8).abs() < 0.01);
+        player.toggle_mute();
+        assert!(player.is_muted);
+        player.toggle_mute();
+        assert!(!player.is_muted);
+        player.seek(Duration::from_millis(50), false);
+        player.restart();
     }
 
     #[test]
     fn test_real_mp4_decoding() {
-        let path = r"C:\Users\Dean\ComfyUI-Installs\ComfyUI\ComfyUI\output\ImageStudio\video_00001_.mp4";
-        if std::path::Path::new(path).exists() {
-            let bytes = std::fs::read(path).unwrap();
-            let res = VideoPlayer::from_mp4_bytes(bytes, "video_00001_.mp4".into(), "ImageStudio".into());
-            assert!(res.is_ok(), "VideoPlayer::from_mp4_bytes failed: {:?}", res.err());
-            let player = res.unwrap();
-            assert_eq!(player.frames.len(), 25);
-            assert_eq!(player.fps, 24.0);
-            assert_eq!(player.width, 1280);
-            assert_eq!(player.height, 704);
-            assert!(player.audio.is_some(), "Audio should be decoded from MP4");
+        let base = dirs::home_dir().or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from));
+        if let Some(home) = base {
+            let path = home
+                .join("ComfyUI-Installs")
+                .join("ComfyUI")
+                .join("ComfyUI")
+                .join("output")
+                .join("ImageStudio")
+                .join("video_00001_.mp4");
+            if path.exists() {
+                let bytes = std::fs::read(&path).unwrap();
+                let res = VideoPlayer::from_mp4_bytes(bytes, "video_00001_.mp4".into(), "ImageStudio".into());
+                assert!(res.is_ok(), "VideoPlayer::from_mp4_bytes failed: {:?}", res.err());
+                let player = res.unwrap();
+                assert_eq!(player.frames.len(), 25);
+                assert_eq!(player.fps, 24.0);
+                assert_eq!(player.width, 1280);
+                assert_eq!(player.height, 704);
+                assert!(player.audio.is_some(), "Audio should be decoded from MP4");
+            }
         }
     }
 }

@@ -23,11 +23,11 @@ const BG: Color32 = Color32::from_rgb(12, 14, 19);
 const PANEL: Color32 = Color32::from_rgb(18, 21, 29);
 const CARD: Color32 = Color32::from_rgb(25, 29, 40);
 const CARD_HI: Color32 = Color32::from_rgb(33, 38, 53);
-const LINE: Color32 = Color32::from_rgb(45, 51, 70);
+const LINE: Color32 = Color32::from_rgb(52, 60, 82);
 const ACCENT: Color32 = Color32::from_rgb(99, 102, 241);
 const ACCENT_GLOW: Color32 = Color32::from_rgb(129, 140, 248);
-const TEXT: Color32 = Color32::from_rgb(229, 231, 240);
-const DIM: Color32 = Color32::from_rgb(138, 146, 170);
+const TEXT: Color32 = Color32::from_rgb(235, 238, 248);
+const DIM: Color32 = Color32::from_rgb(168, 177, 202);
 const GREEN: Color32 = Color32::from_rgb(52, 211, 153);
 const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
@@ -365,34 +365,47 @@ fn draw_restart_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
-        ctx.style_mut_of(egui::Theme::Dark, |s| {
-            let v = &mut s.visuals;
-            v.dark_mode = true;
-            v.override_text_color = Some(TEXT);
-            v.panel_fill = PANEL;
-            v.window_fill = PANEL;
-            v.window_stroke = Stroke::new(1.0, LINE);
-            v.widgets.noninteractive.bg_fill = CARD;
-            v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-            v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-            v.widgets.inactive.bg_fill = CARD_HI;
-            v.widgets.hovered.weak_bg_fill = Color32::from_rgb(46, 52, 72);
-            v.widgets.hovered.bg_fill = Color32::from_rgb(46, 52, 72);
-            v.widgets.active.weak_bg_fill = ACCENT;
+
+        // Enforce dark mode visuals unconditionally to prevent black-on-black text on systems running light theme
+        let mut visuals = egui::Visuals::dark();
+        visuals.dark_mode = true;
+        visuals.override_text_color = Some(TEXT);
+        visuals.panel_fill = PANEL;
+        visuals.window_fill = PANEL;
+        visuals.window_stroke = Stroke::new(1.0, LINE);
+        visuals.widgets.noninteractive.bg_fill = CARD;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        visuals.widgets.inactive.bg_fill = CARD_HI;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(46, 52, 72);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(46, 52, 72);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        visuals.widgets.active.weak_bg_fill = ACCENT;
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        ctx.set_visuals(visuals);
+        ctx.set_theme(egui::Theme::Dark);
+
+        let apply_style = |s: &mut egui::Style| {
+            s.visuals.dark_mode = true;
+            s.visuals.override_text_color = Some(TEXT);
             s.spacing.item_spacing = vec2(6.0, 6.0);
-            s.spacing.button_padding = vec2(8.0, 4.0);
+            s.spacing.button_padding = vec2(8.0, 5.0);
             for (ts, sz) in [
-                (egui::TextStyle::Body, 13.0),
-                (egui::TextStyle::Button, 12.0),
-                (egui::TextStyle::Small, 11.0),
-                (egui::TextStyle::Heading, 16.0),
-                (egui::TextStyle::Monospace, 11.5),
+                (egui::TextStyle::Body, 13.5),
+                (egui::TextStyle::Button, 13.0),
+                (egui::TextStyle::Small, 12.0),
+                (egui::TextStyle::Heading, 18.0),
+                (egui::TextStyle::Monospace, 12.5),
             ] {
                 if let Some(f) = s.text_styles.get_mut(&ts) {
                     f.size = sz;
                 }
             }
-        });
+        };
+        ctx.style_mut_of(egui::Theme::Dark, apply_style);
+        ctx.style_mut_of(egui::Theme::Light, apply_style);
         let sh = Shared::new();
         let profile = Profile::load();
         engine::start_supervisor(sh.clone(), profile.clone(), ctx.clone());
@@ -1638,6 +1651,7 @@ fn is_win_ctrl_v() -> bool {
         let st = self.sh.state.lock().unwrap().clone();
         match st {
             EngState::Ready { .. } | EngState::Starting { .. } | EngState::Detecting => {}
+            EngState::AwaitingDownloadConfirmation { .. } => return Err("Download confirmation required (see Setup)"),
             EngState::DownloadingEngine { .. } => return Err("Downloading engine..."),
             EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
             EngState::DownloadingModels { .. } => return Err("Downloading models..."),
@@ -1711,6 +1725,7 @@ fn is_win_ctrl_v() -> bool {
                         }
                         let (txt, col) = match &*self.sh.state.lock().unwrap() {
                             EngState::Detecting => ("Detecting engine...".to_string(), AMBER),
+                            EngState::AwaitingDownloadConfirmation { .. } => ("Download confirmation required".to_string(), AMBER),
                             EngState::DownloadingEngine { .. } => ("Downloading engine...".to_string(), AMBER),
                             EngState::ExtractingEngine { .. } => ("Extracting engine...".to_string(), AMBER),
                             EngState::DownloadingModels { file_index, total_files, .. } => (format!("Downloading model ({}/{})", file_index, total_files), AMBER),
@@ -2779,13 +2794,13 @@ fn is_win_ctrl_v() -> bool {
             .fill(Color32::from_rgb(20, 23, 32))
             .stroke(Stroke::new(1.0, LINE))
             .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(10, 6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let mut dl_img = sh.dl_image_model.load(Ordering::SeqCst);
                     let mut dl_vid = sh.dl_video_model.load(Ordering::SeqCst);
 
-                    let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(11.0).strong());
+                    let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(12.0).strong());
                     if resp_img.changed() {
                         sh.dl_image_model.store(dl_img, Ordering::SeqCst);
                         let mut cfg = sh.cfg.lock().unwrap();
@@ -2798,9 +2813,9 @@ fn is_win_ctrl_v() -> bool {
                         }
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(16.0);
 
-                    let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(11.0).strong());
+                    let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(12.0).strong());
                     if resp_vid.changed() {
                         sh.dl_video_model.store(dl_vid, Ordering::SeqCst);
                         let mut cfg = sh.cfg.lock().unwrap();
@@ -2816,6 +2831,42 @@ fn is_win_ctrl_v() -> bool {
             });
     }
 
+    fn render_storage_location_row(&self, ui: &mut egui::Ui) {
+        let cur_loc = self
+            .sh
+            .pending_models_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.sh.paths.lock().unwrap().models.clone());
+        let display_str = cur_loc.display().to_string();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Storage:").size(12.0).color(DIM));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let change_btn = ui.button(RichText::new("Change Location...").size(12.0))
+                    .on_hover_text("Change install/model location to another drive (e.g. D:\\ImageStudio). Finished files will automatically move to this location.");
+                if change_btn.clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        let target_models = folder.join("models");
+                        *self.sh.pending_models_dir.lock().unwrap() = Some(target_models.clone());
+                        let mut cfg = self.sh.cfg.lock().unwrap();
+                        cfg.models_dir = Some(target_models.clone());
+                        cfg.save();
+                        self.sh.paths.lock().unwrap().models = target_models;
+                    }
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let avail = ui.available_width();
+                    ui.add_sized(
+                        [avail, 20.0],
+                        egui::Label::new(RichText::new(&display_str).size(12.0).color(TEXT).strong()).truncate(),
+                    ).on_hover_text(&display_str);
+                });
+            });
+        });
+    }
+
     fn render_setup_card(&mut self, ui: &mut egui::Ui, rect: Rect, state: &EngState) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
@@ -2823,12 +2874,21 @@ fn is_win_ctrl_v() -> bool {
 
         let is_failed = matches!(state, EngState::Failed(_) | EngState::ModelDownloadFailed { .. });
         let is_model_failed = matches!(state, EngState::ModelDownloadFailed { .. });
-        let card_w = (if is_failed { 620.0f32 } else { 560.0f32 }).min(rect.width() - 32.0);
-        let card_h = if is_model_failed { 320.0f32 } else if is_failed { 380.0f32 } else { 300.0f32 };
+        let is_confirmation = matches!(state, EngState::AwaitingDownloadConfirmation { .. });
+        let card_w = (rect.width() - 48.0).clamp(580.0, 920.0);
+        let card_h = if is_confirmation {
+            360.0f32
+        } else if is_model_failed {
+            340.0f32
+        } else if is_failed {
+            400.0f32
+        } else {
+            330.0f32
+        };
         let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, card_h));
 
         p.rect_filled(card_rect, 12, CARD);
-        let stroke_color = if is_model_failed {
+        let stroke_color = if is_model_failed || is_confirmation {
             AMBER.linear_multiply(0.5)
         } else if is_failed {
             RED.linear_multiply(0.4)
@@ -2840,8 +2900,39 @@ fn is_win_ctrl_v() -> bool {
         let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
         card_ui.vertical_centered(|ui| {
             match state {
+                EngState::AwaitingDownloadConfirmation { metered } => {
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(AMBER).strong());
+                    ui.add_space(4.0);
+                    let title = if *metered {
+                        "Metered Connection Detected"
+                    } else {
+                        "Download Confirmation Required"
+                    };
+                    ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
+                    ui.add_space(2.0);
+                    let desc = if *metered {
+                        "A metered network connection was detected. Automatic downloads are paused to prevent unexpected data usage. Select your preferred models and storage path below before beginning."
+                    } else {
+                        "Confirm your model selection and storage path below to begin downloading."
+                    };
+                    ui.label(RichText::new(desc).size(12.0).color(DIM));
+                    ui.add_space(10.0);
+
+                    self.render_storage_location_row(ui);
+                    ui.add_space(8.0);
+                    self.render_model_checkboxes(ui);
+                    ui.add_space(14.0);
+
+                    let start_btn = egui::Button::new(RichText::new("Begin Download").size(13.5).strong().color(Color32::WHITE))
+                        .fill(ACCENT)
+                        .min_size(vec2(160.0, 32.0));
+                    if ui.add(start_btn).on_hover_text("Starts downloading missing engine and model files").clicked() {
+                        self.sh.download_confirmed.store(true, Ordering::SeqCst);
+                        self.sh.retry.store(true, Ordering::SeqCst);
+                    }
+                }
                 EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new("Downloading AI Image Engine").size(18.0).strong().color(TEXT));
                     ui.label(RichText::new(step).size(12.0).color(DIM));
@@ -2856,16 +2947,18 @@ fn is_win_ctrl_v() -> bool {
                     ui.add_space(6.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
+                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(12.0).color(DIM));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
+                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(12.0).color(TEXT).strong());
                         });
                     });
                     ui.add_space(8.0);
+                    self.render_storage_location_row(ui);
+                    ui.add_space(6.0);
                     self.render_model_checkboxes(ui);
                 }
                 EngState::ExtractingEngine { step } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new("Extracting Portable Engine").size(18.0).strong().color(TEXT));
                     ui.label(RichText::new("Unpacking runtime components (this takes 1-2 minutes)...").size(12.0).color(DIM));
@@ -2874,15 +2967,15 @@ fn is_win_ctrl_v() -> bool {
                     let spinner_bar = egui::ProgressBar::new(0.5).fill(ACCENT).animate(true);
                     ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
                     ui.add_space(6.0);
-                    ui.label(RichText::new(step).size(11.5).color(DIM));
+                    ui.label(RichText::new(step).size(12.0).color(DIM));
                     ui.add_space(8.0);
                     self.render_model_checkboxes(ui);
                 }
                 EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(11.0).color(ACCENT).strong());
+                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
                     ui.add_space(4.0);
                     ui.label(RichText::new(format!("Downloading AI Model Weights ({}/{})", file_index, total_files)).size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(format!("File: {}", current_file)).size(11.5).color(DIM));
+                    ui.label(RichText::new(format!("File: {}", current_file)).size(12.0).color(DIM));
                     ui.add_space(8.0);
 
                     let bar = egui::ProgressBar::new(*file_progress)
@@ -2893,9 +2986,9 @@ fn is_win_ctrl_v() -> bool {
                     ui.add_space(5.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.5).color(DIM));
+                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(12.0).color(DIM));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.5).color(TEXT).strong());
+                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(12.0).color(TEXT).strong());
                         });
                     });
                     ui.add_space(5.0);
@@ -2905,29 +2998,8 @@ fn is_win_ctrl_v() -> bool {
                         .text(format!("Total Download Progress: {:.0}%", overall_progress * 100.0));
                     ui.add_sized([card_w - 44.0, 10.0], ov_bar);
 
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let cur_loc = self.sh.pending_models_dir.lock().unwrap().clone()
-                            .unwrap_or_else(|| self.sh.paths.lock().unwrap().models.clone());
-                        ui.label(RichText::new("Storage:").size(11.0).color(DIM));
-                        let display_str = cur_loc.display().to_string();
-                        let truncated = if display_str.len() > 36 {
-                            format!("...{}", &display_str[display_str.len() - 33..])
-                        } else {
-                            display_str
-                        };
-                        ui.label(RichText::new(truncated).size(11.0).color(TEXT));
-                        if ui.small_button("Change Location...").on_hover_text("Change install/model location to another drive (e.g. D:\\ImageStudio). Finished files will automatically move to this location.").clicked() {
-                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                let target_models = folder.join("models");
-                                *self.sh.pending_models_dir.lock().unwrap() = Some(target_models.clone());
-                                let mut cfg = self.sh.cfg.lock().unwrap();
-                                cfg.models_dir = Some(target_models.clone());
-                                cfg.save();
-                                self.sh.paths.lock().unwrap().models = target_models;
-                            }
-                        }
-                    });
+                    ui.add_space(8.0);
+                    self.render_storage_location_row(ui);
                     ui.add_space(6.0);
                     self.render_model_checkboxes(ui);
                 }
@@ -3739,7 +3811,8 @@ fn is_win_ctrl_v() -> bool {
             let st = self.sh.state.lock().unwrap().clone();
             let is_setup_in_progress = matches!(
                 st,
-                EngState::DownloadingEngine { .. }
+                EngState::AwaitingDownloadConfirmation { .. }
+                    | EngState::DownloadingEngine { .. }
                     | EngState::ExtractingEngine { .. }
                     | EngState::DownloadingModels { .. }
                     | EngState::RepairingEngine { .. }
@@ -3792,9 +3865,9 @@ fn is_win_ctrl_v() -> bool {
                 p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
                 p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
                 let btn_label = if self.mode == StudioMode::Video {
-                    "📋 Paste Image for Image-to-Video (Ctrl+V)"
+                    "Paste Image for Image-to-Video (Ctrl+V)"
                 } else {
-                    "📋 Paste Image from Clipboard (Ctrl+V)"
+                    "Paste Image from Clipboard (Ctrl+V)"
                 };
                 p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
 
@@ -3898,7 +3971,7 @@ fn is_win_ctrl_v() -> bool {
             .inner_margin(egui::Margin::symmetric(12, 7))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let paste_icon_btn = egui::Button::new(RichText::new("📋 Paste").size(12.0).color(TEXT))
+                    let paste_icon_btn = egui::Button::new(RichText::new("Paste").size(12.0).color(TEXT))
                         .fill(CARD)
                         .stroke(Stroke::new(1.0, LINE))
                         .corner_radius(6)
@@ -4170,6 +4243,7 @@ fn is_win_ctrl_v() -> bool {
                         let state = self.sh.state.lock().unwrap().clone();
                         let st = match &state {
                             EngState::Detecting => "Detecting engine...".to_string(),
+                            EngState::AwaitingDownloadConfirmation { .. } => "Download confirmation required (metered connection)".to_string(),
                             EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
                                 format!("{step} ({:.1}%) - {} / {} @ {:.1} MB/s", progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
                             }
@@ -4421,7 +4495,7 @@ fn is_win_ctrl_v() -> bool {
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            let dl_btn = egui::Button::new(RichText::new("📥 Start Download (~42 GB)").strong().color(Color32::WHITE))
+                            let dl_btn = egui::Button::new(RichText::new("Start Download (~42 GB)").strong().color(Color32::WHITE))
                                 .fill(ACCENT)
                                 .min_size(vec2(180.0, 32.0));
                             if ui.add(dl_btn).clicked() {
@@ -4450,7 +4524,7 @@ fn is_win_ctrl_v() -> bool {
         // Position at top-right near the status pill (e.g., right margin 24px, top 48px)
         let default_pos = egui::pos2((screen_rect.max.x - 390.0).max(10.0), 48.0);
 
-        egui::Window::new("📥 Active Downloads")
+        egui::Window::new("Active Downloads")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -4562,6 +4636,7 @@ impl eframe::App for App {
             *self.sh.state.lock().unwrap(),
             EngState::Starting { .. }
                 | EngState::Detecting
+                | EngState::AwaitingDownloadConfirmation { .. }
                 | EngState::DownloadingEngine { .. }
                 | EngState::ExtractingEngine { .. }
                 | EngState::DownloadingModels { .. }

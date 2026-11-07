@@ -2,9 +2,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
-pub const UPDATE_URL: &str = "https://desinc.my.to/image-studio/version.json";
+pub const GITHUB_API_URL: &str = "https://api.github.com/repos/DeSinc/Image-Studio/releases/latest";
+pub const SERVER_PRIMARY_URL: &str = "https://desinc.ax/image-studio/version.json";
+pub const SERVER_FALLBACK_URL: &str = "https://desinc.my.to/image-studio/version.json";
+#[allow(dead_code)]
+pub const UPDATE_URL: &str = SERVER_PRIMARY_URL;
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
 pub struct RemoteVersion {
     pub version: String,
     pub download_url: String,
@@ -23,6 +27,21 @@ pub struct UpdaterState {
     pub downloading: bool,
     pub download_progress: f32,
     pub update_applied: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 /// Compares two semver-like version strings ("0.2.8" vs "0.2.7").
@@ -50,6 +69,96 @@ pub fn is_newer(remote: &str, current: &str) -> bool {
     false
 }
 
+/// Parses a GitHub Release JSON string into a RemoteVersion
+pub fn parse_github_release(json_text: &str) -> Result<RemoteVersion, String> {
+    let release: GithubRelease = serde_json::from_str(json_text)
+        .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))?;
+    let version = release.tag_name.trim_start_matches('v').trim().to_string();
+    let download_url = release
+        .assets
+        .into_iter()
+        .find(|a| a.name.eq_ignore_ascii_case("ImageStudio.exe") || a.name.ends_with(".exe"))
+        .map(|a| a.browser_download_url)
+        .unwrap_or_else(|| {
+            format!(
+                "https://github.com/DeSinc/Image-Studio/releases/download/{}/ImageStudio.exe",
+                release.tag_name
+            )
+        });
+    Ok(RemoteVersion {
+        version,
+        download_url,
+        changelog: release.body,
+    })
+}
+
+/// Parses server version.json content, handling possible BOM prefixes
+pub fn parse_server_version(json_text: &str) -> Result<RemoteVersion, String> {
+    let clean = json_text.trim_start_matches('\u{feff}').trim();
+    serde_json::from_str::<RemoteVersion>(clean)
+        .map_err(|e| format!("Failed to parse server version JSON: {e}"))
+}
+
+/// Fetches the latest release from GitHub API
+pub fn fetch_github_version(client: &reqwest::blocking::Client) -> Result<RemoteVersion, String> {
+    let resp = client
+        .get(GITHUB_API_URL)
+        .header(reqwest::header::USER_AGENT, "ImageStudio-Updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+        .send()
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned HTTP {}", resp.status()));
+    }
+
+    let text = resp.text().map_err(|e| format!("Failed to read GitHub response: {e}"))?;
+    parse_github_release(&text)
+}
+
+/// Fetches version from server: tries desinc.ax first, falls back to desinc.my.to if unreachable
+pub fn fetch_server_version(client: &reqwest::blocking::Client) -> Result<RemoteVersion, String> {
+    // 1. Try primary server (.ax)
+    if let Ok(resp) = client.get(SERVER_PRIMARY_URL).send() {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text() {
+                if let Ok(v) = parse_server_version(&text) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    // 2. If .ax failed or could not be resolved, fall back to .my.to
+    let resp = client
+        .get(SERVER_FALLBACK_URL)
+        .send()
+        .map_err(|e| format!("Could not reach server fallback: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Server returned HTTP {}", resp.status()));
+    }
+    let text = resp.text().map_err(|e| format!("Failed to read server response: {e}"))?;
+    parse_server_version(&text)
+}
+
+/// Selects the best candidate between GitHub and server releases.
+/// Checks GitHub first, then compares with server: picking whichever is strictly newest.
+/// If versions are identical, GitHub is favored as the primary distribution channel.
+pub fn select_best_version(gh: Option<RemoteVersion>, srv: Option<RemoteVersion>) -> Option<RemoteVersion> {
+    match (gh, srv) {
+        (Some(g), Some(s)) => {
+            if is_newer(&s.version, &g.version) {
+                Some(s)
+            } else {
+                Some(g)
+            }
+        }
+        (Some(g), None) => Some(g),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
 pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let current_ver = env!("CARGO_PKG_VERSION");
@@ -68,53 +177,33 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
             }
         };
 
-        match client.get(UPDATE_URL).send() {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let text = match resp.text() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let mut st = state.lock().unwrap();
-                            st.checked = true;
-                            st.error = Some(format!("Failed to read response body: {e}"));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    };
-                    let clean = text.trim_start_matches('\u{feff}').trim();
-                    match serde_json::from_str::<RemoteVersion>(clean) {
-                        Ok(info) => {
-                            let is_new = is_newer(&info.version, current_ver);
-                            let should_auto_dl = {
-                                let mut st = state.lock().unwrap();
-                                st.checked = true;
-                                st.latest_version = info.version.clone();
-                                st.download_url = info.download_url.clone();
-                                st.changelog = info.changelog;
-                                st.error = None;
-                                st.update_available = is_new;
-                                is_new && !st.downloading && !st.update_applied
-                            };
-                            if should_auto_dl {
-                                download_and_install_update(state.clone(), ctx.clone());
-                            }
-                        }
-                        Err(e) => {
-                            let mut st = state.lock().unwrap();
-                            st.checked = true;
-                            st.error = Some(format!("Failed to parse version JSON: {e}"));
-                        }
-                    }
-                } else {
+        let gh_res = fetch_github_version(&client);
+        let srv_res = fetch_server_version(&client);
+
+        let best = select_best_version(gh_res.ok(), srv_res.ok());
+
+        match best {
+            Some(info) => {
+                let is_new = is_newer(&info.version, current_ver);
+                let is_metered = crate::engine::is_metered_connection();
+                let should_auto_dl = {
                     let mut st = state.lock().unwrap();
                     st.checked = true;
-                    st.error = Some(format!("Server returned HTTP {}", resp.status()));
+                    st.latest_version = info.version.clone();
+                    st.download_url = info.download_url.clone();
+                    st.changelog = info.changelog;
+                    st.error = None;
+                    st.update_available = is_new;
+                    is_new && !st.downloading && !st.update_applied && !is_metered
+                };
+                if should_auto_dl {
+                    download_and_install_update(state.clone(), ctx.clone());
                 }
             }
-            Err(e) => {
+            None => {
                 let mut st = state.lock().unwrap();
                 st.checked = true;
-                st.error = Some(format!("Could not reach update server: {e}"));
+                st.error = Some("Could not check for updates from GitHub or mirror servers".to_string());
             }
         }
         ctx.request_repaint();
@@ -242,10 +331,68 @@ mod tests {
     #[test]
     fn test_parse_version_with_bom() {
         let raw_with_bom = "\u{feff}{\"version\": \"0.2.8\", \"download_url\": \"https://desinc.my.to/image-studio/ImageStudio.exe\"}";
-        let clean = raw_with_bom.trim_start_matches('\u{feff}').trim();
-        let parsed: Result<RemoteVersion, _> = serde_json::from_str(clean);
+        let parsed = parse_server_version(raw_with_bom);
         assert!(parsed.is_ok());
         let info = parsed.unwrap();
         assert_eq!(info.version, "0.2.8");
+    }
+
+    #[test]
+    fn test_parse_github_release() {
+        let json = r#"{
+            "tag_name": "v0.3.5",
+            "body": "Bug fixes and improvements",
+            "assets": [
+                {
+                    "name": "ImageStudio.exe",
+                    "browser_download_url": "https://github.com/DeSinc/Image-Studio/releases/download/v0.3.5/ImageStudio.exe"
+                }
+            ]
+        }"#;
+        let parsed = parse_github_release(json).unwrap();
+        assert_eq!(parsed.version, "0.3.5");
+        assert_eq!(parsed.download_url, "https://github.com/DeSinc/Image-Studio/releases/download/v0.3.5/ImageStudio.exe");
+        assert_eq!(parsed.changelog.as_deref(), Some("Bug fixes and improvements"));
+    }
+
+    #[test]
+    fn test_select_best_version() {
+        let gh_older = Some(RemoteVersion {
+            version: "0.3.5".into(),
+            download_url: "https://github.com/.../0.3.5.exe".into(),
+            changelog: None,
+        });
+        let srv_newer = Some(RemoteVersion {
+            version: "0.3.6".into(),
+            download_url: "https://desinc.ax/.../0.3.6.exe".into(),
+            changelog: None,
+        });
+        let gh_newer = Some(RemoteVersion {
+            version: "0.3.7".into(),
+            download_url: "https://github.com/.../0.3.7.exe".into(),
+            changelog: None,
+        });
+
+        // Server newer than GitHub -> pick server
+        let res = select_best_version(gh_older.clone(), srv_newer.clone());
+        assert_eq!(res.unwrap().version, "0.3.6");
+
+        // GitHub newer than server -> pick GitHub
+        let res = select_best_version(gh_newer.clone(), srv_newer.clone());
+        assert_eq!(res.unwrap().version, "0.3.7");
+
+        // Equal version -> favor GitHub
+        let srv_same = Some(RemoteVersion {
+            version: "0.3.5".into(),
+            download_url: "https://desinc.ax/.../0.3.5.exe".into(),
+            changelog: None,
+        });
+        let res = select_best_version(gh_older.clone(), srv_same);
+        assert_eq!(res.unwrap().download_url, "https://github.com/.../0.3.5.exe");
+
+        // One source failed
+        assert_eq!(select_best_version(gh_older.clone(), None).unwrap().version, "0.3.5");
+        assert_eq!(select_best_version(None, srv_newer.clone()).unwrap().version, "0.3.6");
+        assert!(select_best_version(None, None).is_none());
     }
 }

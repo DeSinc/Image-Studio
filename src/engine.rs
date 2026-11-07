@@ -276,6 +276,9 @@ impl Profile {
 #[derive(Clone)]
 pub enum EngState {
     Detecting,
+    AwaitingDownloadConfirmation {
+        metered: bool,
+    },
     DownloadingEngine {
         step: String,
         progress: f32,
@@ -330,6 +333,7 @@ pub struct Shared {
     pub clean_engine: AtomicBool,
     pub cancel: AtomicBool,
     pub cancel_model_dl: AtomicBool,
+    pub download_confirmed: AtomicBool,
     pub dl_image_model: AtomicBool,
     pub dl_video_model: AtomicBool,
     pub cfg: Mutex<Config>,
@@ -352,6 +356,7 @@ impl Shared {
             clean_engine: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             cancel_model_dl: AtomicBool::new(false),
+            download_confirmed: AtomicBool::new(false),
             dl_image_model: AtomicBool::new(dl_img),
             dl_video_model: AtomicBool::new(dl_vid),
             cfg: Mutex::new(cfg),
@@ -1478,8 +1483,14 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 continue;
             }
 
-            // 2. ComfyUI missing? Bootstrap automatically!
+            // 2. ComfyUI missing? Bootstrap automatically (requires confirmation if on metered connection)
             if comfy.is_none() {
+                if is_metered_connection() && !sh.download_confirmed.load(Ordering::SeqCst) {
+                    *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
+                    ctx.request_repaint();
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
                 isolated_attempted = true;
                 match bootstrap_engine(&sh, &ctx, &dl_client, clean_requested) {
                     Ok(c) => {
@@ -1505,7 +1516,15 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 *sh.paths.lock().unwrap() = Paths { comfy: Some(cd.clone()), python: pys.first().cloned(), models: models.clone() };
             }
 
-            // 3. Are all profile models present?
+            // 3. Are all profile models present? (requires confirmation if on metered connection)
+            let missing_models = Profile::missing_models(&sh);
+            if !missing_models.is_empty() && is_metered_connection() && !sh.download_confirmed.load(Ordering::SeqCst) {
+                *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
             match bootstrap_models(&sh, &ctx, &dl_client, &models, &profile) {
                 Ok(()) => {
                     *sh.models_found.lock().unwrap() = profile
@@ -1631,6 +1650,44 @@ pub fn adopt_into_kill_job() {
     }
 }
 
+/// Checks if the primary network connection is metered to prevent unconfirmed large downloads.
+#[cfg(windows)]
+pub fn is_metered_connection() -> bool {
+    use windows_sys::Win32::NetworkManagement::WindowsConnectionManager::*;
+    unsafe {
+        let mut data_size: u32 = 0;
+        let mut data_ptr: *mut u8 = std::ptr::null_mut();
+        let res = WcmQueryProperty(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut data_size,
+            &mut data_ptr,
+        );
+        if res == 0 && !data_ptr.is_null() {
+            if data_size as usize >= std::mem::size_of::<WCM_CONNECTION_COST_DATA>() {
+                let cost_data = *(data_ptr as *const WCM_CONNECTION_COST_DATA);
+                let _ = WcmFreeMemory(data_ptr as _);
+                let cost = cost_data.ConnectionCost;
+                return (cost as i32 & (WCM_CONNECTION_COST_FIXED
+                    | WCM_CONNECTION_COST_VARIABLE
+                    | WCM_CONNECTION_COST_OVERDATALIMIT
+                    | WCM_CONNECTION_COST_CONGESTED
+                    | WCM_CONNECTION_COST_ROAMING
+                    | WCM_CONNECTION_COST_APPROACHINGDATALIMIT)) != 0;
+            }
+            let _ = WcmFreeMemory(data_ptr as _);
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_metered_connection() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1730,6 +1787,12 @@ mod tests {
         assert!(download(&url, &dest, 6).is_err());
         assert!(!dest.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_metered_connection_detection() {
+        let is_metered = is_metered_connection();
+        println!("Metered connection: {is_metered}");
     }
 }
 
