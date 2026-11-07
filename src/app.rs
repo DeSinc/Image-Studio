@@ -4043,7 +4043,14 @@ fn is_win_ctrl_v() -> bool {
 
                             ui.label("Python");
                             ui.label(RichText::new(paths.python.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())).color(DIM));
-                            ui.label("");
+                            if ui.button("Browse...").clicked() {
+                                if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                    let mut c = self.sh.cfg.lock().unwrap();
+                                    c.python_path = Some(f);
+                                    c.save();
+                                    self.sh.restart.store(true, Ordering::SeqCst);
+                                }
+                            }
                             ui.end_row();
 
                             ui.label("Models");

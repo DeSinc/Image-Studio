@@ -72,6 +72,8 @@ pub struct Config {
     pub comfy_dir: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
     #[serde(default)]
+    pub python_path: Option<PathBuf>,
+    #[serde(default)]
     pub ignore_paths: Vec<PathBuf>,
     #[serde(default)]
     pub active_profile: Option<String>,
@@ -86,6 +88,7 @@ impl Default for Config {
         Self {
             comfy_dir: None,
             models_dir: None,
+            python_path: None,
             ignore_paths: Vec::new(),
             active_profile: None,
             dl_image_model: true,
@@ -568,25 +571,49 @@ pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
 }
 
 fn detect_gpu_vendor() -> &'static str {
-    let out = if cfg!(windows) {
-        Command::new("powershell")
+    #[cfg(windows)]
+    {
+        let out = Command::new("powershell")
             .args(["-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"])
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
-    } else {
-        Command::new("lspci").output()
-    };
+            .output();
 
-    if let Ok(o) = out {
-        let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
-        if s.contains("nvidia") || s.contains("geforce") || s.contains("quadro") || s.contains("rtx") {
-            return "nvidia";
-        } else if s.contains("amd") || s.contains("radeon") || s.contains("advanced micro devices") {
-            return "amd";
-        } else if s.contains("intel") || s.contains("arc") {
-            return "intel";
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            if s.contains("nvidia") || s.contains("geforce") || s.contains("quadro") || s.contains("rtx") {
+                return "nvidia";
+            } else if s.contains("amd") || s.contains("radeon") {
+                return "amd";
+            } else if s.contains("intel") || s.contains("arc") {
+                return "intel";
+            }
         }
     }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(o) = Command::new("lspci").output() {
+            let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            if s.contains("nvidia") || s.contains("geforce") || s.contains("quadro") || s.contains("rtx") {
+                return "nvidia";
+            } else if s.contains("amd") || s.contains("radeon") || s.contains("advanced micro devices") {
+                return "amd";
+            } else if s.contains("intel") || s.contains("arc") {
+                return "intel";
+            }
+        }
+        if let Ok(o) = Command::new("nvidia-smi").output() {
+            if o.status.success() {
+                return "nvidia";
+            }
+        }
+        if let Ok(o) = Command::new("rocm-smi").output() {
+            if o.status.success() {
+                return "amd";
+            }
+        }
+    }
+
     "nvidia"
 }
 
@@ -627,6 +654,15 @@ pub fn find_comfy(cfg: &Config) -> Option<PathBuf> {
         c.push(h.join("ComfyUI_windows_portable/ComfyUI"));
         c.push(h.join("ComfyUI"));
         c.push(h.join("Documents/ComfyUI"));
+        c.push(h.join(".local/share/ComfyUI"));
+        c.push(h.join("src/ComfyUI"));
+        c.push(h.join("comfyui"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        c.push(PathBuf::from("/opt/ComfyUI"));
+        c.push(PathBuf::from("/opt/comfyui"));
     }
 
     c.into_iter().find(|p| {
@@ -646,10 +682,21 @@ fn find_in_path(bin_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
+fn find_pythons(cfg: &Config, comfy: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Explicitly configured python in settings
+    if let Some(ref p) = cfg.python_path {
+        if p.is_file() {
+            candidates.push(p.clone());
+        }
+    }
+
     let parent = comfy.parent().map(Path::to_path_buf).unwrap_or_default();
     let grand = parent.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut candidates: Vec<PathBuf> = [
+
+    // 2. Comfy-local virtual environments
+    let local_envs = [
         comfy.join(".venv/Scripts/python.exe"),
         comfy.join("venv/Scripts/python.exe"),
         parent.join(".venv/Scripts/python.exe"),
@@ -664,13 +711,47 @@ fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
         parent.join(".venv/bin/python3"),
         parent.join("bin/python"),
         parent.join("bin/python3"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .collect();
+    ];
+
+    for p in local_envs {
+        if p.is_file() && !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+
+    // 3. User conda / pyenv virtual environments
+    if let Some(h) = dirs::home_dir() {
+        let env_dirs = [
+            h.join("miniconda3/envs"),
+            h.join("anaconda3/envs"),
+            h.join(".conda/envs"),
+            h.join("miniforge3/envs"),
+            h.join(".virtualenvs"),
+        ];
+        let comfy_env_names = ["comfy", "comfyui", "ComfyUI", "comfy-env", "ai", "torch"];
+        for ed in env_dirs {
+            for name in comfy_env_names {
+                let py_unix = ed.join(name).join("bin/python");
+                if py_unix.is_file() && !candidates.contains(&py_unix) {
+                    candidates.push(py_unix);
+                }
+                let py_win = ed.join(name).join("python.exe");
+                if py_win.is_file() && !candidates.contains(&py_win) {
+                    candidates.push(py_win);
+                }
+            }
+        }
+    }
+
+    // 4. PATH binaries
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            for name in ["python.exe", "python3", "python"] {
+            #[cfg(windows)]
+            let names = ["python.exe"];
+            #[cfg(not(windows))]
+            let names = ["python3", "python"];
+
+            for name in names {
                 let python = dir.join(name);
                 if python.is_file() && !candidates.contains(&python) {
                     candidates.push(python);
@@ -678,6 +759,7 @@ fn find_pythons(comfy: &Path) -> Vec<PathBuf> {
             }
         }
     }
+
     candidates
 }
 
@@ -1316,58 +1398,163 @@ fn bootstrap_engine(
 ) -> Result<PathBuf, String> {
     let engine_dir = fresh_engine_dir(&data_dir().join("engine"))?;
 
-    let (comfy_url, vendor_name) = get_comfy_portable_url();
-    let archive_path = data_dir().join(format!("comfyui_portable_{vendor_name}.7z"));
-    log(&format!("bootstrap: downloading {vendor_name} portable from {comfy_url}"));
-
+    #[cfg(not(windows))]
     {
+        let (_, vendor_name) = get_comfy_portable_url();
+        log(&format!("bootstrap: setting up ComfyUI for Linux ({vendor_name}) in {}", engine_dir.display()));
+
         let step_desc = if recovering {
-            format!("Existing engine failed; creating an isolated {vendor_name} instance...")
+            "Existing engine failed; setting up a fresh ComfyUI instance...".to_string()
         } else {
-            format!("Downloading ComfyUI Portable ({vendor_name})...")
+            "Setting up ComfyUI engine for Linux...".to_string()
         };
-        let step_clone = step_desc.clone();
-        let res = download_file(
-            dl_client,
-            comfy_url,
-            &archive_path,
-            0,
-            |done, total, speed| {
-                let prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-                *sh.state.lock().unwrap() = EngState::DownloadingEngine {
-                    step: step_clone.clone(),
-                    progress: prog,
-                    bytes_done: done,
-                    bytes_total: total,
-                    speed_mb: speed,
-                };
-            },
-            &sh.cancel,
-            ctx,
-            Some(sh),
-        );
-        if let Err(e) = res {
-            return Err(format!("Engine download failed: {e}"));
+
+        *sh.state.lock().unwrap() = EngState::DownloadingEngine {
+            step: format!("{step_desc} (cloning repository)"),
+            progress: 0.1,
+            bytes_done: 0,
+            bytes_total: 0,
+            speed_mb: 0.0,
+        };
+        ctx.request_repaint();
+
+        let comfy_target = engine_dir.join("ComfyUI");
+        let git_status = Command::new("git")
+            .args(["clone", "--depth", "1", "https://github.com/comfyanonymous/ComfyUI.git"])
+            .arg(&comfy_target)
+            .status();
+
+        let clone_ok = git_status.map(|s| s.success()).unwrap_or(false);
+        if !clone_ok {
+            log("bootstrap: git clone failed or git missing; downloading repository source archive");
+            let archive_path = engine_dir.join("comfyui_master.tar.gz");
+            let dl_res = download_file(
+                dl_client,
+                "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.tar.gz",
+                &archive_path,
+                0,
+                |done, total, speed| {
+                    let prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                    *sh.state.lock().unwrap() = EngState::DownloadingEngine {
+                        step: "Downloading ComfyUI source archive...".into(),
+                        progress: prog,
+                        bytes_done: done,
+                        bytes_total: total,
+                        speed_mb: speed,
+                    };
+                },
+                &sh.cancel,
+                ctx,
+                Some(sh),
+            );
+            if let Err(e) = dl_res {
+                return Err(format!("Could not acquire ComfyUI on Linux: {e}\nPlease install ComfyUI and set its path in Settings."));
+            }
+
+            let _ = Command::new("tar")
+                .args(["-xzf", archive_path.to_str().unwrap_or(""), "-C", engine_dir.to_str().unwrap_or("")])
+                .status();
+            let _ = std::fs::remove_file(&archive_path);
+
+            if engine_dir.join("ComfyUI-master").exists() {
+                let _ = std::fs::rename(engine_dir.join("ComfyUI-master"), &comfy_target);
+            }
         }
+
+        if !comfy_target.join("main.py").is_file() {
+            return Err("ComfyUI download finished but main.py was not found. Please specify ComfyUI directory in Settings.".into());
+        }
+
+        // Initialize virtualenv if python3 is present
+        *sh.state.lock().unwrap() = EngState::ExtractingEngine {
+            step: "Creating Python virtual environment (.venv)...".into(),
+        };
+        ctx.request_repaint();
+
+        let venv_cmd = Command::new("python3")
+            .args(["-m", "venv", ".venv"])
+            .current_dir(&comfy_target)
+            .status();
+
+        if let Ok(st) = venv_cmd {
+            if st.success() {
+                log("bootstrap: created .venv; installing PyTorch and ComfyUI requirements via pip");
+                *sh.state.lock().unwrap() = EngState::ExtractingEngine {
+                    step: "Installing PyTorch and dependencies into .venv...".into(),
+                };
+                ctx.request_repaint();
+
+                let py_venv = comfy_target.join(".venv/bin/python");
+                let pip_wheel_args: Vec<&str> = match vendor_name {
+                    "AMD" => vec!["install", "--pre", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/rocm6.2", "-r", "requirements.txt"],
+                    _ => vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu124", "-r", "requirements.txt"],
+                };
+                let _ = Command::new(&py_venv)
+                    .args(&["-m", "pip"])
+                    .args(&pip_wheel_args)
+                    .current_dir(&comfy_target)
+                    .status();
+            }
+        }
+
+        return Ok(comfy_target);
     }
 
-    *sh.state.lock().unwrap() = EngState::ExtractingEngine {
-        step: format!("Extracting ComfyUI Portable ({vendor_name}) components..."),
-    };
-    ctx.request_repaint();
-    log("bootstrap: extracting 7z archive into engine directory");
+    #[cfg(windows)]
+    {
+        let (comfy_url, vendor_name) = get_comfy_portable_url();
+        let archive_path = data_dir().join(format!("comfyui_portable_{vendor_name}.7z"));
+        log(&format!("bootstrap: downloading {vendor_name} portable from {comfy_url}"));
 
-    let extraction = sevenz_rust2::decompress_file(&archive_path, &engine_dir);
-    let _ = std::fs::remove_file(&archive_path);
-    extraction.map_err(|e| format!("Failed to extract ComfyUI 7z archive: {e}"))?;
+        {
+            let step_desc = if recovering {
+                format!("Existing engine failed; creating an isolated {vendor_name} instance...")
+            } else {
+                format!("Downloading ComfyUI Portable ({vendor_name})...")
+            };
+            let step_clone = step_desc.clone();
+            let res = download_file(
+                dl_client,
+                comfy_url,
+                &archive_path,
+                0,
+                |done, total, speed| {
+                    let prog = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                    *sh.state.lock().unwrap() = EngState::DownloadingEngine {
+                        step: step_clone.clone(),
+                        progress: prog,
+                        bytes_done: done,
+                        bytes_total: total,
+                        speed_mb: speed,
+                    };
+                },
+                &sh.cancel,
+                ctx,
+                Some(sh),
+            );
+            if let Err(e) = res {
+                return Err(format!("Engine download failed: {e}"));
+            }
+        }
 
-    log("bootstrap: extracted successfully");
+        *sh.state.lock().unwrap() = EngState::ExtractingEngine {
+            step: format!("Extracting ComfyUI Portable ({vendor_name}) components..."),
+        };
+        ctx.request_repaint();
+        log("bootstrap: extracting 7z archive into engine directory");
 
-    if let Some(c) = [engine_dir.join("ComfyUI_windows_portable/ComfyUI"), engine_dir.join("ComfyUI")]
-        .into_iter().find(|c| c.join("main.py").is_file()) {
-        Ok(c)
-    } else {
-        Err("Extraction finished but main.py was not found in extracted directory.".into())
+        let extraction = sevenz_rust2::decompress_file(&archive_path, &engine_dir);
+        let _ = std::fs::remove_file(&archive_path);
+        extraction.map_err(|e| format!("Failed to extract ComfyUI 7z archive: {e}"))?;
+
+        log("bootstrap: extracted successfully");
+
+        if let Some(c) = [engine_dir.join("ComfyUI_windows_portable/ComfyUI"), engine_dir.join("ComfyUI")]
+            .into_iter().find(|c| c.join("main.py").is_file()) {
+            Ok(c)
+        } else {
+            Err("Extraction finished but main.py was not found in extracted directory.".into())
+        }
     }
 }
 
@@ -1675,7 +1862,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 consecutive_crashes = 0;
                 *sh.state.lock().unwrap() = EngState::Ready { ours: child.is_some(), gpu };
                 let models = comfy.as_ref().map(|c| find_models(&cfg, c)).unwrap_or_default();
-                let pys = comfy.as_ref().map(|c| find_pythons(c)).unwrap_or_default();
+                let pys = comfy.as_ref().map(|c| find_pythons(&cfg, c)).unwrap_or_default();
                 if child.is_none() {
                     *sh.paths.lock().unwrap() = Paths { comfy: comfy.clone(), python: pys.first().cloned(), models: models.clone() };
                 }
@@ -1735,7 +1922,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
             let cd = comfy.as_ref().unwrap();
             let models = find_models(&cfg, cd);
             if child.is_none() {
-                let pys = find_pythons(cd);
+                let pys = find_pythons(&cfg, cd);
                 *sh.paths.lock().unwrap() = Paths { comfy: Some(cd.clone()), python: pys.first().cloned(), models: models.clone() };
             }
 
@@ -1783,7 +1970,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
 
             // 4. Launch ComfyUI process
             if child.is_none() {
-                let pys = find_pythons(cd);
+                let pys = find_pythons(&cfg, cd);
                 if attempt >= pys.len() {
                     let t = tail(&data_dir().join("comfyui.log"), 14);
                     let is_managed = cd.starts_with(data_dir());
@@ -2073,5 +2260,36 @@ mod tests {
     fn test_metered_connection_detection() {
         let is_metered = is_metered_connection();
         println!("Metered connection: {is_metered}");
+    }
+
+    #[test]
+    fn test_config_python_path_serialization() {
+        let mut cfg = Config::default();
+        cfg.python_path = Some(PathBuf::from("/usr/bin/custom-python3"));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("/usr/bin/custom-python3"));
+
+        let deserialized: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.python_path, Some(PathBuf::from("/usr/bin/custom-python3")));
+    }
+
+    #[test]
+    fn test_find_pythons_prioritizes_configured_path() {
+        let root = sandbox();
+        let comfy = root.join("ComfyUI");
+        std::fs::create_dir_all(&comfy).unwrap();
+        std::fs::write(comfy.join("main.py"), "print('comfy')").unwrap();
+
+        let custom_py = root.join("my_python.exe");
+        std::fs::write(&custom_py, "#!/bin/sh\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.python_path = Some(custom_py.clone());
+
+        let candidates = find_pythons(&cfg, &comfy);
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0], custom_py);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
