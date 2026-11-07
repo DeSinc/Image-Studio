@@ -19,6 +19,12 @@ fn main() {
     .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=BUILD_STAMP={}", out.trim());
 
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=BUILD_EPOCH={epoch}");
+
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();

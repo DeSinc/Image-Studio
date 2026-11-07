@@ -244,6 +244,11 @@ pub fn restart_application() {
         exe
     };
 
+    if !target_exe.is_file() {
+        crate::engine::log(&format!("restart_application: target executable not found at {}", target_exe.display()));
+        return;
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -251,9 +256,12 @@ pub fn restart_application() {
         const DETACHED_PROCESS: u32 = 0x00000008;
 
         let target_str = target_exe.to_string_lossy().to_string();
-        let cmd_script = format!("timeout /t 1 /nobreak > nul & start \"\" \"{}\"", target_str);
-        let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.args(["/C", &cmd_script]);
+        let ps_cmd = format!(
+            "Start-Sleep -Milliseconds 600; Start-Process -FilePath '{}'",
+            target_str.replace('\'', "''")
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
         cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
         let _ = cmd.spawn();
         std::process::exit(0);

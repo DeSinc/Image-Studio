@@ -8,6 +8,7 @@ target/
 *.dll
 *.so
 *.dylib
+*.old
 ImageStudio.exe
 
 # Model weights and checkpoints (never commit model files!)

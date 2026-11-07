@@ -19,6 +19,15 @@ pub fn estimate_video_vram_gb(w: u32, h: u32, duration: u32, fps: u32) -> f32 {
     9.5 + load_factor * 0.55
 }
 
+pub fn build_timestamp_display() -> String {
+    if let Ok(epoch_secs) = option_env!("BUILD_EPOCH").unwrap_or("").parse::<i64>() {
+        if let Some(dt) = chrono::DateTime::from_timestamp(epoch_secs, 0) {
+            return dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+    }
+    env!("BUILD_STAMP").to_string()
+}
+
 const BG: Color32 = Color32::from_rgb(12, 14, 19);
 const PANEL: Color32 = Color32::from_rgb(18, 21, 29);
 const CARD: Color32 = Color32::from_rgb(25, 29, 40);
@@ -1770,7 +1779,9 @@ fn is_win_ctrl_v() -> bool {
                             }
                         }
                         pill_click.on_hover_text("Click to toggle download manager");
-                        ui.label(RichText::new(format!("build {}", env!("BUILD_STAMP"))).size(11.0).color(DIM));
+                        let local_time = build_timestamp_display();
+                        ui.label(RichText::new(format!("build {local_time}")).size(11.0).color(DIM))
+                            .on_hover_text(format!("Build time (local): {local_time}\nBuild UTC: {}", env!("BUILD_STAMP")));
                     });
                 });
             });

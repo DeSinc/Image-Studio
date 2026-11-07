@@ -19,7 +19,7 @@ fn load_app_icon() -> Option<eframe::egui::IconData> {
 
 fn main() -> eframe::Result {
     std::panic::set_hook(Box::new(|info| engine::log(&format!("PANIC: {info}"))));
-    engine::log(&format!("=== start, build {} ===", env!("BUILD_STAMP")));
+    engine::log(&format!("=== start, build {} (local: {}) ===", env!("BUILD_STAMP"), app::build_timestamp_display()));
     engine::adopt_into_kill_job();
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
