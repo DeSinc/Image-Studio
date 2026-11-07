@@ -287,7 +287,7 @@ pub struct App {
     pub video_prompt_enhance: bool,
     pub video_negative: String,
     pub show_video_dl_modal: bool,
-    pub show_downloads_menu: bool,
+    pub download_pane: crate::download_ui::DownloadPaneState,
     pub last_progress_time: Option<Instant>,
     pub last_progress_val: u32,
     pub step_duration_ema: f32,
@@ -481,7 +481,7 @@ impl App {
             video_prompt_enhance: true,
             video_negative: String::new(),
             show_video_dl_modal: false,
-            show_downloads_menu: false,
+            download_pane: crate::download_ui::DownloadPaneState::default(),
             last_progress_time: None,
             last_progress_val: 0,
             step_duration_ema: 0.0,
@@ -1650,22 +1650,25 @@ fn is_win_ctrl_v() -> bool {
     fn can_queue(&self) -> Result<(), &'static str> {
         let st = self.sh.state.lock().unwrap().clone();
         match st {
-            EngState::Ready { .. } | EngState::Starting { .. } | EngState::Detecting => {}
-            EngState::AwaitingDownloadConfirmation { .. } => return Err("Download confirmation required (see Setup)"),
-            EngState::DownloadingEngine { .. } => return Err("Downloading engine..."),
-            EngState::ExtractingEngine { .. } => return Err("Extracting engine..."),
-            EngState::DownloadingModels { .. } => return Err("Downloading models..."),
-            EngState::RepairingEngine { .. } => return Err("Repairing engine..."),
-            EngState::ModelDownloadFailed { .. } => return Err("Model download paused (see Setup)"),
-            EngState::Failed(_) => return Err("Engine setup failed (see Setup)"),
+            EngState::Ready { .. }
+            | EngState::Starting { .. }
+            | EngState::Detecting
+            | EngState::AwaitingDownloadConfirmation { .. }
+            | EngState::DownloadingEngine { .. }
+            | EngState::ExtractingEngine { .. }
+            | EngState::DownloadingModels { .. }
+            | EngState::ModelDownloadPaused { .. }
+            | EngState::RepairingEngine { .. } => {}
+            EngState::ModelDownloadFailed { .. } => return Err("Model download interrupted - check downloads"),
+            EngState::Failed(_) => return Err("Engine setup failed"),
         }
         if self.mode == StudioMode::Video {
-            if !self.has_video_models() {
-                return Err("Video models not downloaded (check Setup)");
+            if !self.has_video_models() && !self.sh.dl_video_model.load(Ordering::SeqCst) {
+                return Err("Video model download disabled in settings");
             }
         } else {
-            if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
-                return Err("Downloading model weights...");
+            if !self.sh.dl_image_model.load(Ordering::SeqCst) && self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
+                return Err("Image model download disabled in settings");
             }
         }
         Ok(())
@@ -1729,6 +1732,7 @@ fn is_win_ctrl_v() -> bool {
                             EngState::DownloadingEngine { .. } => ("Downloading engine...".to_string(), AMBER),
                             EngState::ExtractingEngine { .. } => ("Extracting engine...".to_string(), AMBER),
                             EngState::DownloadingModels { file_index, total_files, .. } => (format!("Downloading model ({}/{})", file_index, total_files), AMBER),
+                            EngState::ModelDownloadPaused { .. } => ("Model download paused".to_string(), AMBER),
                             EngState::RepairingEngine { .. } => ("Repairing engine...".to_string(), AMBER),
                             EngState::Starting { since, .. } => (format!("Starting engine... {}s", since.elapsed().as_secs()), AMBER),
                             EngState::Ready { ours, .. } => (
@@ -1759,9 +1763,13 @@ fn is_win_ctrl_v() -> bool {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if pill_click.clicked() {
-                            self.show_downloads_menu = !self.show_downloads_menu;
+                            self.download_pane.is_expanded = !self.download_pane.is_expanded;
+                            self.download_pane.user_opened = self.download_pane.is_expanded;
+                            if self.download_pane.is_expanded {
+                                self.download_pane.user_acknowledged = true;
+                            }
                         }
-                        pill_click.on_hover_text("Click to view downloads list");
+                        pill_click.on_hover_text("Click to toggle download manager");
                         ui.label(RichText::new(format!("build {}", env!("BUILD_STAMP"))).size(11.0).color(DIM));
                     });
                 });
@@ -2831,337 +2839,7 @@ fn is_win_ctrl_v() -> bool {
             });
     }
 
-    fn render_storage_location_row(&self, ui: &mut egui::Ui) {
-        let cur_loc = self
-            .sh
-            .pending_models_dir
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| self.sh.paths.lock().unwrap().models.clone());
-        let display_str = cur_loc.display().to_string();
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Storage:").size(12.0).color(DIM));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let change_btn = ui.button(RichText::new("Change Location...").size(12.0))
-                    .on_hover_text("Change install/model location to another drive (e.g. D:\\ImageStudio). Finished files will automatically move to this location.");
-                if change_btn.clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        let target_models = folder.join("models");
-                        *self.sh.pending_models_dir.lock().unwrap() = Some(target_models.clone());
-                        let mut cfg = self.sh.cfg.lock().unwrap();
-                        cfg.models_dir = Some(target_models.clone());
-                        cfg.save();
-                        self.sh.paths.lock().unwrap().models = target_models;
-                    }
-                }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let avail = ui.available_width();
-                    ui.add_sized(
-                        [avail, 20.0],
-                        egui::Label::new(RichText::new(&display_str).size(12.0).color(TEXT).strong()).truncate(),
-                    ).on_hover_text(&display_str);
-                });
-            });
-        });
-    }
-
-    fn render_setup_card(&mut self, ui: &mut egui::Ui, rect: Rect, state: &EngState) {
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
-        p.rect_stroke(rect, 10, Stroke::new(1.5, LINE), StrokeKind::Inside);
-
-        let is_failed = matches!(state, EngState::Failed(_) | EngState::ModelDownloadFailed { .. });
-        let is_model_failed = matches!(state, EngState::ModelDownloadFailed { .. });
-        let is_confirmation = matches!(state, EngState::AwaitingDownloadConfirmation { .. });
-        let card_w = (rect.width() - 48.0).clamp(580.0, 920.0);
-        let card_h = if is_confirmation {
-            360.0f32
-        } else if is_model_failed {
-            340.0f32
-        } else if is_failed {
-            400.0f32
-        } else {
-            330.0f32
-        };
-        let card_rect = Rect::from_center_size(rect.center(), vec2(card_w, card_h));
-
-        p.rect_filled(card_rect, 12, CARD);
-        let stroke_color = if is_model_failed || is_confirmation {
-            AMBER.linear_multiply(0.5)
-        } else if is_failed {
-            RED.linear_multiply(0.4)
-        } else {
-            CARD_HI
-        };
-        p.rect_stroke(card_rect, 12, Stroke::new(1.0, stroke_color), StrokeKind::Inside);
-
-        let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect.shrink(22.0)));
-        card_ui.vertical_centered(|ui| {
-            match state {
-                EngState::AwaitingDownloadConfirmation { metered } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(AMBER).strong());
-                    ui.add_space(4.0);
-                    let title = if *metered {
-                        "Metered Connection Detected"
-                    } else {
-                        "Download Confirmation Required"
-                    };
-                    ui.label(RichText::new(title).size(18.0).strong().color(TEXT));
-                    ui.add_space(2.0);
-                    let desc = if *metered {
-                        "A metered network connection was detected. Automatic downloads are paused to prevent unexpected data usage. Select your preferred models and storage path below before beginning."
-                    } else {
-                        "Confirm your model selection and storage path below to begin downloading."
-                    };
-                    ui.label(RichText::new(desc).size(12.0).color(DIM));
-                    ui.add_space(10.0);
-
-                    self.render_storage_location_row(ui);
-                    ui.add_space(8.0);
-                    self.render_model_checkboxes(ui);
-                    ui.add_space(14.0);
-
-                    let start_btn = egui::Button::new(RichText::new("Begin Download").size(13.5).strong().color(Color32::WHITE))
-                        .fill(ACCENT)
-                        .min_size(vec2(160.0, 32.0));
-                    if ui.add(start_btn).on_hover_text("Starts downloading missing engine and model files").clicked() {
-                        self.sh.download_confirmed.store(true, Ordering::SeqCst);
-                        self.sh.retry.store(true, Ordering::SeqCst);
-                    }
-                }
-                EngState::DownloadingEngine { step, progress, bytes_done, bytes_total, speed_mb } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Downloading AI Image Engine").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(step).size(12.0).color(DIM));
-                    ui.label(RichText::new(format!("Step 1 of 2: Portable ComfyUI environment • {:.1} MB/s", speed_mb)).size(12.0).color(DIM));
-                    ui.add_space(12.0);
-
-                    let bar = egui::ProgressBar::new(*progress)
-                        .show_percentage()
-                        .fill(ACCENT)
-                        .animate(true);
-                    ui.add_sized([card_w - 44.0, 14.0], bar);
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(12.0).color(DIM));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(12.0).color(TEXT).strong());
-                        });
-                    });
-                    ui.add_space(8.0);
-                    self.render_storage_location_row(ui);
-                    ui.add_space(6.0);
-                    self.render_model_checkboxes(ui);
-                }
-                EngState::ExtractingEngine { step } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Extracting Portable Engine").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new("Unpacking runtime components (this takes 1-2 minutes)...").size(12.0).color(DIM));
-                    ui.add_space(12.0);
-
-                    let spinner_bar = egui::ProgressBar::new(0.5).fill(ACCENT).animate(true);
-                    ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(step).size(12.0).color(DIM));
-                    ui.add_space(8.0);
-                    self.render_model_checkboxes(ui);
-                }
-                EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
-                    ui.label(RichText::new("SETTING UP IMAGE STUDIO").size(12.0).color(ACCENT).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(format!("Downloading AI Model Weights ({}/{})", file_index, total_files)).size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(format!("File: {}", current_file)).size(12.0).color(DIM));
-                    ui.add_space(8.0);
-
-                    let bar = egui::ProgressBar::new(*file_progress)
-                        .show_percentage()
-                        .fill(ACCENT)
-                        .animate(true);
-                    ui.add_sized([card_w - 44.0, 14.0], bar);
-                    ui.add_space(5.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(12.0).color(DIM));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(12.0).color(TEXT).strong());
-                        });
-                    });
-                    ui.add_space(5.0);
-
-                    let ov_bar = egui::ProgressBar::new(*overall_progress)
-                        .fill(ACCENT.linear_multiply(0.6))
-                        .text(format!("Total Download Progress: {:.0}%", overall_progress * 100.0));
-                    ui.add_sized([card_w - 44.0, 10.0], ov_bar);
-
-                    ui.add_space(8.0);
-                    self.render_storage_location_row(ui);
-                    ui.add_space(6.0);
-                    self.render_model_checkboxes(ui);
-                }
-                EngState::Starting { since, attempt } => {
-                    ui.label(RichText::new("INITIALIZING BACKEND").size(11.0).color(AMBER).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Starting ComfyUI Engine").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(format!("Starting background process (attempt {}, {}s)...", attempt + 1, since.elapsed().as_secs())).size(12.0).color(DIM));
-                    ui.add_space(14.0);
-
-                    let bar = egui::ProgressBar::new(0.6).fill(AMBER).animate(true);
-                    ui.add_sized([card_w - 44.0, 12.0], bar);
-                }
-                EngState::RepairingEngine { step } => {
-                    ui.label(RichText::new("REPAIRING ENVIRONMENT").size(11.0).color(AMBER).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Installing Missing Dependencies").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new(step).size(12.0).color(DIM));
-                    ui.add_space(14.0);
-
-                    let spinner_bar = egui::ProgressBar::new(0.5).fill(AMBER).animate(true);
-                    ui.add_sized([card_w - 44.0, 14.0], spinner_bar);
-                }
-                EngState::ModelDownloadFailed { current_file, error } => {
-                    ui.label(RichText::new("DOWNLOAD PAUSED").size(11.0).color(AMBER).strong());
-                    ui.add_space(3.0);
-                    ui.label(RichText::new("Model Download Interrupted").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new("The local ComfyUI engine is working properly. A model file download was interrupted or throttled.").size(11.5).color(DIM));
-                    ui.add_space(8.0);
-
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(10, 12, 16))
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("model_dl_err_log_scroll")
-                                .max_height(80.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(format!("File: {current_file}\n{error}"))
-                                                .monospace()
-                                                .size(11.0)
-                                                .color(Color32::from_rgb(255, 180, 100)),
-                                        )
-                                        .selectable(true),
-                                    );
-                                });
-                        });
-                    ui.add_space(10.0);
-
-                    let retry_btn = egui::Button::new(
-                        RichText::new("Retry Model Download")
-                            .size(12.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(ACCENT)
-                    .stroke(Stroke::new(1.0, ACCENT_GLOW))
-                    .corner_radius(6);
-                    if ui.add(retry_btn).on_hover_text("Resumes downloading missing models from the fastest available mirror").clicked() {
-                        self.sh.retry.store(true, Ordering::SeqCst);
-                    }
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Open Models Folder").clicked() {
-                            engine::open_models_folder(&self.sh);
-                        }
-
-                        if ui.button("Dismiss / Check Status").clicked() {
-                            self.sh.retry.store(true, Ordering::SeqCst);
-                        }
-                    });
-                }
-                EngState::Failed(msg) => {
-                    ui.label(RichText::new("SETUP INTERRUPTED").size(11.0).color(RED).strong());
-                    ui.add_space(3.0);
-                    ui.label(RichText::new("Engine Failed to Start").size(18.0).strong().color(TEXT));
-                    ui.label(RichText::new("The local ComfyUI installation failed to launch (missing dependencies or incompatible version).").size(11.5).color(DIM));
-                    ui.add_space(8.0);
-
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(10, 12, 16))
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("err_log_scroll")
-                                .max_height(105.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(msg)
-                                                .monospace()
-                                                .size(11.0)
-                                                .color(Color32::from_rgb(255, 120, 120)),
-                                        )
-                                        .selectable(true),
-                                    );
-                                });
-                        });
-                    ui.add_space(10.0);
-
-                    let clean_btn = egui::Button::new(
-                        RichText::new("Download Clean Dedicated Engine (Recommended)")
-                            .size(12.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(ACCENT)
-                    .stroke(Stroke::new(1.0, ACCENT_GLOW))
-                    .corner_radius(6);
-                    if ui.add(clean_btn).on_hover_text("Bypasses broken local installs and automatically downloads a clean, tested portable engine").clicked() {
-                        engine::reset_to_clean_engine(&self.sh);
-                    }
-                    ui.add_space(6.0);
-
-                    ui.horizontal(|ui| {
-                        let rep_btn = egui::Button::new(
-                            RichText::new("Auto-Repair Environment (pip)")
-                                .size(11.5)
-                                .color(TEXT),
-                        )
-                        .fill(CARD_HI)
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6);
-                        if ui.add(rep_btn).on_hover_text("Runs pip install (async-timeout, aiohttp, requirements.txt) in the detected Python environment").clicked() {
-                            engine::repair_environment(self.sh.clone(), ui.ctx().clone());
-                        }
-
-                        if ui.button("Browse Different Folder").clicked() {
-                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                let mut cfg = self.sh.cfg.lock().unwrap();
-                                cfg.comfy_dir = Some(folder);
-                                cfg.save();
-                                self.sh.retry.store(true, Ordering::SeqCst);
-                            }
-                        }
-
-                        if ui.button("Retry").clicked() {
-                            self.sh.retry.store(true, Ordering::SeqCst);
-                        }
-                    });
-                }
-                EngState::Detecting => {
-                    ui.label(RichText::new("DETECTING ENGINE").size(11.0).color(AMBER).strong());
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Checking for Local ComfyUI...").size(18.0).strong().color(TEXT));
-                    ui.add_space(14.0);
-                    let bar = egui::ProgressBar::new(0.3).fill(AMBER).animate(true);
-                    ui.add_sized([card_w - 44.0, 12.0], bar);
-                }
-                EngState::Ready { .. } => {}
-            }
-        });
-    }
 
     fn render_video_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_size: Vec2) {
         let player = match self.video_player.as_mut() {
@@ -3808,74 +3486,59 @@ fn is_win_ctrl_v() -> bool {
 
         } else {
             let (rect, resp) = ui.allocate_exact_size(max_size, Sense::click());
-            let st = self.sh.state.lock().unwrap().clone();
-            let is_setup_in_progress = matches!(
-                st,
-                EngState::AwaitingDownloadConfirmation { .. }
-                    | EngState::DownloadingEngine { .. }
-                    | EngState::ExtractingEngine { .. }
-                    | EngState::DownloadingModels { .. }
-                    | EngState::RepairingEngine { .. }
-                    | EngState::ModelDownloadFailed { .. }
-                    | EngState::Failed(_)
-            );
-            if is_setup_in_progress {
-                self.render_setup_card(ui, rect, &st);
+            let hover = resp.hovered();
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
+            p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
+
+            let c = rect.center();
+            if self.mode == StudioMode::Video {
+                p.text(
+                    c - vec2(0.0, 36.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Video Generation Mode (LTX-Video 2.3)",
+                    egui::FontId::proportional(19.0),
+                    TEXT,
+                );
+                p.text(
+                    c - vec2(0.0, 10.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Enter a prompt below for Text-to-Video, or paste an image for Image-to-Video.",
+                    egui::FontId::proportional(13.0),
+                    ACCENT_GLOW,
+                );
             } else {
-                let hover = resp.hovered();
-                let p = ui.painter_at(rect);
-                p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
-                p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
+                p.text(
+                    c - vec2(0.0, 36.0),
+                    egui::Align2::CENTER_CENTER,
+                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
+                    egui::FontId::proportional(19.0),
+                    TEXT,
+                );
+                p.text(
+                    c - vec2(0.0, 10.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Or enter a prompt below to generate an image from scratch.",
+                    egui::FontId::proportional(13.0),
+                    ACCENT_GLOW,
+                );
+            }
 
-                let c = rect.center();
-                if self.mode == StudioMode::Video {
-                    p.text(
-                        c - vec2(0.0, 36.0),
-                        egui::Align2::CENTER_CENTER,
-                        "Video Generation Mode (LTX-Video 2.3)",
-                        egui::FontId::proportional(19.0),
-                        TEXT,
-                    );
-                    p.text(
-                        c - vec2(0.0, 10.0),
-                        egui::Align2::CENTER_CENTER,
-                        "Enter a prompt below for Text-to-Video, or paste an image for Image-to-Video!",
-                        egui::FontId::proportional(13.0),
-                        ACCENT_GLOW,
-                    );
-                } else {
-                    p.text(
-                        c - vec2(0.0, 36.0),
-                        egui::Align2::CENTER_CENTER,
-                        if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
-                        egui::FontId::proportional(19.0),
-                        TEXT,
-                    );
-                    p.text(
-                        c - vec2(0.0, 10.0),
-                        egui::Align2::CENTER_CENTER,
-                        "Or simply enter a prompt below to generate an image from scratch!",
-                        egui::FontId::proportional(13.0),
-                        ACCENT_GLOW,
-                    );
-                }
+            let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0));
+            let paste_hover = btn_rect.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or_default()));
+            p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
+            p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
+            let btn_label = if self.mode == StudioMode::Video {
+                "Paste Image for Image-to-Video (Ctrl+V)"
+            } else {
+                "Paste Image from Clipboard (Ctrl+V)"
+            };
+            p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
 
-                let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0));
-                let paste_hover = btn_rect.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or_default()));
-                p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
-                p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
-                let btn_label = if self.mode == StudioMode::Video {
-                    "Paste Image for Image-to-Video (Ctrl+V)"
-                } else {
-                    "Paste Image from Clipboard (Ctrl+V)"
-                };
-                p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
-
-                if paste_hover && ui.ctx().input(|i| i.pointer.any_pressed()) {
-                    let _ = self.paste_from_clipboard(ctx);
-                } else if resp.clicked() {
-                    self.pick_images(ctx, Target::Base, false);
-                }
+            if paste_hover && ui.ctx().input(|i| i.pointer.any_pressed()) {
+                let _ = self.paste_from_clipboard(ctx);
+            } else if resp.clicked() {
+                self.pick_images(ctx, Target::Base, false);
             }
         }
 
@@ -3944,13 +3607,25 @@ fn is_win_ctrl_v() -> bool {
         }
 
         let st = self.sh.state.lock().unwrap().clone();
-        let is_starting = matches!(st, EngState::Starting { .. } | EngState::Detecting);
-        if is_starting && !self.queue.is_empty() {
-            let attempt_str = match st {
+        let is_ready = matches!(st, EngState::Ready { .. });
+        if !is_ready && !self.queue.is_empty() {
+            let attempt_str = match &st {
+                EngState::DownloadingModels { file_index, total_files, file_progress, .. } => {
+                    format!("Downloading models ({}/{}, {:.0}%) — queued tasks will run once ready...", file_index, total_files, file_progress * 100.0)
+                }
+                EngState::DownloadingEngine { step, .. } => {
+                    format!("{step} — queued tasks will run once ready...")
+                }
+                EngState::ExtractingEngine { step } => {
+                    format!("{step} — queued tasks will run once ready...")
+                }
+                EngState::ModelDownloadPaused { .. } => {
+                    "Download paused — queued tasks waiting...".to_string()
+                }
                 EngState::Starting { since, attempt } => {
                     format!("Starting engine in background (attempt {}, {}s)...", attempt + 1, since.elapsed().as_secs())
                 }
-                _ => "Starting background engine...".to_string(),
+                _ => "Preparing engine in background...".to_string(),
             };
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -4014,7 +3689,8 @@ fn is_win_ctrl_v() -> bool {
                     }
 
                     let st = self.sh.state.lock().unwrap().clone();
-                    let is_starting = matches!(st, EngState::Starting { .. } | EngState::Detecting);
+                    let is_ready = matches!(st, EngState::Ready { .. });
+                    let should_queue = self.generating || !is_ready;
 
                     // Submit on Enter (without Shift)
                     let enter_submit = text_resp.has_focus()
@@ -4042,12 +3718,12 @@ fn is_win_ctrl_v() -> bool {
                         }
                         let p_text = self.prompt.trim().to_string();
                         if !p_text.is_empty() {
-                            if self.generating || is_starting {
+                            if should_queue {
                                 if self.can_queue().is_ok() {
                                     self.queue.push(QueuedItem { prompt: p_text });
                                     self.prompt.clear();
-                                    if is_starting {
-                                        self.status = "Queued (starting engine...)".into();
+                                    if !is_ready {
+                                        self.status = "Queued (will start automatically once engine is ready)".into();
                                     }
                                 }
                             } else if self.can_generate().is_ok() {
@@ -4061,9 +3737,10 @@ fn is_win_ctrl_v() -> bool {
                             let q_can = self.can_queue();
                             let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
                             (ok, "Queue", q_can.err())
-                        } else if is_starting {
-                            let ok = !self.prompt.trim().is_empty() && self.can_queue().is_ok();
-                            (ok, "Generate", Some("Engine is starting; your prompt will be queued and will generate immediately."))
+                        } else if !is_ready {
+                            let q_can = self.can_queue();
+                            let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
+                            (ok, "Queue", Some("Engine setup in progress; prompt will be queued and will generate automatically once ready."))
                         } else {
                             let g_can = self.can_generate();
                             let ok = g_can.is_ok() && !self.prompt.trim().is_empty();
@@ -4085,12 +3762,12 @@ fn is_win_ctrl_v() -> bool {
                         if resp.clicked() {
                             let p_text = self.prompt.trim().to_string();
                             if !p_text.is_empty() {
-                                if self.generating || is_starting {
+                                if should_queue {
                                     if self.can_queue().is_ok() {
                                         self.queue.push(QueuedItem { prompt: p_text });
                                         self.prompt.clear();
-                                        if is_starting {
-                                            self.status = "Queued (starting engine...)".into();
+                                        if !is_ready {
+                                            self.status = "Queued (will start automatically once engine is ready)".into();
                                         }
                                     }
                                 } else if self.can_generate().is_ok() {
@@ -4252,6 +3929,9 @@ fn is_win_ctrl_v() -> bool {
                             EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, .. } => {
                                 format!("Downloading Model [{}/{}] {} ({:.1}%) - {} / {} @ {:.1} MB/s", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total), speed_mb)
                             }
+                            EngState::ModelDownloadPaused { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, .. } => {
+                                format!("Model Download Paused [{}/{}] {} ({:.1}%) - {} / {}", file_index, total_files, current_file, file_progress * 100.0, engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))
+                            }
                             EngState::Starting { since, attempt } => format!("Starting (attempt {}, {}s)", attempt + 1, since.elapsed().as_secs()),
                             EngState::Ready { ours, gpu } => {
                                 format!("Ready on {gpu} ({})", if *ours { "launched by Image Studio" } else { "already running" })
@@ -4397,6 +4077,9 @@ fn is_win_ctrl_v() -> bool {
                             );
                         }
                         ui.horizontal(|ui| {
+                            if ui.button("Open Models Folder").clicked() {
+                                engine::open_models_folder(&self.sh);
+                            }
                             if ui.button("Retry Setup / Restart Engine").clicked() {
                                 self.sh.retry.store(true, Ordering::SeqCst);
                                 self.sh.restart.store(true, Ordering::SeqCst);
@@ -4516,114 +4199,6 @@ fn is_win_ctrl_v() -> bool {
             });
         self.show_video_dl_modal = open && !should_close;
     }
-
-    fn downloads_dropdown_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_downloads_menu;
-        let mut should_close = false;
-        let screen_rect = ctx.content_rect();
-        // Position at top-right near the status pill (e.g., right margin 24px, top 48px)
-        let default_pos = egui::pos2((screen_rect.max.x - 390.0).max(10.0), 48.0);
-
-        egui::Window::new("Active Downloads")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .fixed_size(vec2(380.0, 320.0))
-            .default_pos(default_pos)
-            .show(ctx, |ui| {
-                ui.add_space(2.0);
-                let state = self.sh.state.lock().unwrap().clone();
-                match state {
-                    EngState::DownloadingModels { ref current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Downloading Model Files").strong().color(TEXT).size(14.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).strong().color(ACCENT));
-                            });
-                        });
-                        ui.add_space(4.0);
-
-                        // Overall progress bar
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("Overall: {:.0}% ({}/{})", overall_progress * 100.0, file_index, total_files)).size(11.0).color(DIM));
-                        });
-                        let bar = egui::ProgressBar::new(overall_progress).show_percentage().fill(ACCENT);
-                        ui.add_sized([ui.available_width(), 12.0], bar);
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        // Current active file card
-                        card(ui, |ui| {
-                            ui.label(RichText::new(format!("Current: {current_file}")).strong().color(TEXT).size(12.0));
-                            ui.add_space(2.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{} / {}", engine::format_bytes(bytes_done), engine::format_bytes(bytes_total))).size(11.0).color(DIM));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(format!("{:.1}%", file_progress * 100.0)).size(11.0).color(AMBER));
-                                });
-                            });
-                            let file_bar = egui::ProgressBar::new(file_progress).fill(AMBER);
-                            ui.add_sized([ui.available_width(), 10.0], file_bar);
-                        });
-
-                        ui.add_space(6.0);
-                        heading(ui, "MODEL QUEUE");
-                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                            let missing = engine::Profile::missing_models(&self.sh);
-                            if missing.is_empty() {
-                                ui.label(RichText::new("All remaining models ready.").size(11.0).color(GREEN));
-                            } else {
-                                for (i, m) in missing.iter().enumerate() {
-                                    let is_active = m.filename == *current_file;
-                                    let (col, badge) = if is_active {
-                                        (AMBER, "DOWNLOADING")
-                                    } else if i < file_index {
-                                        (GREEN, "COMPLETED")
-                                    } else {
-                                        (DIM, "QUEUED")
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&m.filename).size(11.0).color(if is_active { TEXT } else { DIM }));
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(RichText::new(badge).size(10.0).color(col).strong());
-                                            ui.label(RichText::new(engine::format_bytes(m.size_bytes)).size(10.0).color(DIM));
-                                        });
-                                    });
-                                }
-                            }
-                        });
-                    }
-                    EngState::DownloadingEngine { ref step, progress, bytes_done, bytes_total, speed_mb } => {
-                        ui.label(RichText::new("Downloading Engine Component").strong().color(TEXT).size(14.0));
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(step).size(11.5).color(DIM));
-                        ui.add_space(4.0);
-                        let bar = egui::ProgressBar::new(progress).show_percentage().fill(ACCENT);
-                        ui.add_sized([ui.available_width(), 14.0], bar);
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{} / {}", engine::format_bytes(bytes_done), engine::format_bytes(bytes_total))).size(11.0).color(DIM));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).strong().color(ACCENT));
-                            });
-                        });
-                    }
-                    _ => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(20.0);
-                            ui.label(RichText::new("No active background downloads.").size(13.0).color(DIM));
-                            ui.add_space(8.0);
-                            if ui.button("Open Settings").clicked() {
-                                self.show_setup = true;
-                                should_close = true;
-                            }
-                        });
-                    }
-                }
-            });
-        self.show_downloads_menu = open && !should_close;
-    }
 }
 
 impl eframe::App for App {
@@ -4640,6 +4215,7 @@ impl eframe::App for App {
                 | EngState::DownloadingEngine { .. }
                 | EngState::ExtractingEngine { .. }
                 | EngState::DownloadingModels { .. }
+                | EngState::ModelDownloadPaused { .. }
                 | EngState::RepairingEngine { .. }
         );
         if starting || self.generating || self.loading > 0 {
@@ -4701,9 +4277,7 @@ impl eframe::App for App {
         if self.show_video_dl_modal {
             self.video_dl_window(&ctx);
         }
-        if self.show_downloads_menu {
-            self.downloads_dropdown_window(&ctx);
-        }
+        self.download_pane.show(&ctx, &self.sh);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));

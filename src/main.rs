@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod comfy;
+pub mod download_ui;
 mod engine;
 mod updater;
 pub mod video;

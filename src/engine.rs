@@ -313,6 +313,15 @@ pub enum EngState {
         speed_mb: f32,
         overall_progress: f32,
     },
+    ModelDownloadPaused {
+        current_file: String,
+        file_index: usize,
+        total_files: usize,
+        file_progress: f32,
+        bytes_done: u64,
+        bytes_total: u64,
+        overall_progress: f32,
+    },
     ModelDownloadFailed {
         current_file: String,
         error: String,
@@ -348,6 +357,9 @@ pub struct Shared {
     pub cancel: AtomicBool,
     pub cancel_model_dl: AtomicBool,
     pub download_confirmed: AtomicBool,
+    pub download_paused: AtomicBool,
+    pub metered_allowed: AtomicBool,
+    pub metered_switch_detected: AtomicBool,
     pub dl_image_model: AtomicBool,
     pub dl_video_model: AtomicBool,
     pub cfg: Mutex<Config>,
@@ -371,6 +383,9 @@ impl Shared {
             cancel: AtomicBool::new(false),
             cancel_model_dl: AtomicBool::new(false),
             download_confirmed: AtomicBool::new(false),
+            download_paused: AtomicBool::new(false),
+            metered_allowed: AtomicBool::new(false),
+            metered_switch_detected: AtomicBool::new(false),
             dl_image_model: AtomicBool::new(dl_img),
             dl_video_model: AtomicBool::new(dl_vid),
             cfg: Mutex::new(cfg),
@@ -499,6 +514,7 @@ pub fn reset_to_clean_engine(sh: &Shared) {
     log("reset to clean managed engine requested");
 }
 
+#[allow(dead_code)]
 pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let paths = sh.paths.lock().unwrap().clone();
@@ -878,6 +894,7 @@ fn download_curl_resume<F>(
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
     speed_watchdog: bool,
+    sh: Option<&Shared>,
 ) -> Result<(), String>
 where
     F: FnMut(u64, u64, f32),
@@ -896,7 +913,15 @@ where
     let start_time = Instant::now();
     let mut last_len = existing_len;
     let mut last_tick = Instant::now();
+    let mut last_metered_check = Instant::now();
     let mut speed_mb = 0.0f32;
+
+    if let Some(s) = sh {
+        if s.download_paused.load(Ordering::SeqCst) {
+            kill_tree(&mut child);
+            return Err("download paused".into());
+        }
+    }
 
     on_progress(existing_len, total_bytes, 0.0);
     ctx.request_repaint();
@@ -908,6 +933,25 @@ where
         if cancel.load(Ordering::SeqCst) {
             kill_tree(&mut child);
             return Err("download cancelled".into());
+        }
+        if let Some(s) = sh {
+            if s.download_paused.load(Ordering::SeqCst) {
+                kill_tree(&mut child);
+                return Err("download paused".into());
+            }
+            if last_metered_check.elapsed() >= Duration::from_millis(1500) {
+                last_metered_check = Instant::now();
+                if is_metered_connection() && !s.metered_allowed.load(Ordering::SeqCst) {
+                    log("metered network switch detected during curl stream");
+                    s.metered_switch_detected.store(true, Ordering::SeqCst);
+                    s.download_paused.store(true, Ordering::SeqCst);
+                    flash_taskbar();
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(eframe::egui::UserAttentionType::Critical));
+                    ctx.request_repaint();
+                    kill_tree(&mut child);
+                    return Err("download paused (metered network)".into());
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(250));
         let len = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(last_len);
@@ -962,6 +1006,7 @@ fn download_stream<F>(
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
     speed_watchdog: bool,
+    sh: Option<&Shared>,
 ) -> Result<(), String>
 where
     F: FnMut(u64, u64, f32),
@@ -1068,8 +1113,15 @@ where
     let mut downloaded = existing_len;
     let start_time = Instant::now();
     let mut last_tick = Instant::now();
+    let mut last_metered_check = Instant::now();
     let mut bytes_since_tick = 0u64;
     let mut speed_mb = 0.0f32;
+
+    if let Some(s) = sh {
+        if s.download_paused.load(Ordering::SeqCst) {
+            return Err("download paused".into());
+        }
+    }
 
     on_progress(downloaded, total_bytes, speed_mb);
     ctx.request_repaint();
@@ -1084,6 +1136,25 @@ where
         if cancel.load(Ordering::SeqCst) {
             download_err = Some("download cancelled".into());
             break;
+        }
+        if let Some(s) = sh {
+            if s.download_paused.load(Ordering::SeqCst) {
+                download_err = Some("download paused".into());
+                break;
+            }
+            if last_metered_check.elapsed() >= Duration::from_millis(1500) {
+                last_metered_check = Instant::now();
+                if is_metered_connection() && !s.metered_allowed.load(Ordering::SeqCst) {
+                    log("metered network switch detected during download stream");
+                    s.metered_switch_detected.store(true, Ordering::SeqCst);
+                    s.download_paused.store(true, Ordering::SeqCst);
+                    flash_taskbar();
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(eframe::egui::UserAttentionType::Critical));
+                    ctx.request_repaint();
+                    download_err = Some("download paused (metered network)".into());
+                    break;
+                }
+            }
         }
         let n = match resp.read(&mut buf) {
             Ok(0) => break,
@@ -1200,6 +1271,7 @@ where
             cancel,
             ctx,
             speed_watchdog,
+            sh,
         );
     }
 
@@ -1228,11 +1300,12 @@ fn download_file<F>(
     on_progress: F,
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
+    sh: Option<&Shared>,
 ) -> Result<(), String>
 where
     F: FnMut(u64, u64, f32),
 {
-    download_stream(client, url, dest, expected_size, on_progress, cancel, ctx, false)
+    download_stream(client, url, dest, expected_size, on_progress, cancel, ctx, false, sh)
 }
 
 fn bootstrap_engine(
@@ -1271,6 +1344,7 @@ fn bootstrap_engine(
             },
             &sh.cancel,
             ctx,
+            Some(sh),
         );
         if let Err(e) = res {
             return Err(format!("Engine download failed: {e}"));
@@ -1384,6 +1458,32 @@ fn bootstrap_models(
             let total_files = missing.len();
             let file_expected = m.size_bytes;
 
+            if sh.download_paused.load(Ordering::SeqCst) {
+                log(&format!("bootstrap: model download paused for {}", m.filename));
+                let part_path = dest.with_extension(format!(
+                    "{}.part",
+                    dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+                ));
+                let part_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                let f_prog = if file_expected > 0 { (part_len as f32 / file_expected as f32).clamp(0.0, 1.0) } else { 0.0 };
+                let overall = if total_all_bytes > 0 {
+                    ((completed_bytes + part_len) as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    f_prog
+                };
+                *sh.state.lock().unwrap() = EngState::ModelDownloadPaused {
+                    current_file: cur_file.clone(),
+                    file_index: cur_idx,
+                    total_files,
+                    file_progress: f_prog,
+                    bytes_done: part_len,
+                    bytes_total: file_expected,
+                    overall_progress: overall,
+                };
+                ctx.request_repaint();
+                return Ok(());
+            }
+
             let file_cancel = AtomicBool::new(false);
             let cancel_ref = &file_cancel;
 
@@ -1411,7 +1511,7 @@ fn bootstrap_models(
             let total_candidates = candidates.len();
             let mut download_result = Err("No download candidates".to_string());
             for (c_idx, (url, source_name)) in candidates.into_iter().enumerate() {
-                if cancel_ref.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) || sh.cancel_model_dl.load(Ordering::SeqCst) {
+                if sh.download_paused.load(Ordering::SeqCst) || cancel_ref.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) || sh.cancel_model_dl.load(Ordering::SeqCst) {
                     break;
                 }
                 let is_last_candidate = c_idx + 1 >= total_candidates;
@@ -1424,6 +1524,9 @@ fn bootstrap_models(
                     &dest,
                     file_expected,
                     |done, total, speed| {
+                        if sh.download_paused.load(Ordering::SeqCst) {
+                            return;
+                        }
                         if sh.cancel.load(Ordering::SeqCst) || sh.cancel_model_dl.load(Ordering::SeqCst) {
                             cancel_ref.store(true, Ordering::SeqCst);
                         }
@@ -1447,9 +1550,12 @@ fn bootstrap_models(
                     cancel_ref,
                     ctx,
                     enable_watchdog,
+                    Some(sh),
                 );
-                if download_result.is_ok() {
-                    log(&format!("bootstrap: successfully downloaded {} via {}", m.filename, source_name));
+                if download_result.is_ok() || sh.download_paused.load(Ordering::SeqCst) {
+                    if download_result.is_ok() {
+                        log(&format!("bootstrap: successfully downloaded {} via {}", m.filename, source_name));
+                    }
                     break;
                 } else {
                     log(&format!("bootstrap: download from {} failed or throttled: {:?}", source_name, download_result.as_ref().err()));
@@ -1460,6 +1566,32 @@ fn bootstrap_models(
                 log(&format!("bootstrap: model download interrupted by checkbox change for {}", m.filename));
                 any_interrupted = true;
                 break;
+            }
+
+            if sh.download_paused.load(Ordering::SeqCst) {
+                log(&format!("bootstrap: model download paused for {}", m.filename));
+                let part_path = dest.with_extension(format!(
+                    "{}.part",
+                    dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+                ));
+                let part_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                let f_prog = if file_expected > 0 { (part_len as f32 / file_expected as f32).clamp(0.0, 1.0) } else { 0.0 };
+                let overall = if total_all_bytes > 0 {
+                    ((completed_bytes + part_len) as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    f_prog
+                };
+                *sh.state.lock().unwrap() = EngState::ModelDownloadPaused {
+                    current_file: cur_file.clone(),
+                    file_index: cur_idx,
+                    total_files,
+                    file_progress: f_prog,
+                    bytes_done: part_len,
+                    bytes_total: file_expected,
+                    overall_progress: overall,
+                };
+                ctx.request_repaint();
+                return Ok(());
             }
 
             if let Err(e) = download_result {
@@ -1479,6 +1611,10 @@ fn bootstrap_models(
             }
 
             completed_bytes += file_expected;
+        }
+
+        if sh.download_paused.load(Ordering::SeqCst) {
+            return Ok(());
         }
 
         if !any_interrupted {
@@ -1559,9 +1695,15 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 continue;
             }
 
+            if sh.download_paused.load(Ordering::SeqCst) {
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
             // 2. ComfyUI missing? Bootstrap automatically (requires confirmation if on metered connection)
             if comfy.is_none() {
-                if is_metered_connection() && !sh.download_confirmed.load(Ordering::SeqCst) {
+                if is_metered_connection() && !sh.metered_allowed.load(Ordering::SeqCst) && !sh.download_confirmed.load(Ordering::SeqCst) {
                     *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
                     ctx.request_repaint();
                     std::thread::sleep(Duration::from_millis(200));
@@ -1576,6 +1718,11 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                         *sh.cfg.lock().unwrap() = cfg.clone();
                     }
                     Err(e) => {
+                        if sh.download_paused.load(Ordering::SeqCst) {
+                            ctx.request_repaint();
+                            std::thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
                         failed = true;
                         *sh.state.lock().unwrap() = EngState::Failed(e);
                         ctx.request_repaint();
@@ -1594,7 +1741,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
 
             // 3. Are all profile models present? (requires confirmation if on metered connection)
             let missing_models = Profile::missing_models(&sh);
-            if !missing_models.is_empty() && is_metered_connection() && !sh.download_confirmed.load(Ordering::SeqCst) {
+            if !missing_models.is_empty() && is_metered_connection() && !sh.metered_allowed.load(Ordering::SeqCst) && !sh.download_confirmed.load(Ordering::SeqCst) {
                 *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
                 ctx.request_repaint();
                 std::thread::sleep(Duration::from_millis(200));
@@ -1619,6 +1766,19 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                     std::thread::sleep(Duration::from_millis(600));
                     continue;
                 }
+            }
+
+            if sh.download_paused.load(Ordering::SeqCst) {
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
+            let still_missing = Profile::missing_models(&sh);
+            if !still_missing.is_empty() {
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
 
             // 4. Launch ComfyUI process
@@ -1735,31 +1895,47 @@ pub fn adopt_into_kill_job() {
 /// Checks if the primary network connection is metered to prevent unconfirmed large downloads.
 #[cfg(windows)]
 pub fn is_metered_connection() -> bool {
-    use windows_sys::Win32::NetworkManagement::WindowsConnectionManager::*;
+    use windows_sys::Win32::System::Com::*;
+    use windows_sys::core::GUID;
+
+    const CLSID_NETWORK_LIST_MANAGER: GUID = GUID {
+        data1: 0xDCB00C01,
+        data2: 0x570F,
+        data3: 0x4A9B,
+        data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+    };
+    const IID_INETWORK_COST_MANAGER: GUID = GUID {
+        data1: 0xDCB00008,
+        data2: 0x570F,
+        data3: 0x4A9B,
+        data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+    };
+
     unsafe {
-        let mut data_size: u32 = 0;
-        let mut data_ptr: *mut u8 = std::ptr::null_mut();
-        let res = WcmQueryProperty(
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &mut data_size,
-            &mut data_ptr,
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
+        let mut obj: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_NETWORK_LIST_MANAGER,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_INETWORK_COST_MANAGER,
+            &mut obj,
         );
-        if res == 0 && !data_ptr.is_null() {
-            if data_size as usize >= std::mem::size_of::<WCM_CONNECTION_COST_DATA>() {
-                let cost_data = *(data_ptr as *const WCM_CONNECTION_COST_DATA);
-                let _ = WcmFreeMemory(data_ptr as _);
-                let cost = cost_data.ConnectionCost;
-                return (cost as i32 & (WCM_CONNECTION_COST_FIXED
-                    | WCM_CONNECTION_COST_VARIABLE
-                    | WCM_CONNECTION_COST_OVERDATALIMIT
-                    | WCM_CONNECTION_COST_CONGESTED
-                    | WCM_CONNECTION_COST_ROAMING
-                    | WCM_CONNECTION_COST_APPROACHINGDATALIMIT)) != 0;
+        if hr == 0 && !obj.is_null() {
+            type GetCostFn = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32, *const std::ffi::c_void) -> i32;
+            type ReleaseFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+
+            let vtbl = *(obj as *const *const usize);
+            let get_cost: GetCostFn = std::mem::transmute(*vtbl.add(3));
+            let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+
+            let mut cost: u32 = 0;
+            let hr_cost = get_cost(obj, &mut cost, std::ptr::null());
+            release(obj);
+            if hr_cost == 0 {
+                const METERED_MASK: u32 = 0x2 | 0x4 | 0x10000 | 0x20000 | 0x40000 | 0x80000;
+                return (cost & METERED_MASK) != 0;
             }
-            let _ = WcmFreeMemory(data_ptr as _);
         }
     }
     false
@@ -1769,6 +1945,28 @@ pub fn is_metered_connection() -> bool {
 pub fn is_metered_connection() -> bool {
     false
 }
+
+/// Flashes the application taskbar button to draw immediate user attention.
+#[cfg(windows)]
+pub fn flash_taskbar() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if !hwnd.is_null() {
+            let mut fwi = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 6,
+                dwTimeout: 0,
+            };
+            FlashWindowEx(&mut fwi);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn flash_taskbar() {}
 
 #[cfg(test)]
 mod tests {
@@ -1797,7 +1995,7 @@ mod tests {
         let client = reqwest::blocking::Client::builder().no_proxy()
             .timeout(Duration::from_secs(5)).build().unwrap();
         download_file(&client, url, dest, expected, |_, _, _| {},
-            &AtomicBool::new(false), &eframe::egui::Context::default())
+            &AtomicBool::new(false), &eframe::egui::Context::default(), None)
     }
 
     #[test]
