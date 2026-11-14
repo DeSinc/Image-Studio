@@ -71,6 +71,7 @@ impl DownloadPaneState {
 
     pub fn is_active(&self, sh: &Shared) -> bool {
         let st = sh.state.lock().unwrap();
+        let has_model_dl = sh.model_dl_progress.lock().unwrap().is_some();
         let in_dl_state = matches!(
             *st,
             EngState::AwaitingDownloadConfirmation { .. }
@@ -80,7 +81,7 @@ impl DownloadPaneState {
                 | EngState::ModelDownloadPaused { .. }
                 | EngState::ModelDownloadFailed { .. }
                 | EngState::RepairingEngine { .. }
-        ) || sh.download_paused.load(Ordering::SeqCst);
+        ) || sh.download_paused.load(Ordering::SeqCst) || has_model_dl;
 
         in_dl_state || (self.user_opened && self.is_expanded)
     }
@@ -142,6 +143,7 @@ impl DownloadPaneState {
         p.rect_stroke(rect, 8, border_stroke, StrokeKind::Inside);
 
         let paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
+        let dl_prog = sh.model_dl_progress.lock().unwrap().clone();
 
         // Data extraction
         let (file_title, size_speed, progress) = match st {
@@ -166,7 +168,16 @@ impl DownloadPaneState {
                 (step.clone(), size_str, *progress)
             }
             EngState::ExtractingEngine { step } => {
-                (step.clone(), "Extracting runtime".to_string(), 0.5)
+                if let Some(ref mp) = dl_prog {
+                    let size_str = if paused {
+                        format!("{} / {} (Paused)", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total))
+                    } else {
+                        format!("{} / {} • {:.1} MB/s", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total), mp.speed_mb)
+                    };
+                    (format!("Extracting • {}", mp.current_file), size_str, mp.file_progress)
+                } else {
+                    (step.clone(), "Extracting runtime".to_string(), 0.5)
+                }
             }
             EngState::AwaitingDownloadConfirmation { metered } => {
                 let label = if *metered { "Metered Connection" } else { "Download Confirmation" };
@@ -176,10 +187,30 @@ impl DownloadPaneState {
                 (current_file.clone(), "Download Interrupted".to_string(), 0.0)
             }
             EngState::RepairingEngine { step } => {
-                (step.clone(), "Repairing".to_string(), 0.5)
+                if let Some(ref mp) = dl_prog {
+                    let size_str = if paused {
+                        format!("{} / {} (Paused)", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total))
+                    } else {
+                        format!("{} / {} • {:.1} MB/s", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total), mp.speed_mb)
+                    };
+                    (format!("Repairing • {}", mp.current_file), size_str, mp.file_progress)
+                } else {
+                    (step.clone(), "Repairing".to_string(), 0.5)
+                }
             }
-            EngState::Ready { .. } => {
-                ("All models ready".to_string(), "Ready".to_string(), 1.0)
+            EngState::Ready { .. } | EngState::Starting { .. } | EngState::Detecting => {
+                if let Some(ref mp) = dl_prog {
+                    let size_str = if paused {
+                        format!("{} / {} (Paused)", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total))
+                    } else {
+                        format!("{} / {} • {:.1} MB/s", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total), mp.speed_mb)
+                    };
+                    (mp.current_file.clone(), size_str, mp.file_progress)
+                } else if matches!(st, EngState::Ready { .. }) {
+                    ("All models ready".to_string(), "Ready".to_string(), 1.0)
+                } else {
+                    ("Engine Setup".to_string(), "Waiting".to_string(), 0.0)
+                }
             }
             _ => ("Engine Setup".to_string(), "Waiting".to_string(), 0.0),
         };
@@ -272,10 +303,15 @@ impl DownloadPaneState {
 
                     // Speed badge
                     let is_paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
+                    let dl_prog_hdr = sh.model_dl_progress.lock().unwrap().clone();
                     if !is_paused {
                         if let EngState::DownloadingModels { speed_mb, .. } | EngState::DownloadingEngine { speed_mb, .. } = st {
                             if *speed_mb > 0.05 {
                                 ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(12.0).color(ACCENT).strong());
+                            }
+                        } else if let Some(ref mp) = dl_prog_hdr {
+                            if mp.speed_mb > 0.05 {
+                                ui.label(RichText::new(format!("{:.1} MB/s", mp.speed_mb)).size(12.0).color(ACCENT).strong());
                             }
                         }
                     }
@@ -288,34 +324,10 @@ impl DownloadPaneState {
 
             // 2. Active Download Status
             let is_paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
+            let dl_prog = sh.model_dl_progress.lock().unwrap().clone();
             match st {
                 EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, speed_mb, overall_progress } if !is_paused => {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Downloading ({}/{})", file_index, total_files)).size(12.0).color(ACCENT).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1}%", file_progress * 100.0)).size(12.0).color(AMBER).strong());
-                        });
-                    });
-                    ui.label(RichText::new(current_file).size(12.5).color(TEXT).strong());
-                    ui.add_space(4.0);
-
-                    let bar = egui::ProgressBar::new(*file_progress).fill(ACCENT);
-                    ui.add_sized([ui.available_width(), 10.0], bar);
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{} / {}", engine::format_bytes(*bytes_done), engine::format_bytes(*bytes_total))).size(11.0).color(DIM));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.0).color(DIM));
-                        });
-                    });
-
-                    if *total_files > 1 {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(format!("Overall Progress: {:.0}%", overall_progress * 100.0)).size(11.0).color(DIM));
-                        let ov_bar = egui::ProgressBar::new(*overall_progress).fill(ACCENT.linear_multiply(0.6));
-                        ui.add_sized([ui.available_width(), 8.0], ov_bar);
-                    }
+                    Self::render_model_progress_block(ui, current_file, *file_index, *total_files, *file_progress, *bytes_done, *bytes_total, *speed_mb, *overall_progress);
                 }
                 EngState::DownloadingModels { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, overall_progress, .. }
                 | EngState::ModelDownloadPaused { current_file, file_index, total_files, file_progress, bytes_done, bytes_total, overall_progress } => {
@@ -359,6 +371,12 @@ impl DownloadPaneState {
                     ui.add_space(4.0);
                     let bar = egui::ProgressBar::new(0.5).fill(ACCENT).animate(true);
                     ui.add_sized([ui.available_width(), 10.0], bar);
+                    if let Some(ref mp) = dl_prog {
+                        if !is_paused {
+                            ui.add_space(10.0);
+                            Self::render_model_progress_block(ui, &mp.current_file, mp.file_index, mp.total_files, mp.file_progress, mp.bytes_done, mp.bytes_total, mp.speed_mb, mp.overall_progress);
+                        }
+                    }
                 }
                 EngState::AwaitingDownloadConfirmation { metered } => {
                     let title = if *metered { "Metered Connection Detected" } else { "Download Confirmation Required" };
@@ -379,13 +397,30 @@ impl DownloadPaneState {
                 EngState::RepairingEngine { step } => {
                     ui.label(RichText::new("Repairing Environment").size(12.0).color(AMBER).strong());
                     ui.label(RichText::new(step).size(11.5).color(DIM));
+                    if let Some(ref mp) = dl_prog {
+                        if !is_paused {
+                            ui.add_space(10.0);
+                            Self::render_model_progress_block(ui, &mp.current_file, mp.file_index, mp.total_files, mp.file_progress, mp.bytes_done, mp.bytes_total, mp.speed_mb, mp.overall_progress);
+                        }
+                    }
                 }
                 EngState::Failed(msg) => {
                     ui.label(RichText::new("Engine Startup Failed").size(12.5).color(RED).strong());
                     ui.label(RichText::new(msg).size(11.0).color(DIM));
                 }
                 _ => {
-                    ui.label(RichText::new("All models ready.").size(12.0).color(GREEN));
+                    if let Some(ref mp) = dl_prog {
+                        if !is_paused {
+                            Self::render_model_progress_block(ui, &mp.current_file, mp.file_index, mp.total_files, mp.file_progress, mp.bytes_done, mp.bytes_total, mp.speed_mb, mp.overall_progress);
+                        } else {
+                            ui.label(RichText::new("DOWNLOAD PAUSED").size(11.0).color(AMBER).strong());
+                            ui.label(RichText::new(&mp.current_file).size(12.5).color(TEXT).strong());
+                        }
+                    } else if !sh.dl_image_model.load(Ordering::SeqCst) && !sh.dl_video_model.load(Ordering::SeqCst) {
+                        ui.label(RichText::new("No model downloads selected.").size(12.0).color(DIM));
+                    } else {
+                        ui.label(RichText::new("All models ready.").size(12.0).color(GREEN));
+                    }
                 }
             }
 
@@ -403,7 +438,9 @@ impl DownloadPaneState {
 
             // 5. Action Controls (Pause / Resume / Retry / Begin Download)
             let is_paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
-            let is_downloading = matches!(st, EngState::DownloadingModels { .. } | EngState::DownloadingEngine { .. });
+            let is_downloading = matches!(st, EngState::DownloadingModels { .. } | EngState::DownloadingEngine { .. })
+                || dl_prog.is_some()
+                || sh.model_dl_running.load(Ordering::SeqCst);
             let is_dl_failed = matches!(st, EngState::ModelDownloadFailed { .. });
             let is_eng_failed = matches!(st, EngState::Failed(_));
             let is_awaiting = matches!(st, EngState::AwaitingDownloadConfirmation { .. });
@@ -423,7 +460,10 @@ impl DownloadPaneState {
                         .min_size(vec2(130.0, 28.0));
                     if ui.add(resume_btn).clicked() {
                         sh.download_paused.store(false, Ordering::SeqCst);
-                        sh.retry.store(true, Ordering::SeqCst);
+                        crate::engine::spawn_model_downloads_if_needed(sh, ui.ctx());
+                        if matches!(st, EngState::DownloadingEngine { .. } | EngState::AwaitingDownloadConfirmation { .. } | EngState::ModelDownloadPaused { .. }) {
+                            sh.retry.store(true, Ordering::SeqCst);
+                        }
                     }
                 } else if is_downloading {
                     let pause_btn = egui::Button::new(RichText::new("Pause Download").size(12.0).strong().color(TEXT))
@@ -439,6 +479,7 @@ impl DownloadPaneState {
                         .min_size(vec2(130.0, 28.0));
                     if ui.add(retry_btn).clicked() {
                         sh.retry.store(true, Ordering::SeqCst);
+                        crate::engine::spawn_model_downloads_if_needed(sh, ui.ctx());
                     }
                 } else if is_eng_failed {
                     let repair_btn = egui::Button::new(RichText::new("Repair Dependencies & Retry").size(12.0).strong().color(Color32::WHITE))
@@ -461,11 +502,14 @@ impl DownloadPaneState {
                 ui.add_space(4.0);
 
                 egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
-                    let cur_active = match st {
-                        EngState::DownloadingModels { current_file, .. } => current_file.clone(),
-                        EngState::ModelDownloadPaused { current_file, .. } => current_file.clone(),
-                        _ => String::new(),
-                    };
+                    let cur_active = dl_prog
+                        .as_ref()
+                        .map(|p| p.current_file.clone())
+                        .unwrap_or_else(|| match st {
+                            EngState::DownloadingModels { current_file, .. } => current_file.clone(),
+                            EngState::ModelDownloadPaused { current_file, .. } => current_file.clone(),
+                            _ => String::new(),
+                        });
 
                     for m in &missing {
                         let is_active = m.filename == cur_active;
@@ -525,6 +569,45 @@ impl DownloadPaneState {
         });
     }
 
+    fn render_model_progress_block(
+        ui: &mut egui::Ui,
+        current_file: &str,
+        file_index: usize,
+        total_files: usize,
+        file_progress: f32,
+        bytes_done: u64,
+        bytes_total: u64,
+        speed_mb: f32,
+        overall_progress: f32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Downloading ({}/{})", file_index, total_files)).size(12.0).color(ACCENT).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("{:.1}%", file_progress * 100.0)).size(12.0).color(AMBER).strong());
+            });
+        });
+        ui.label(RichText::new(current_file).size(12.5).color(TEXT).strong());
+        ui.add_space(4.0);
+
+        let bar = egui::ProgressBar::new(file_progress).fill(ACCENT);
+        ui.add_sized([ui.available_width(), 10.0], bar);
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} / {}", engine::format_bytes(bytes_done), engine::format_bytes(bytes_total))).size(11.0).color(DIM));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("{:.1} MB/s", speed_mb)).size(11.0).color(DIM));
+            });
+        });
+
+        if total_files > 1 {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("Overall Progress: {:.0}%", overall_progress * 100.0)).size(11.0).color(DIM));
+            let ov_bar = egui::ProgressBar::new(overall_progress).fill(ACCENT.linear_multiply(0.6));
+            ui.add_sized([ui.available_width(), 8.0], ov_bar);
+        }
+    }
+
     fn render_model_checkboxes(&mut self, ui: &mut egui::Ui, sh: &Arc<Shared>) {
         let mut dl_img = sh.dl_image_model.load(Ordering::SeqCst);
         let mut dl_vid = sh.dl_video_model.load(Ordering::SeqCst);
@@ -532,30 +615,14 @@ impl DownloadPaneState {
         ui.horizontal(|ui| {
             let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(11.5));
             if resp_img.changed() {
-                sh.dl_image_model.store(dl_img, Ordering::SeqCst);
-                let mut cfg = sh.cfg.lock().unwrap();
-                cfg.dl_image_model = dl_img;
-                cfg.save();
-                if !dl_img {
-                    sh.cancel_model_dl.store(true, Ordering::SeqCst);
-                } else {
-                    sh.retry.store(true, Ordering::SeqCst);
-                }
+                engine::toggle_model_download(sh, ui.ctx(), true, dl_img);
             }
 
             ui.add_space(12.0);
 
             let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(11.5));
             if resp_vid.changed() {
-                sh.dl_video_model.store(dl_vid, Ordering::SeqCst);
-                let mut cfg = sh.cfg.lock().unwrap();
-                cfg.dl_video_model = dl_vid;
-                cfg.save();
-                if !dl_vid {
-                    sh.cancel_model_dl.store(true, Ordering::SeqCst);
-                } else {
-                    sh.retry.store(true, Ordering::SeqCst);
-                }
+                engine::toggle_model_download(sh, ui.ctx(), false, dl_vid);
             }
         });
     }
@@ -760,5 +827,27 @@ mod tests {
         state.toggle(&sh_downloading);
         assert!(state.is_active(&sh_downloading));
         assert!(state.is_expanded);
+    }
+
+    #[test]
+    fn test_download_pane_active_with_concurrent_model_dl_progress() {
+        let state = DownloadPaneState::default();
+        let sh_ready = make_test_shared(EngState::Ready {
+            ours: true,
+            gpu: "NVIDIA RTX 4070".into(),
+        });
+        assert!(!state.is_active(&sh_ready));
+
+        *sh_ready.model_dl_progress.lock().unwrap() = Some(crate::engine::ModelDownloadProgress {
+            current_file: "ltx-2.3.safetensors".into(),
+            file_index: 1,
+            total_files: 3,
+            file_progress: 0.25,
+            bytes_done: 250,
+            bytes_total: 1000,
+            speed_mb: 50.0,
+            overall_progress: 0.1,
+        });
+        assert!(state.is_active(&sh_ready));
     }
 }

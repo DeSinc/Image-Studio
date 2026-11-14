@@ -3,6 +3,9 @@ mod app;
 mod comfy;
 pub mod download_ui;
 mod engine;
+pub mod history;
+pub mod presets;
+pub mod render;
 mod updater;
 pub mod video;
 

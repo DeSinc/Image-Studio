@@ -243,6 +243,7 @@ fn explain(v: &Value) -> String {
 struct WsTracker {
     last_activity: Mutex<Option<Instant>>,
     executing_node: Mutex<Option<String>>,
+    node_has_progress: AtomicBool,
     execution_error: Mutex<Option<String>>,
     execution_interrupted: AtomicBool,
 }
@@ -333,14 +334,22 @@ fn spawn_ws_progress(
                             match val["type"].as_str() {
                                 Some("progress") => {
                                     *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                    tracker.node_has_progress.store(true, Ordering::SeqCst);
                                     if let (Some(cur), Some(max)) = (val["data"]["value"].as_u64(), val["data"]["max"].as_u64()) {
                                         on_progress(cur as u32, max as u32);
                                     }
                                 }
+                                Some("progress_state") => {
+                                    *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                                }
                                 Some("executing") => {
                                     *tracker.last_activity.lock().unwrap() = Some(Instant::now());
                                     let node = val["data"]["node"].as_str().map(|s| s.to_string());
-                                    *tracker.executing_node.lock().unwrap() = node;
+                                    let mut exec = tracker.executing_node.lock().unwrap();
+                                    if *exec != node {
+                                        tracker.node_has_progress.store(false, Ordering::SeqCst);
+                                        *exec = node;
+                                    }
                                 }
                                 Some("execution_error") => {
                                     *tracker.last_activity.lock().unwrap() = Some(Instant::now());
@@ -363,6 +372,7 @@ fn spawn_ws_progress(
                     }
                 } else if opcode == 0x2 && payload.len() > 8 {
                     *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                    tracker.node_has_progress.store(true, Ordering::SeqCst);
                     let event = u32::from_be_bytes(payload[0..4].try_into().unwrap_or_default());
                     let img_bytes = if event == 1 {
                         Some(&payload[8..])
@@ -599,41 +609,16 @@ pub fn run_video(
 
         // Stall Watchdog: detect genuine hangs per stage and automatically abort & clear queue
         let active_node = tracker.executing_node.lock().unwrap().clone();
+        let node_has_progress = tracker.node_has_progress.load(Ordering::SeqCst);
         let last_act = tracker.last_activity.lock().unwrap().unwrap_or(t0);
         let inactive_secs = last_act.elapsed().as_secs();
-        let max_inactive = match active_node.as_deref() {
-            Some("325") => 180, // Gemma 3 prompt expansion (takes ~90-120s)
-            Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => 90, // Model weight staging
-            Some("303") | Some("313") => 60, // Prompt conditioning encoding
-            Some("304") | Some("314") | Some("284") | Some("282") => 45, // Conditioning and guiders setup
-            Some("295") | Some("305") | Some("318") | Some("278") | Some("277") | Some("276") | Some("291") | Some("280") | Some("306") | Some("281") => 45, // Latent initialization
-            Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => 60, // Reference frame processing
-            Some("283") | Some("308") => 90, // Diffusion steps (each step updates last_act)
-            Some("287") => 90, // Spatial 2x upscaling
-            Some("315") | Some("297") => 90, // VAE decoding
-            Some("310") | Some("75") => 60, // Video encoding & saving
-            _ => 90,
-        };
+        let max_inactive = video_stage_timeout_secs(active_node.as_deref(), node_has_progress);
         if inactive_secs > max_inactive {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
             let _ = c.post(format!("{}/queue", base_url())).json(&serde_json::json!({"clear": true})).send();
             let _ = c.post(format!("{}/free", base_url())).json(&serde_json::json!({"unload_models": true, "free_memory": true})).send();
             ws_stop.store(true, Ordering::SeqCst);
-            let stage_name = match active_node.as_deref() {
-                Some("325") => "prompt expansion (Gemma 3 12B)",
-                Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => "model weight staging",
-                Some("303") | Some("313") => "prompt conditioning encoding",
-                Some("304") | Some("314") | Some("284") | Some("282") => "conditioning and guidance setup",
-                Some("295") | Some("305") | Some("318") | Some("278") => "latent initialization",
-                Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => "reference frame processing",
-                Some("283") => "Stage 1 video diffusion",
-                Some("287") => "spatial 2x upscaling",
-                Some("308") => "Stage 2 detail refinement",
-                Some("315") => "tiled VAE decoding",
-                Some("297") => "audio VAE decoding",
-                Some("310") | Some("75") => "MP4 video encoding",
-                _ => "generation pipeline",
-            };
+            let stage_name = video_stage_name(active_node.as_deref());
             return Err(format!("Engine stalled during {stage_name} (no activity for {inactive_secs}s). Queue cleared automatically."));
         }
 
@@ -791,4 +776,69 @@ fn prepare_clean_slate(c: &Client, status: &dyn Fn(String)) {
         std::thread::sleep(Duration::from_millis(150));
     }
 }
+
+/// Returns the inactivity watchdog threshold (in seconds) for a video workflow node.
+/// Sampler nodes (`283`, `308`) get a longer grace period before their first `progress` event
+/// because ComfyUI must offload Gemma 3, cold-load/stage the 22B FP8 weights, initialize
+/// CUDA/cuDNN kernels, and complete step 1 before emitting progress.
+fn video_stage_timeout_secs(active_node: Option<&str>, node_has_progress: bool) -> u64 {
+    match active_node {
+        Some("325") => 180, // Gemma 3 prompt expansion (takes ~90-120s)
+        Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => 180, // Model weight staging
+        Some("303") | Some("313") => 60, // Prompt conditioning encoding
+        Some("304") | Some("314") | Some("284") | Some("282") => 45, // Conditioning and guiders setup
+        Some("295") | Some("305") | Some("318") | Some("278") | Some("277") | Some("276") | Some("291") | Some("280") | Some("306") | Some("281") => 45, // Latent initialization
+        Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => 60, // Reference frame processing
+        Some("283") | Some("308") => {
+            if node_has_progress {
+                180 // Active diffusion steps (each step updates last_activity)
+            } else {
+                300 // Cold start / Gemma->LTXAV swap / 22B weight staging + step 1
+            }
+        }
+        Some("287") => 180, // Spatial 2x upscaling
+        Some("315") | Some("297") => 180, // VAE decoding
+        Some("310") | Some("75") => 120, // Video encoding & saving
+        _ => 120,
+    }
+}
+
+fn video_stage_name(active_node: Option<&str>) -> &'static str {
+    match active_node {
+        Some("325") => "prompt expansion (Gemma 3 12B)",
+        Some("316") | Some("317") | Some("324") | Some("285") | Some("279") | Some("311") => "model weight staging",
+        Some("303") | Some("313") => "prompt conditioning encoding",
+        Some("304") | Some("314") | Some("284") | Some("282") => "conditioning and guidance setup",
+        Some("295") | Some("305") | Some("318") | Some("278") => "latent initialization",
+        Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288") => "reference frame processing",
+        Some("283") => "Stage 1 video diffusion",
+        Some("287") => "spatial 2x upscaling",
+        Some("308") => "Stage 2 detail refinement",
+        Some("315") => "tiled VAE decoding",
+        Some("297") => "audio VAE decoding",
+        Some("310") | Some("75") => "MP4 video encoding",
+        _ => "generation pipeline",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampler_cold_start_gets_extended_timeout() {
+        assert_eq!(video_stage_timeout_secs(Some("283"), false), 300);
+        assert_eq!(video_stage_timeout_secs(Some("283"), true), 180);
+        assert_eq!(video_stage_timeout_secs(Some("308"), false), 300);
+        assert_eq!(video_stage_timeout_secs(Some("308"), true), 180);
+    }
+
+    #[test]
+    fn stage_names_match_expected_nodes() {
+        assert_eq!(video_stage_name(Some("283")), "Stage 1 video diffusion");
+        assert_eq!(video_stage_name(Some("308")), "Stage 2 detail refinement");
+        assert_eq!(video_stage_name(None), "generation pipeline");
+    }
+}
+
 

@@ -5,7 +5,10 @@
 //! 3. Textures are created strictly on the UI thread inside `drain()`, outside any input locks.
 use crate::comfy;
 use crate::engine::{self, EngState, Profile, Shared};
-use eframe::egui::{self, pos2, vec2, Color32, ColorImage, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2};
+use crate::history::TrimHistory;
+use crate::presets::{AutoQualityLevel, QualityPreset, TargetResolution, VideoCodec};
+use crate::render::{JobState, RenderJobRequest, RenderManager};
+use eframe::egui::{self, pos2, vec2, Color32, ColorImage, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +41,7 @@ const ACCENT_GLOW: Color32 = Color32::from_rgb(129, 140, 248);
 const TEXT: Color32 = Color32::from_rgb(235, 238, 248);
 const DIM: Color32 = Color32::from_rgb(168, 177, 202);
 const GREEN: Color32 = Color32::from_rgb(52, 211, 153);
+const BLUE: Color32 = Color32::from_rgb(59, 130, 246);
 const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
 const DISCORD_GREEN: Color32 = Color32::from_rgb(35, 165, 90);
@@ -302,6 +306,114 @@ pub struct App {
     pub step_duration_ema: f32,
     pub is_swapping_detected: bool,
     pub generation_retries: u32,
+    // Video player trim, compression & history state (ported from ztrim)
+    pub trim_history: TrimHistory,
+    pub render_mgr: RenderManager,
+    pub video_presets: Vec<QualityPreset>,
+    pub selected_video_preset_idx: usize,
+    pub auto_quality_level: AutoQualityLevel,
+    pub compress_enabled: bool,
+    pub avg_bitrate: f32,
+    pub max_bitrate: f32,
+    pub selected_codec: VideoCodec,
+    pub selected_res: TargetResolution,
+    pub normalise_audio: bool,
+    pub audio_normalise_ratio: f32,
+    pub audio_normalise_thresh_db: f32,
+    pub audio_normalise_boost_db: f32,
+    pub new_video_preset_modal_open: bool,
+    pub new_video_preset_name: String,
+    pub active_timeline_drag: TimelineDrag,
+    pub timeline_drag_occurred: bool,
+    pub was_playing_before_scrub: bool,
+    pub trim_drag_initial: Option<TrimStateSnapshot>,
+    pub trim_undo_stack: Vec<TrimStateSnapshot>,
+    pub trim_redo_stack: Vec<TrimStateSnapshot>,
+    pub end_trim_error_flash_start: Option<Instant>,
+    pub has_seen_trim_hint: bool,
+    pub persist_trim_history: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimelineDrag {
+    None,
+    Playhead,
+    TrimStart,
+    TrimEnd,
+}
+
+pub const END_TRIM_PAD_PX: f32 = 25.0;
+pub const START_TRIM_PAD_PX: f32 = 26.0;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TrimClickDecision {
+    SetStartTrim(f64),
+    SetEndTrim(f64),
+    BlockRightClickFlashRed,
+}
+
+pub fn evaluate_trim_click(
+    is_right_click: bool,
+    pos_x: f32,
+    trim_x_min: f32,
+    trim_x_max: f32,
+    target_sec: f64,
+    cur_start: f64,
+    cur_end: f64,
+    dur: f64,
+) -> TrimClickDecision {
+    if is_right_click {
+        let is_after_end_marker = pos_x >= trim_x_max;
+        let min_trim_gap_sec = 0.05;
+        let is_inside_or_before_start = !is_after_end_marker
+            && (pos_x <= trim_x_min + START_TRIM_PAD_PX || target_sec <= cur_start + min_trim_gap_sec);
+
+        if is_inside_or_before_start {
+            TrimClickDecision::BlockRightClickFlashRed
+        } else {
+            let new_e = target_sec.clamp(cur_start + min_trim_gap_sec, dur);
+            TrimClickDecision::SetEndTrim(new_e)
+        }
+    } else {
+        let d_start = (pos_x - trim_x_min).abs();
+        let d_end = (pos_x - trim_x_max).abs();
+
+        let is_after_end = pos_x >= trim_x_max;
+        let is_in_end_padding = pos_x >= trim_x_max - END_TRIM_PAD_PX;
+        let start_overrides = d_start <= START_TRIM_PAD_PX && d_start < d_end;
+        let controls_end_trim = is_after_end || (is_in_end_padding && !start_overrides);
+
+        if controls_end_trim {
+            let new_e = target_sec.clamp(cur_start + 0.05, dur);
+            TrimClickDecision::SetEndTrim(new_e)
+        } else {
+            let new_s = target_sec.clamp(0.0, (cur_end - 0.05).max(0.0));
+            TrimClickDecision::SetStartTrim(new_s)
+        }
+    }
+}
+
+pub fn is_end_trim_flashing_red_at(flash_start: Option<Instant>, now: Instant) -> (bool, bool) {
+    if let Some(start) = flash_start {
+        let elapsed = now.saturating_duration_since(start).as_millis();
+        if elapsed < 400 {
+            (true, true)
+        } else if elapsed < 600 {
+            (false, true)
+        } else if elapsed < 1000 {
+            (true, true)
+        } else {
+            (false, false)
+        }
+    } else {
+        (false, false)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrimStateSnapshot {
+    pub start: Option<f64>,
+    pub end: Option<f64>,
 }
 
 fn rand_u64() -> u64 {
@@ -371,6 +483,33 @@ fn draw_restart_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
     }
 }
 
+pub fn draw_scissors_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    p.circle_stroke(center + vec2(-5.0, -3.0), 2.5, stroke);
+    p.circle_stroke(center + vec2(-5.0, 3.0), 2.5, stroke);
+    p.line_segment([center + vec2(-2.5, -2.5), center + vec2(6.5, 3.5)], stroke);
+    p.line_segment([center + vec2(-2.5, 2.5), center + vec2(6.5, -3.5)], stroke);
+    p.circle_filled(center + vec2(0.5, 0.0), 1.2, color);
+}
+
+pub fn draw_play_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let c = center + vec2(0.75, 0.0);
+    let p1 = c + vec2(-4.5, -5.5);
+    let p2 = c + vec2(-4.5, 5.5);
+    let p3 = c + vec2(5.5, 0.0);
+    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], color, Stroke::NONE));
+}
+
+pub fn draw_pause_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let h = 5.5;
+    let w = 2.4;
+    let gap = 2.0;
+    let rect_left = Rect::from_min_max(center + vec2(-gap - w, -h), center + vec2(-gap, h));
+    let rect_right = Rect::from_min_max(center + vec2(gap, -h), center + vec2(gap + w, h));
+    p.rect_filled(rect_left, 1.0, color);
+    p.rect_filled(rect_right, 1.0, color);
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
@@ -431,6 +570,18 @@ impl App {
         let initial_w = presets.get(default_idx).map(|p| p.target_w).unwrap_or(1024);
         let initial_h = presets.get(default_idx).map(|p| p.target_h).unwrap_or(1024);
         let initial_cfg = presets.get(default_idx).map(|p| p.cfg).unwrap_or(profile.default_cfg);
+
+        let video_presets = QualityPreset::load_presets();
+        let trim_history = TrimHistory::load();
+        let render_mgr = RenderManager::new();
+        let persisted_jobs = RenderManager::load_queue_history();
+        if !persisted_jobs.is_empty() {
+            render_mgr.load_persisted_jobs(persisted_jobs);
+        }
+        let default_preset = video_presets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| QualityPreset::default_presets()[0].clone());
 
         App {
             sh,
@@ -496,6 +647,31 @@ impl App {
             step_duration_ema: 0.0,
             is_swapping_detected: false,
             generation_retries: 0,
+            trim_history,
+            render_mgr,
+            video_presets,
+            selected_video_preset_idx: 0,
+            auto_quality_level: AutoQualityLevel::Med,
+            compress_enabled: true,
+            avg_bitrate: default_preset.avg_bitrate_mbps,
+            max_bitrate: default_preset.max_bitrate_mbps,
+            selected_codec: default_preset.codec,
+            selected_res: default_preset.resolution,
+            normalise_audio: false,
+            audio_normalise_ratio: 6.0,
+            audio_normalise_thresh_db: -25.0,
+            audio_normalise_boost_db: 10.0,
+            new_video_preset_modal_open: false,
+            new_video_preset_name: String::new(),
+            active_timeline_drag: TimelineDrag::None,
+            timeline_drag_occurred: false,
+            was_playing_before_scrub: false,
+            trim_drag_initial: None,
+            trim_undo_stack: Vec::new(),
+            trim_redo_stack: Vec::new(),
+            end_trim_error_flash_start: None,
+            has_seen_trim_hint: false,
+            persist_trim_history: true,
         }
     }
 
@@ -620,12 +796,16 @@ impl App {
                         .map(|p| p.filename == out_fn && !out_fn.is_empty())
                         .unwrap_or(false);
                     if !already_loaded {
+                        let norm = self.current_audio_normalise();
                         if let Ok(player) = crate::video::VideoPlayer::from_mp4_bytes(
                             mp4,
                             out_fn,
                             out_sub,
+                            norm,
                         ) {
                             self.video_player = Some(player);
+                            self.trim_undo_stack.clear();
+                            self.trim_redo_stack.clear();
                         }
                     }
                 } else {
@@ -867,6 +1047,70 @@ impl App {
         self.custom_h = (((self.ref_h as f32 * self.scale) / 16.0).round() as u32 * 16).clamp(64, 4096);
     }
 
+    fn load_video_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let norm = self.current_audio_normalise();
+        match crate::video::VideoPlayer::load_from_file(&path, norm) {
+            Ok(mut player) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("video.mp4")
+                    .to_string();
+                player.filename = filename.clone();
+
+                // Read bytes for HistoryNode if <= 256 MB
+                let mp4_bytes = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.len() <= 256 * 1024 * 1024)
+                    .and_then(|_| std::fs::read(&path).ok());
+                player.mp4_bytes = mp4_bytes.clone();
+
+                if let Some(first) = player.current_image.as_ref() {
+                    let id = self.next_node_id;
+                    self.next_node_id += 1;
+                    let tex = ctx.load_texture(format!("video_frame_{id}"), first.clone(), egui::TextureOptions::LINEAR);
+                    let mut png_bytes = Vec::new();
+                    if let Some(rgba) = image::RgbaImage::from_raw(
+                        first.size[0] as u32,
+                        first.size[1] as u32,
+                        first.as_raw().to_vec(),
+                    ) {
+                        let _ = image::DynamicImage::ImageRgba8(rgba)
+                            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+                    }
+                    let node = HistoryNode {
+                        id,
+                        parent_id: None,
+                        label: filename.clone(),
+                        prompt: String::new(),
+                        png: png_bytes,
+                        tex,
+                        width: player.original_width,
+                        height: player.original_height,
+                        step_num: 0,
+                        output_filename: filename,
+                        output_subfolder: String::new(),
+                        temp_files: Vec::new(),
+                        mp4_bytes,
+                    };
+                    self.nodes.push(node);
+                    self.active_node_id = Some(id);
+                }
+
+                self.mode = StudioMode::Video;
+                self.video_player = Some(player);
+                self.trim_undo_stack.clear();
+                self.trim_redo_stack.clear();
+                self.error = None;
+                self.status = format!("Loaded video: {}", path.display());
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to load video {}: {e}", path.display()));
+            }
+        }
+    }
+
     fn load(&mut self, ctx: &egui::Context, target: Target, src: Src) {
         self.loading += 1;
         let tx = self.tx.clone();
@@ -958,16 +1202,19 @@ impl App {
         // If a video is currently loaded in the player, automatically extract the frame
         // the user has scrubbed to as the start frame for the next shot!
         let (base_png_opt, scrubbed_frame_ci) = if let Some(ref player) = self.video_player {
-            let cur_idx = player.current_frame.min(player.frames.len().saturating_sub(1));
-            let cur_img = player.frames[cur_idx].clone();
-            let [f_w, f_h] = cur_img.size;
-            let mut png_bytes = Vec::new();
-            if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
-                let _ = image::DynamicImage::ImageRgba8(rgba)
-                    .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
-            }
-            if !png_bytes.is_empty() {
-                (Some(png_bytes), Some(cur_img))
+            if let Some(ref cur_img) = player.current_image {
+                let cur_img = cur_img.clone();
+                let [f_w, f_h] = cur_img.size;
+                let mut png_bytes = Vec::new();
+                if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
+                    let _ = image::DynamicImage::ImageRgba8(rgba)
+                        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+                }
+                if !png_bytes.is_empty() {
+                    (Some(png_bytes), Some(cur_img))
+                } else {
+                    (self.active_node().map(|n| n.png.clone()), None)
+                }
             } else {
                 (self.active_node().map(|n| n.png.clone()), None)
             }
@@ -1404,9 +1651,10 @@ impl App {
                     self.is_swapping_detected = false;
                     self.generation_retries = 0;
 
-                    match crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone()) {
+                    let norm = self.current_audio_normalise();
+                    match crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone(), norm) {
                         Ok(player) => {
-                            if let Some(first) = player.frames.first() {
+                            if let Some(first) = player.current_image.as_ref() {
                                 let id = self.next_node_id;
                                 self.next_node_id += 1;
                                 let tex = ctx.load_texture(format!("video_frame_{id}"), first.clone(), egui::TextureOptions::LINEAR);
@@ -1441,18 +1689,20 @@ impl App {
                                     prompt: self.generating_prompt.clone(),
                                     png: png_bytes,
                                     tex,
-                                    width: player.width,
-                                    height: player.height,
+                                    width: player.original_width,
+                                    height: player.original_height,
                                     step_num,
                                     output_filename,
                                     output_subfolder,
                                     temp_files,
-                                    mp4_bytes: Some(player.mp4_bytes.clone()),
+                                    mp4_bytes: player.mp4_bytes.clone(),
                                 };
                                 self.nodes.push(node);
                                 self.active_node_id = Some(id);
                             }
                             self.video_player = Some(player);
+                            self.trim_undo_stack.clear();
+                            self.trim_redo_stack.clear();
                         }
                         Err(e) => {
                             self.error = Some(format!("Failed to decode video: {e}"));
@@ -1513,6 +1763,377 @@ impl App {
                 self.start_generation_with_prompt(ctx, next.prompt);
             }
         }
+
+        if self.render_mgr.update() {
+            if self.persist_trim_history {
+                self.render_mgr.save_queue_history();
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn current_audio_normalise(&self) -> Option<crate::video::AudioNormaliseConfig> {
+        if self.normalise_audio {
+            Some(crate::video::AudioNormaliseConfig {
+                ratio: self.audio_normalise_ratio,
+                threshold_db: self.audio_normalise_thresh_db,
+                boost_db: self.audio_normalise_boost_db,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn is_auto_video_preset(&self) -> bool {
+        self.video_presets
+            .get(self.selected_video_preset_idx)
+            .map(|p| p.id == "auto")
+            .unwrap_or(false)
+    }
+
+    fn apply_auto_bitrate(&mut self) {
+        let source_h = self
+            .video_player
+            .as_ref()
+            .map(|p| p.original_height)
+            .unwrap_or(self.video_height.max(1));
+        let effective_h = match self.selected_res.max_height() {
+            Some(cap_h) => source_h.min(cap_h),
+            None => source_h,
+        };
+        let (avg, max) = crate::presets::auto_bitrate_range(effective_h, self.auto_quality_level);
+        self.avg_bitrate = avg;
+        self.max_bitrate = max;
+    }
+
+    fn sync_from_video_preset_idx(&mut self, idx: usize) {
+        if idx < self.video_presets.len() {
+            self.selected_video_preset_idx = idx;
+            let p = &self.video_presets[idx];
+            if p.id == "auto" {
+                self.selected_res = TargetResolution::Source;
+                self.selected_codec = p.codec;
+                self.apply_auto_bitrate();
+            } else {
+                self.avg_bitrate = p.avg_bitrate_mbps;
+                self.max_bitrate = p.max_bitrate_mbps;
+                self.selected_codec = p.codec;
+                self.selected_res = p.resolution;
+            }
+        }
+    }
+
+    fn record_trim_undo(&mut self, snapshot: TrimStateSnapshot) {
+        self.trim_undo_stack.push(snapshot);
+        if self.trim_undo_stack.len() > 64 {
+            self.trim_undo_stack.remove(0);
+        }
+        self.trim_redo_stack.clear();
+    }
+
+    fn perform_trim_undo(&mut self) {
+        if let Some(prev) = self.trim_undo_stack.pop() {
+            if let Some(ref mut player) = self.video_player {
+                let current = TrimStateSnapshot {
+                    start: player.trim_start_sec,
+                    end: player.trim_end_sec,
+                };
+                self.trim_redo_stack.push(current);
+                player.trim_start_sec = prev.start;
+                player.trim_end_sec = prev.end;
+                let target = prev.start.unwrap_or(0.0);
+                player.seek_to_time(target);
+                self.status = "Undid trim change".into();
+            }
+        }
+    }
+
+    fn perform_trim_redo(&mut self) {
+        if let Some(next) = self.trim_redo_stack.pop() {
+            if let Some(ref mut player) = self.video_player {
+                let current = TrimStateSnapshot {
+                    start: player.trim_start_sec,
+                    end: player.trim_end_sec,
+                };
+                self.trim_undo_stack.push(current);
+                player.trim_start_sec = next.start;
+                player.trim_end_sec = next.end;
+                let target = next.start.unwrap_or(0.0);
+                player.seek_to_time(target);
+                self.status = "Redid trim change".into();
+            }
+        }
+    }
+
+    fn trigger_trim_and_compress(&mut self) {
+        let Some(ref player) = self.video_player else {
+            return;
+        };
+        let input_path = player.file_path.clone();
+        let temp_guard = player.temp_file_guard.clone();
+        let trim_start = if player.trim_start() > 0.01 {
+            Some(player.trim_start())
+        } else {
+            None
+        };
+        let trim_end = if player.trim_end() < (player.duration_sec - 0.01) {
+            Some(player.trim_end())
+        } else {
+            None
+        };
+        let total_duration = player.duration_sec;
+        let base_name = if !player.filename.is_empty() {
+            player.filename.clone()
+        } else {
+            input_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("video.mp4")
+                .to_string()
+        };
+
+        let stem = PathBuf::from(&base_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video")
+            .to_string();
+        let ext = PathBuf::from(&base_name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mp4")
+            .to_string();
+        let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let out_filename = format!("{stem}_trimmed_{stamp}.{ext}");
+        let renders_dir = engine::data_dir().join("renders");
+        let _ = std::fs::create_dir_all(&renders_dir);
+        let explicit_output_path = renders_dir.join(&out_filename);
+
+        let mut preset = self
+            .video_presets
+            .get(self.selected_video_preset_idx)
+            .cloned()
+            .unwrap_or_else(|| QualityPreset::default_presets()[0].clone());
+        preset.avg_bitrate_mbps = self.avg_bitrate;
+        preset.max_bitrate_mbps = self.max_bitrate;
+        preset.codec = self.selected_codec;
+        preset.resolution = self.selected_res;
+
+        let req = RenderJobRequest {
+            id: 0,
+            input_path: input_path.clone(),
+            trim_start,
+            trim_end,
+            total_duration,
+            compress: self.compress_enabled,
+            preset,
+            replace_in_place: false,
+            normalise_audio: self.normalise_audio,
+            audio_normalise_ratio: self.audio_normalise_ratio,
+            audio_normalise_thresh_db: self.audio_normalise_thresh_db,
+            audio_normalise_boost_db: self.audio_normalise_boost_db,
+            display_name: Some(out_filename.clone()),
+            explicit_output_path: Some(explicit_output_path.clone()),
+            temp_input_guard: temp_guard,
+        };
+
+        self.render_mgr.submit_job(req);
+        self.trim_history.mark_trimmed(&explicit_output_path);
+        if self.persist_trim_history {
+            self.render_mgr.save_queue_history();
+        }
+        self.status = format!("Queued trim/compress: {out_filename}");
+    }
+
+    fn render_trim_history_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            heading(ui, "TRIM HISTORY");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.checkbox(&mut self.persist_trim_history, "Persist")
+                    .on_hover_text("Keep trim & render history across app launches")
+                    .changed()
+                {
+                    if self.persist_trim_history {
+                        self.render_mgr.save_queue_history();
+                    } else {
+                        RenderManager::delete_queue_history_file();
+                    }
+                }
+            });
+        });
+
+        let mut job_to_remove: Option<u64> = None;
+        let mut path_to_load: Option<(PathBuf, String)> = None;
+        let mut path_to_save: Option<(PathBuf, String)> = None;
+
+        card(ui, |ui| {
+            let max_w = ui.available_width();
+            ui.set_max_width(max_w);
+            egui::ScrollArea::vertical()
+                .id_salt("trim_history_scroll")
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if let Ok(jobs) = self.render_mgr.active_jobs.lock() {
+                        if jobs.is_empty() {
+                            ui.label(RichText::new("No trim or compression jobs yet.").size(11.0).color(DIM));
+                        } else {
+                            for j in jobs.iter().rev() {
+                                egui::Frame::new()
+                                    .fill(CARD_HI)
+                                    .stroke(Stroke::new(1.0, LINE))
+                                    .corner_radius(5)
+                                    .inner_margin(egui::Margin::symmetric(6, 4))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&j.file_name).size(11.0).strong().color(TEXT),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&j.file_name);
+
+                                        ui.horizontal(|ui| {
+                                            match &j.state {
+                                                JobState::Queued => {
+                                                    ui.label(RichText::new("Queued").size(10.5).color(AMBER));
+                                                }
+                                                JobState::Running { progress, speed } => {
+                                                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                                                    ui.label(
+                                                        RichText::new(format!("{:.0}% ({speed})", progress * 100.0))
+                                                            .size(10.5)
+                                                            .color(BLUE),
+                                                    );
+                                                }
+                                                JobState::Finished => {
+                                                    if let Some(ref out_p) = j.output_path {
+                                                        if out_p.exists() {
+                                                            if ui.small_button("Load").on_hover_text("Open in player").clicked() {
+                                                                path_to_load = Some((out_p.clone(), j.file_name.clone()));
+                                                            }
+                                                            if ui.small_button("Save").on_hover_text("Save trimmed MP4 as...").clicked() {
+                                                                path_to_save = Some((out_p.clone(), j.file_name.clone()));
+                                                            }
+                                                        } else {
+                                                            ui.label(RichText::new("Done").size(10.5).color(GREEN));
+                                                        }
+                                                    } else {
+                                                        ui.label(RichText::new("Done").size(10.5).color(GREEN));
+                                                    }
+                                                }
+                                                JobState::Deleted => {
+                                                    ui.label(RichText::new("Deleted").size(10.5).color(DIM));
+                                                }
+                                                JobState::Failed(err) => {
+                                                    ui.label(RichText::new("Failed").size(10.5).color(RED))
+                                                        .on_hover_text(err);
+                                                }
+                                            }
+
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let x_btn = egui::Button::new(RichText::new("x").size(10.5).color(DIM))
+                                                    .frame(false)
+                                                    .min_size(vec2(16.0, 16.0));
+                                                if ui.add(x_btn).on_hover_text("Remove from trim history").clicked() {
+                                                    job_to_remove = Some(j.job_id);
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(3.0);
+                            }
+                        }
+                    }
+                });
+        });
+
+        if let Some(id) = job_to_remove {
+            self.render_mgr.remove_job(id);
+            if self.persist_trim_history {
+                self.render_mgr.save_queue_history();
+            }
+        }
+        if let Some((path, name)) = path_to_load {
+            let norm = self.current_audio_normalise();
+            match crate::video::VideoPlayer::load_from_file(&path, norm) {
+                Ok(mut player) => {
+                    player.filename = name;
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        player.mp4_bytes = Some(bytes);
+                    }
+                    self.video_player = Some(player);
+                    self.trim_undo_stack.clear();
+                    self.trim_redo_stack.clear();
+                    ctx.request_repaint();
+                }
+                Err(e) => {
+                    self.error = Some(format!("Could not load trimmed video: {e}"));
+                }
+            }
+        }
+        if let Some((src_path, name)) = path_to_save {
+            if let Some(dst) = rfd::FileDialog::new()
+                .set_file_name(&name)
+                .add_filter("MP4 Video", &["mp4"])
+                .save_file()
+            {
+                if let Err(e) = std::fs::copy(&src_path, &dst) {
+                    self.error = Some(format!("Could not save trimmed MP4: {e}"));
+                } else {
+                    self.status = format!("Saved {}", dst.display());
+                }
+            }
+        }
+    }
+
+    fn new_video_preset_modal(&mut self, ctx: &egui::Context) {
+        if !self.new_video_preset_modal_open {
+            return;
+        }
+        let mut open = true;
+        let mut should_close = false;
+        egui::Window::new("Save Video Compression Preset")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Preset Name:");
+                ui.text_edit_singleline(&mut self.new_video_preset_name);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() && !self.new_video_preset_name.trim().is_empty() {
+                        let name = self.new_video_preset_name.trim().to_string();
+                        let id = format!(
+                            "custom_{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        );
+                        let new_p = QualityPreset {
+                            id,
+                            name,
+                            resolution: self.selected_res,
+                            avg_bitrate_mbps: self.avg_bitrate,
+                            max_bitrate_mbps: self.max_bitrate,
+                            codec: self.selected_codec,
+                            audio_bitrate_kbps: 192,
+                            is_builtin: false,
+                        };
+                        self.video_presets.push(new_p);
+                        self.selected_video_preset_idx = self.video_presets.len() - 1;
+                        QualityPreset::save_presets(&self.video_presets);
+                        self.new_video_preset_name.clear();
+                        should_close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        should_close = true;
+                    }
+                });
+            });
+        self.new_video_preset_modal_open = open && !should_close;
     }
 
     
@@ -1609,9 +2230,18 @@ fn is_win_ctrl_v() -> bool {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let mut need_base = self.active_node().is_none();
         for p in dropped {
-            let t = if need_base { Target::Base } else { Target::Ref };
-            need_base = false;
-            self.load(ctx, t, Src::Path(p));
+            let is_vid = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"))
+                .unwrap_or(false);
+            if is_vid {
+                self.load_video_file(ctx, p);
+            } else {
+                let t = if need_base { Target::Base } else { Target::Ref };
+                need_base = false;
+                self.load(ctx, t, Src::Path(p));
+            }
         }
         let win_down = Self::is_win_ctrl_v();
         let win_paste = win_down && !self.last_ctrl_v_down;
@@ -1640,14 +2270,16 @@ fn is_win_ctrl_v() -> bool {
             }
         }
 
-        // Undo / Redo keyboard shortcuts
-        let undo = ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
-        let redo = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::Y)) || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z)));
-        if undo && !ctx.egui_wants_keyboard_input() && self.can_undo() {
-            self.undo();
-        }
-        if redo && !ctx.egui_wants_keyboard_input() && self.can_redo() {
-            self.redo();
+        // Undo / Redo keyboard shortcuts (image/node history; video trim undo is handled in render_video_canvas)
+        if self.video_player.is_none() {
+            let undo = ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
+            let redo = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::Y)) || (i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z)));
+            if undo && !ctx.egui_wants_keyboard_input() && self.can_undo() {
+                self.undo();
+            }
+            if redo && !ctx.egui_wants_keyboard_input() && self.can_redo() {
+                self.redo();
+            }
         }
     }
 
@@ -1694,7 +2326,15 @@ fn is_win_ctrl_v() -> bool {
         if !matches!(st, EngState::Ready { .. }) {
             return Err("Engine starting - prompt will be queued");
         }
-        self.can_queue()
+        self.can_queue()?;
+        if self.mode == StudioMode::Video {
+            if !self.has_video_models() {
+                return Err("Downloading video models - prompt will be queued");
+            }
+        } else if self.sh.models_found.lock().unwrap().iter().any(|m| !m.1) {
+            return Err("Downloading image models - prompt will be queued");
+        }
+        Ok(())
     }
 
     fn pick_images(&mut self, ctx: &egui::Context, target: Target, multi: bool) {
@@ -1742,7 +2382,7 @@ fn is_win_ctrl_v() -> bool {
                             EngState::ExtractingEngine { .. } => ("Extracting engine...".to_string(), AMBER),
                             EngState::DownloadingModels { file_index, total_files, .. } => (format!("Downloading model ({}/{})", file_index, total_files), AMBER),
                             EngState::ModelDownloadPaused { .. } => ("Model download paused".to_string(), AMBER),
-                            EngState::RepairingEngine { .. } => ("Repairing engine...".to_string(), AMBER),
+                            EngState::RepairingEngine { step } => (step.clone(), AMBER),
                             EngState::Starting { since, .. } => (format!("Starting engine... {}s", since.elapsed().as_secs()), AMBER),
                             EngState::Ready { ours, .. } => (
                                 if *ours {
@@ -1870,6 +2510,10 @@ fn is_win_ctrl_v() -> bool {
     // Left Panel: Compact Reference Strip (+ Docked History if Left)
     fn refs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.mode == StudioMode::Video {
+            self.render_trim_history_ui(ui, ctx);
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
             self.render_history_ui(ui);
             return;
         }
@@ -2275,6 +2919,172 @@ fn is_win_ctrl_v() -> bool {
                         .desired_width(ui.available_width())
                         .hint_text("e.g. video game, cartoon, CGI, 3D render, ugly, blurry, deformed"),
                 );
+            });
+
+            ui.add_space(6.0);
+
+            // Compression & Export Settings (ported from ztrim)
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.compress_enabled, "");
+                    ui.label(
+                        RichText::new("Compress Video (Trim & Export)")
+                            .size(12.5)
+                            .strong()
+                            .color(if self.compress_enabled { TEXT } else { DIM }),
+                    );
+                });
+            });
+
+            if self.compress_enabled {
+                ui.add_space(6.0);
+                card(ui, |ui| {
+                    heading(ui, "COMPRESSION PRESET");
+                    let mut new_preset_idx = None;
+                    egui::ComboBox::from_id_salt("video_compress_preset_dropdown")
+                        .width(ui.available_width() - 8.0)
+                        .selected_text(
+                            self.video_presets
+                                .get(self.selected_video_preset_idx)
+                                .map(|p| p.name.as_str())
+                                .unwrap_or("Custom"),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, p) in self.video_presets.iter().enumerate() {
+                                if ui.selectable_value(&mut self.selected_video_preset_idx, i, &p.name).clicked() {
+                                    new_preset_idx = Some(i);
+                                }
+                            }
+                        });
+                    if let Some(idx) = new_preset_idx {
+                        self.sync_from_video_preset_idx(idx);
+                    }
+
+                    if self.is_auto_video_preset() {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Auto Range:").size(11.5).color(TEXT));
+                            let mut level_idx = self.auto_quality_level.to_index();
+                            let slider = egui::Slider::new(&mut level_idx, 0..=2)
+                                .custom_formatter(|val, _| match val.round() as usize {
+                                    0 => "Low".to_string(),
+                                    1 => "Med".to_string(),
+                                    _ => "High".to_string(),
+                                })
+                                .show_value(true);
+                            if ui.add(slider).changed() {
+                                self.auto_quality_level = AutoQualityLevel::from_index(level_idx);
+                                self.apply_auto_bitrate();
+                            }
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                    heading(ui, "VARIABLE BITRATE (VBR)");
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Average Bitrate:").size(11.5).color(TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Mb/s").size(11.0).color(DIM));
+                            ui.add(egui::DragValue::new(&mut self.avg_bitrate).range(1.0..=120.0).speed(0.2));
+                        });
+                    });
+                    ui.add(egui::Slider::new(&mut self.avg_bitrate, 1.0..=60.0).show_value(false));
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Maximum Bitrate:").size(11.5).color(TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Mb/s").size(11.0).color(DIM));
+                            ui.add(egui::DragValue::new(&mut self.max_bitrate).range(1.0..=200.0).speed(0.5));
+                        });
+                    });
+                    ui.add(egui::Slider::new(&mut self.max_bitrate, 2.0..=100.0).show_value(false));
+                    if self.max_bitrate < self.avg_bitrate {
+                        self.max_bitrate = self.avg_bitrate;
+                    }
+
+                    ui.add_space(8.0);
+                    heading(ui, "ENCODER & RESOLUTION");
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Codec:").size(11.5).color(TEXT));
+                        egui::ComboBox::from_id_salt("video_codec_select")
+                            .selected_text(self.selected_codec.display_name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.selected_codec, VideoCodec::NvencHevc, VideoCodec::NvencHevc.display_name());
+                                ui.selectable_value(&mut self.selected_codec, VideoCodec::NvencH264, VideoCodec::NvencH264.display_name());
+                                ui.selectable_value(&mut self.selected_codec, VideoCodec::NvencAv1, VideoCodec::NvencAv1.display_name());
+                                ui.selectable_value(&mut self.selected_codec, VideoCodec::CpuX264, VideoCodec::CpuX264.display_name());
+                                ui.selectable_value(&mut self.selected_codec, VideoCodec::CpuX265, VideoCodec::CpuX265.display_name());
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Target Res:").size(11.5).color(TEXT));
+                        let prev_res = self.selected_res;
+                        egui::ComboBox::from_id_salt("video_res_select")
+                            .selected_text(self.selected_res.display_name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.selected_res, TargetResolution::Source, TargetResolution::Source.display_name());
+                                ui.selectable_value(&mut self.selected_res, TargetResolution::P1440, TargetResolution::P1440.display_name());
+                                ui.selectable_value(&mut self.selected_res, TargetResolution::P1080, TargetResolution::P1080.display_name());
+                                ui.selectable_value(&mut self.selected_res, TargetResolution::P4K, TargetResolution::P4K.display_name());
+                                ui.selectable_value(&mut self.selected_res, TargetResolution::P720, TargetResolution::P720.display_name());
+                            });
+                        if self.selected_res != prev_res && self.is_auto_video_preset() {
+                            self.apply_auto_bitrate();
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    if ui.button("+ Save as New Preset...").clicked() {
+                        self.new_video_preset_modal_open = true;
+                    }
+                });
+            }
+
+            ui.add_space(6.0);
+            card(ui, |ui| {
+                let mut audio_toggled = false;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut self.normalise_audio, "").changed() {
+                        audio_toggled = true;
+                    }
+                    ui.label(
+                        RichText::new("Normalise Audio Volume")
+                            .size(12.5)
+                            .strong()
+                            .color(if self.normalise_audio { TEXT } else { DIM }),
+                    );
+                });
+                if self.normalise_audio {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Threshold:").size(11.0).color(DIM));
+                        if ui.add(egui::Slider::new(&mut self.audio_normalise_thresh_db, -45.0..=-5.0).suffix(" dB")).changed() {
+                            audio_toggled = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Ratio:").size(11.0).color(DIM));
+                        if ui.add(egui::Slider::new(&mut self.audio_normalise_ratio, 1.5..=20.0).suffix(":1")).changed() {
+                            audio_toggled = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Makeup:").size(11.0).color(DIM));
+                        if ui.add(egui::Slider::new(&mut self.audio_normalise_boost_db, 0.0..=24.0).suffix(" dB")).changed() {
+                            audio_toggled = true;
+                        }
+                    });
+                }
+                if audio_toggled {
+                    let norm = self.current_audio_normalise();
+                    if let Some(ref mut player) = self.video_player {
+                        player.reload_audio(norm);
+                    }
+                }
             });
         });
     }
@@ -2817,30 +3627,14 @@ fn is_win_ctrl_v() -> bool {
 
                     let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(12.0).strong());
                     if resp_img.changed() {
-                        sh.dl_image_model.store(dl_img, Ordering::SeqCst);
-                        let mut cfg = sh.cfg.lock().unwrap();
-                        cfg.dl_image_model = dl_img;
-                        cfg.save();
-                        if !dl_img {
-                            sh.cancel_model_dl.store(true, Ordering::SeqCst);
-                        } else {
-                            sh.retry.store(true, Ordering::SeqCst);
-                        }
+                        engine::toggle_model_download(sh, ui.ctx(), true, dl_img);
                     }
 
                     ui.add_space(16.0);
 
                     let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(12.0).strong());
                     if resp_vid.changed() {
-                        sh.dl_video_model.store(dl_vid, Ordering::SeqCst);
-                        let mut cfg = sh.cfg.lock().unwrap();
-                        cfg.dl_video_model = dl_vid;
-                        cfg.save();
-                        if !dl_vid {
-                            sh.cancel_model_dl.store(true, Ordering::SeqCst);
-                        } else {
-                            sh.retry.store(true, Ordering::SeqCst);
-                        }
+                        engine::toggle_model_download(sh, ui.ctx(), false, dl_vid);
                     }
                 });
             });
@@ -2849,318 +3643,707 @@ fn is_win_ctrl_v() -> bool {
 
 
     fn render_video_canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_size: Vec2) {
-        let player = match self.video_player.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-
-        player.update(ctx);
-
         let wants_kb = ctx.egui_wants_keyboard_input();
 
-        let space_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::Space));
-        let left_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-        let right_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        let (space_pressed, left_pressed, right_pressed, i_pressed, o_pressed, undo_pressed, redo_pressed) = if !wants_kb {
+            ctx.input(|i| {
+                let ctrl = i.modifiers.ctrl || i.modifiers.command;
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::I),
+                    i.key_pressed(egui::Key::O),
+                    ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
+                    ctrl && (i.key_pressed(egui::Key::Y) || (i.key_pressed(egui::Key::Z) && i.modifiers.shift)),
+                )
+            })
+        } else {
+            (false, false, false, false, false, false, false)
+        };
 
-        if space_pressed {
-            player.toggle_play();
-        }
-        if left_pressed {
-            let prev = player.current_frame.saturating_sub(1);
-            player.seek(prev);
-        }
-        if right_pressed {
-            let next = (player.current_frame + 1).min(player.frames.len().saturating_sub(1));
-            player.seek(next);
+        if undo_pressed {
+            self.perform_trim_undo();
+        } else if redo_pressed {
+            self.perform_trim_redo();
         }
 
+        let mut pending_undo_snapshot: Option<TrimStateSnapshot> = None;
         let mut close_video = false;
         let mut save_video = false;
         let mut extract_frame = false;
+        let mut trigger_trim = false;
+        let mut interacted_with_trim = false;
 
-        let cur_frame_idx = player.current_frame;
-        let total_frames = player.frames.len();
-        let fps = player.fps.max(1.0);
-        let cur_sec = cur_frame_idx as f32 / fps;
-        let tot_sec = total_frames as f32 / fps;
-        let p_w = player.width;
-        let p_h = player.height;
+        {
+            let player = match self.video_player.as_mut() {
+                Some(p) => p,
+                None => return,
+            };
 
-        ui.horizontal(|ui| {
-            heading(ui, &format!("Video Player   {} × {} px   •   {:.1}s @ {:.0} fps", p_w, p_h, tot_sec, fps));
+            player.update(ctx);
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close Video").on_hover_text("Close player and return to image canvas").clicked() {
-                    close_video = true;
+            if space_pressed {
+                player.toggle_play();
+            }
+            if left_pressed {
+                player.step_frames(-1);
+            }
+            if right_pressed {
+                player.step_frames(1);
+            }
+            if i_pressed {
+                let snap = TrimStateSnapshot {
+                    start: player.trim_start_sec,
+                    end: player.trim_end_sec,
+                };
+                player.set_trim_start_to_current();
+                if player.trim_start_sec != snap.start {
+                    pending_undo_snapshot = Some(snap);
+                    interacted_with_trim = true;
                 }
-                if ui.button("Save MP4 as...").on_hover_text("Export video file").clicked() {
-                    save_video = true;
+            }
+            if o_pressed {
+                let snap = TrimStateSnapshot {
+                    start: player.trim_start_sec,
+                    end: player.trim_end_sec,
+                };
+                player.set_trim_end_to_current();
+                if player.trim_end_sec != snap.end {
+                    pending_undo_snapshot = Some(snap);
+                    interacted_with_trim = true;
                 }
-                if ui.button("Use Frame as Base Image").on_hover_text("Extract current video frame as base image and switch to Image mode").clicked() {
-                    extract_frame = true;
-                }
+            }
 
-                let zoom_txt = format!("{:.0}%", self.canvas_zoom * 100.0);
-                if ui.button(zoom_txt).on_hover_text("Click to reset zoom and center video").clicked() {
-                    self.canvas_zoom = 1.0;
-                    self.canvas_pan = vec2(0.0, 0.0);
-                }
-            });
-        });
+            let dur = player.duration_sec.max(0.001);
+            let cur_s = player.current_sec;
+            let fps = player.original_fps.max(1.0);
+            let p_w = player.original_width;
+            let p_h = player.original_height;
 
-        let canvas_area = max_size - vec2(0.0, 96.0);
-        let (canvas_rect, resp) = ui.allocate_exact_size(canvas_area, Sense::click_and_drag());
+            ui.horizontal(|ui| {
+                heading(ui, &format!("Video Player   {} × {} px   •   {:.1}s @ {:.0} fps", p_w, p_h, dur, fps));
 
-        let target_size = vec2(p_w as f32, p_h as f32);
-        let fit_size = fit(target_size, canvas_area);
-
-        // Zoom into cursor position with mouse wheel & trackpad pinch
-        if resp.hovered() {
-            let (scroll_steps, pinch_delta) = ctx.input(|i| {
-                let mut steps = 0.0f32;
-                for ev in &i.raw.events {
-                    if let egui::Event::MouseWheel { unit, delta, .. } = ev {
-                        match unit {
-                            egui::MouseWheelUnit::Line => steps += delta.y,
-                            egui::MouseWheelUnit::Point => steps += delta.y / 60.0,
-                            egui::MouseWheelUnit::Page => steps += delta.y * 3.0,
-                        }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close Video").on_hover_text("Close player and return to image canvas").clicked() {
+                        close_video = true;
                     }
-                }
-                (steps, i.zoom_delta())
-            });
+                    if ui.button("Save MP4 as...").on_hover_text("Export raw video file").clicked() {
+                        save_video = true;
+                    }
+                    if ui.button("Use Frame as Base Image").on_hover_text("Extract current video frame as base image and switch to Image mode").clicked() {
+                        extract_frame = true;
+                    }
 
-            let mut zoom_factor = 1.0f32;
-            if scroll_steps != 0.0 {
-                let clamped = scroll_steps.clamp(-4.0, 4.0);
-                zoom_factor *= 1.12f32.powf(clamped);
-            }
-            if (pinch_delta - 1.0).abs() > 0.001 {
-                zoom_factor *= pinch_delta;
-            }
-
-            if (zoom_factor - 1.0).abs() > 0.0005 {
-                let old_zoom = self.canvas_zoom;
-                let new_zoom = (old_zoom * zoom_factor).clamp(0.15, 25.0);
-
-                if let Some(mouse) = resp.hover_pos() {
-                    let center = canvas_rect.center();
-                    let mouse_rel = mouse - (center + self.canvas_pan);
-                    self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
-                }
-                self.canvas_zoom = new_zoom;
-            }
-        }
-
-        // Pan by dragging
-        if resp.dragged() {
-            self.canvas_pan += resp.drag_delta();
-        }
-        if resp.double_clicked() {
-            self.canvas_zoom = 1.0;
-            self.canvas_pan = vec2(0.0, 0.0);
-        } else if resp.clicked() {
-            player.toggle_play();
-        }
-
-        let cur_size = fit_size * self.canvas_zoom;
-        let cur_center = canvas_rect.center() + self.canvas_pan;
-        let image_rect = Rect::from_center_size(cur_center, cur_size);
-
-        let p = ui.painter().with_clip_rect(canvas_rect);
-        p.rect_filled(canvas_rect, 8, Color32::from_rgb(14, 16, 22));
-        p.rect_stroke(canvas_rect, 8, Stroke::new(1.0, LINE), StrokeKind::Inside);
-
-        if let Some(tex) = player.current_texture(ctx) {
-            p.image(tex.id(), image_rect, FULL_UV, Color32::WHITE);
-            p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(30)), StrokeKind::Outside);
-        }
-
-        ui.add_space(6.0);
-
-        // Player Controls Bar at bottom of canvas
-        card(ui, |ui| {
-            ui.vertical(|ui| {
-                // 1. Full-length scrub bar covering the entire width of the player
-                let cur_f = player.current_frame;
-                let max_f = player.frames.len().saturating_sub(1);
-                let full_w = ui.available_width();
-                let (track_rect, scrub_resp) = ui.allocate_exact_size(vec2(full_w, 18.0), Sense::click_and_drag());
-                if ui.is_rect_visible(track_rect) {
-                    let p = ui.painter();
-                    let is_hovered = scrub_resp.hovered();
-                    let is_dragged = scrub_resp.dragged();
-                    if is_hovered || is_dragged {
+                    // Drawn Scissors SVG + Trim & Compress button
+                    let trim_btn_label = if self.compress_enabled {
+                        "Trim & Compress"
+                    } else {
+                        "Trim / Export"
+                    };
+                    let (trim_rect, trim_resp) = ui.allocate_exact_size(vec2(132.0, 24.0), Sense::click());
+                    if trim_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-
-                    let track_y = track_rect.center().y;
-                    let track_h = if is_hovered || is_dragged { 6.0 } else { 4.0 };
-                    let track_bg_rect = Rect::from_center_size(track_rect.center(), vec2(track_rect.width(), track_h));
-                    p.rect_filled(track_bg_rect, 2.0, Color32::from_rgb(32, 36, 48));
-
-                    let progress_ratio = if max_f > 0 {
-                        (cur_f as f32 / max_f as f32).clamp(0.0, 1.0)
+                    if trim_resp.clicked() {
+                        trigger_trim = true;
+                    }
+                    let trim_bg = if trim_resp.is_pointer_button_down_on() {
+                        Color32::from_rgb(109, 40, 217)
+                    } else if trim_resp.hovered() {
+                        Color32::from_rgb(139, 92, 246)
                     } else {
-                        0.0
+                        ACCENT
                     };
-                    let played_w = track_rect.width() * progress_ratio;
-                    let played_rect = Rect::from_min_max(
-                        pos2(track_rect.left(), track_y - track_h * 0.5),
-                        pos2(track_rect.left() + played_w, track_y + track_h * 0.5),
+                    let tp = ui.painter();
+                    tp.rect_filled(trim_rect, 5.0, trim_bg);
+                    tp.rect_stroke(trim_rect, 5.0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Inside);
+                    draw_scissors_icon(tp, Pos2::new(trim_rect.left() + 14.0, trim_rect.center().y), Color32::WHITE);
+                    tp.text(
+                        Pos2::new(trim_rect.left() + 26.0, trim_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        trim_btn_label,
+                        egui::FontId::proportional(11.5),
+                        Color32::WHITE,
                     );
-                    p.rect_filled(played_rect, 2.0, ACCENT);
+                    let _ = trim_resp.on_hover_text("Render trimmed & compressed MP4 to Trim History");
 
-                    let playhead_x = track_rect.left() + played_w;
-                    let thumb_r = if is_dragged { 7.0 } else if is_hovered { 6.0 } else { 4.5 };
-                    let thumb_pos = pos2(playhead_x, track_y);
-                    p.circle_filled(thumb_pos, thumb_r, Color32::WHITE);
-                    p.circle_stroke(thumb_pos, thumb_r, Stroke::new(1.5, ACCENT_GLOW));
+                    let zoom_txt = format!("{:.0}%", self.canvas_zoom * 100.0);
+                    if ui.button(zoom_txt).on_hover_text("Click to reset zoom and center video").clicked() {
+                        self.canvas_zoom = 1.0;
+                        self.canvas_pan = vec2(0.0, 0.0);
+                    }
+                });
+            });
 
-                    if scrub_resp.dragged() || scrub_resp.clicked() {
-                        if let Some(pos) = scrub_resp.interact_pointer_pos() {
-                            let rel_x = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
-                            let target_frame = (rel_x * max_f as f32).round() as usize;
-                            if scrub_resp.clicked() || target_frame != player.current_frame {
-                                player.seek(target_frame);
+            let canvas_area = max_size - vec2(0.0, 128.0);
+            let (canvas_rect, resp) = ui.allocate_exact_size(canvas_area, Sense::click_and_drag());
+
+            let target_size = vec2(p_w as f32, p_h as f32);
+            let fit_size = fit(target_size, canvas_area);
+
+            if resp.hovered() {
+                let (scroll_steps, pinch_delta) = ctx.input(|i| {
+                    let mut steps = 0.0f32;
+                    for ev in &i.raw.events {
+                        if let egui::Event::MouseWheel { unit, delta, .. } = ev {
+                            match unit {
+                                egui::MouseWheelUnit::Line => steps += delta.y,
+                                egui::MouseWheelUnit::Point => steps += delta.y / 60.0,
+                                egui::MouseWheelUnit::Page => steps += delta.y * 3.0,
                             }
                         }
                     }
+                    (steps, i.zoom_delta())
+                });
+
+                let mut zoom_factor = 1.0f32;
+                if scroll_steps != 0.0 {
+                    let clamped = scroll_steps.clamp(-4.0, 4.0);
+                    zoom_factor *= 1.12f32.powf(clamped);
+                }
+                if (pinch_delta - 1.0).abs() > 0.001 {
+                    zoom_factor *= pinch_delta;
                 }
 
-                ui.add_space(2.0);
+                if (zoom_factor - 1.0).abs() > 0.0005 {
+                    let old_zoom = self.canvas_zoom;
+                    let new_zoom = (old_zoom * zoom_factor).clamp(0.15, 25.0);
 
-                // 2. Transport controls, status counters, audio controls and loop
-                ui.horizontal(|ui| {
-                    let play_txt = if player.is_playing { "Pause" } else { "Play" };
-                    let play_btn = egui::Button::new(RichText::new(play_txt).size(12.0).strong().color(Color32::WHITE))
-                        .fill(if player.is_playing { ACCENT } else { CARD_HI })
-                        .stroke(Stroke::new(1.0, if player.is_playing { ACCENT_GLOW } else { LINE }))
-                        .corner_radius(6)
-                        .min_size(vec2(54.0, 28.0));
-                    if ui.add(play_btn).on_hover_text("Play / Pause (Space)").clicked() {
-                        player.toggle_play();
+                    if let Some(mouse) = resp.hover_pos() {
+                        let center = canvas_rect.center();
+                        let mouse_rel = mouse - (center + self.canvas_pan);
+                        self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
                     }
+                    self.canvas_zoom = new_zoom;
+                }
+            }
 
-                    let step_back_btn = egui::Button::new(RichText::new("< 1f").size(11.5).color(TEXT))
-                        .fill(CARD_HI)
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .min_size(vec2(36.0, 28.0));
-                    if ui.add(step_back_btn).on_hover_text("Step 1 frame back (Left Arrow)").clicked() {
-                        let prev = player.current_frame.saturating_sub(1);
-                        player.seek(prev);
-                    }
+            if resp.dragged() {
+                self.canvas_pan += resp.drag_delta();
+            }
+            if resp.double_clicked() {
+                self.canvas_zoom = 1.0;
+                self.canvas_pan = vec2(0.0, 0.0);
+            } else if resp.clicked() {
+                player.toggle_play();
+            }
 
-                    let step_fwd_btn = egui::Button::new(RichText::new("1f >").size(11.5).color(TEXT))
-                        .fill(CARD_HI)
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .min_size(vec2(36.0, 28.0));
-                    if ui.add(step_fwd_btn).on_hover_text("Step 1 frame forward (Right Arrow)").clicked() {
-                        let next = (player.current_frame + 1).min(player.frames.len().saturating_sub(1));
-                        player.seek(next);
-                    }
+            let cur_size = fit_size * self.canvas_zoom;
+            let cur_center = canvas_rect.center() + self.canvas_pan;
+            let image_rect = Rect::from_center_size(cur_center, cur_size);
 
-                    ui.add_space(6.0);
+            let p = ui.painter().with_clip_rect(canvas_rect);
+            p.rect_filled(canvas_rect, 8, Color32::from_rgb(14, 16, 22));
+            p.rect_stroke(canvas_rect, 8, Stroke::new(1.0, LINE), StrokeKind::Inside);
 
-                    let time_str = format!("{:02}:{:04.1} / {:02}:{:04.1}", (cur_sec / 60.0) as u32, cur_sec % 60.0, (tot_sec / 60.0) as u32, tot_sec % 60.0);
-                    ui.label(RichText::new(time_str).size(12.0).monospace().color(TEXT));
+            if let Some(tex) = player.current_texture(ctx) {
+                p.image(tex.id(), image_rect, FULL_UV, Color32::WHITE);
+                p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(30)), StrokeKind::Outside);
+            }
 
-                    let frame_str = format!("(frame {}/{})", cur_frame_idx + 1, total_frames);
-                    ui.label(RichText::new(frame_str).size(10.5).color(DIM));
+            ui.add_space(6.0);
 
-                    ui.label(RichText::new("• Start frame for next shot").size(10.5).color(ACCENT));
+            // ztrim Dual-Track Vegas-Style Timeline & Transport Controls
+            card(ui, |ui| {
+                ui.vertical(|ui| {
+                    let full_w = ui.available_width();
+                    let show_hint = !self.has_seen_trim_hint;
+                    let top_margin = if show_hint { 20.0 } else { 10.0 };
+                    let total_h = top_margin + 28.0;
+                    let (track_rect, scrub_resp) = ui.allocate_exact_size(vec2(full_w, total_h), Sense::click_and_drag());
+                    let p = ui.painter();
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let loop_txt = if player.loop_playback { "Loop: On" } else { "Loop: Off" };
-                        let loop_btn = egui::Button::new(
-                            RichText::new(loop_txt)
-                                .size(11.5)
-                                .strong()
-                                .color(if player.loop_playback { Color32::WHITE } else { DIM }),
-                        )
-                        .fill(if player.loop_playback { ACCENT } else { CARD_HI })
-                        .stroke(Stroke::new(1.0, if player.loop_playback { ACCENT_GLOW } else { LINE }))
-                        .corner_radius(6);
-                        if ui.add(loop_btn).clicked() {
-                            player.loop_playback = !player.loop_playback;
+                    let trim_s = player.trim_start();
+                    let trim_e = player.trim_end();
+
+                    let start_ratio = (trim_s / dur).clamp(0.0, 1.0) as f32;
+                    let end_ratio = (trim_e / dur).clamp(0.0, 1.0) as f32;
+                    let trim_x_min = track_rect.left() + track_rect.width() * start_ratio;
+                    let trim_x_max = track_rect.left() + track_rect.width() * end_ratio;
+
+                    let trim_track_y = track_rect.top() + top_margin;
+                    let trim_zone_bottom = trim_track_y + 4.0;
+                    let play_bar_top = trim_zone_bottom + 3.0;
+                    let split_y = trim_zone_bottom + 1.0;
+
+                    // 1. Playback Bar
+                    let play_track_h = 15.0;
+                    let play_track_y = play_bar_top + (track_rect.bottom() - play_bar_top) * 0.5;
+                    let play_track_bg = Rect::from_center_size(
+                        Pos2::new(track_rect.center().x, play_track_y),
+                        vec2(track_rect.width(), play_track_h),
+                    );
+                    let scrub_trimmed_color = Color32::from_rgb(82, 86, 98);
+                    let scrub_stroke_color = Color32::from_rgb(125, 131, 148);
+                    p.rect_filled(play_track_bg, 4.0, scrub_trimmed_color);
+                    p.rect_stroke(play_track_bg, 4.0, Stroke::new(1.0, scrub_stroke_color), StrokeKind::Inside);
+
+                    let play_trim_rect = Rect::from_min_max(
+                        Pos2::new(trim_x_min, play_track_y - play_track_h * 0.5),
+                        Pos2::new(trim_x_max, play_track_y + play_track_h * 0.5),
+                    );
+                    p.rect_filled(play_trim_rect, 3.0, Color32::from_rgb(37, 99, 235));
+                    p.rect_stroke(play_trim_rect, 3.0, Stroke::new(1.0, Color32::from_rgb(96, 165, 250)), StrokeKind::Inside);
+
+                    if scrub_resp.hovered() {
+                        if let Some(pos) = scrub_resp.hover_pos() {
+                            if pos.y >= play_bar_top {
+                                p.line_segment(
+                                    [Pos2::new(pos.x, play_track_bg.top() - 1.0), Pos2::new(pos.x, play_track_bg.bottom() + 1.0)],
+                                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
+                                );
+                            }
                         }
+                    }
 
-                        if let Some(ref mut audio) = player.audio {
-                            let mut vol = audio.volume;
-                            let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
-                            let v_resp = ui.add_sized([64.0, 16.0], vol_slider);
-                            if v_resp.changed() {
-                                audio.set_volume(vol);
-                            }
+                    // 2. Trim Bar
+                    p.line_segment(
+                        [Pos2::new(track_rect.left(), trim_track_y), Pos2::new(track_rect.right(), trim_track_y)],
+                        Stroke::new(1.0, Color32::from_rgb(46, 46, 52)),
+                    );
+                    p.line_segment(
+                        [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_max, trim_track_y)],
+                        Stroke::new(3.0, ACCENT),
+                    );
 
-                            let mute_txt = if audio.is_muted || audio.volume == 0.0 { "Unmute" } else { "Mute" };
-                            let mute_btn = egui::Button::new(RichText::new(mute_txt).size(11.5).color(TEXT))
-                                .fill(CARD_HI)
-                                .stroke(Stroke::new(1.0, LINE))
-                                .corner_radius(6);
-                            if ui.add(mute_btn).on_hover_text("Mute / Unmute audio").clicked() {
-                                audio.toggle_mute();
+                    let tab_size = 6.0;
+                    let start_tri = vec![
+                        Pos2::new(trim_x_min - tab_size, trim_track_y - 7.0),
+                        Pos2::new(trim_x_min + tab_size, trim_track_y - 7.0),
+                        Pos2::new(trim_x_min, trim_track_y),
+                    ];
+                    p.add(egui::Shape::convex_polygon(start_tri, BLUE, Stroke::new(1.0, Color32::WHITE)));
+                    p.line_segment(
+                        [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_min, track_rect.bottom())],
+                        Stroke::new(1.5, BLUE),
+                    );
+
+                    let (is_end_trim_flashing_red, should_repaint) =
+                        is_end_trim_flashing_red_at(self.end_trim_error_flash_start, Instant::now());
+                    if should_repaint {
+                        ui.ctx().request_repaint();
+                    } else if self.end_trim_error_flash_start.is_some() {
+                        self.end_trim_error_flash_start = None;
+                    }
+
+                    let end_tri = vec![
+                        Pos2::new(trim_x_max - tab_size, trim_track_y - 7.0),
+                        Pos2::new(trim_x_max + tab_size, trim_track_y - 7.0),
+                        Pos2::new(trim_x_max, trim_track_y),
+                    ];
+                    let end_marker_color = if is_end_trim_flashing_red { Color32::from_rgb(255, 60, 60) } else { AMBER };
+                    let end_tab_stroke = Stroke::new(if is_end_trim_flashing_red { 1.5 } else { 1.0 }, Color32::WHITE);
+                    let end_line_stroke = if is_end_trim_flashing_red {
+                        Stroke::new(2.5, Color32::from_rgb(255, 60, 60))
+                    } else {
+                        Stroke::new(1.5, AMBER)
+                    };
+                    p.add(egui::Shape::convex_polygon(end_tri, end_marker_color, end_tab_stroke));
+                    p.line_segment(
+                        [Pos2::new(trim_x_max, trim_track_y), Pos2::new(trim_x_max, track_rect.bottom())],
+                        end_line_stroke,
+                    );
+
+                    // 3. Playhead
+                    let cur_ratio = (cur_s / dur).clamp(0.0, 1.0) as f32;
+                    let playhead_x = track_rect.left() + track_rect.width() * cur_ratio;
+                    let marker_cap = vec![
+                        Pos2::new(playhead_x - 4.5, play_track_bg.top() - 4.0),
+                        Pos2::new(playhead_x + 4.5, play_track_bg.top() - 4.0),
+                        Pos2::new(playhead_x, play_track_bg.top()),
+                    ];
+                    p.add(egui::Shape::convex_polygon(marker_cap, Color32::WHITE, Stroke::NONE));
+                    p.line_segment(
+                        [Pos2::new(playhead_x, play_track_bg.top() - 4.0), Pos2::new(playhead_x, play_track_bg.bottom() + 2.0)],
+                        Stroke::new(2.0, Color32::WHITE),
+                    );
+
+                    // 4. Onboarding Badges
+                    if show_hint {
+                        let mut l_badge_center_x = trim_x_min.clamp(track_rect.left() + 48.0, track_rect.right() - 48.0);
+                        let mut r_badge_center_x = trim_x_max.clamp(track_rect.left() + 48.0, track_rect.right() - 48.0);
+                        if (r_badge_center_x - l_badge_center_x).abs() < 98.0 {
+                            if l_badge_center_x > track_rect.left() + 52.0 {
+                                l_badge_center_x -= 24.0;
                             }
-                            ui.label(RichText::new("Vol:").size(10.5).color(DIM));
+                            if r_badge_center_x < track_rect.right() - 52.0 {
+                                r_badge_center_x += 24.0;
+                            }
+                        }
+                        let badge_y = track_rect.top() + 8.0;
+                        let l_badge_rect = Rect::from_center_size(Pos2::new(l_badge_center_x, badge_y), vec2(90.0, 15.0));
+                        p.rect_filled(l_badge_rect, 3.0, Color32::from_rgb(18, 25, 45));
+                        p.rect_stroke(l_badge_rect, 3.0, Stroke::new(1.0, BLUE), StrokeKind::Inside);
+                        p.text(l_badge_rect.center(), egui::Align2::CENTER_CENTER, "L-Click: Start", egui::FontId::proportional(10.0), TEXT);
+
+                        let r_badge_rect = Rect::from_center_size(Pos2::new(r_badge_center_x, badge_y), vec2(90.0, 15.0));
+                        p.rect_filled(r_badge_rect, 3.0, Color32::from_rgb(42, 32, 18));
+                        p.rect_stroke(r_badge_rect, 3.0, Stroke::new(1.0, AMBER), StrokeKind::Inside);
+                        p.text(r_badge_rect.center(), egui::Align2::CENTER_CENTER, "R-Click: End", egui::FontId::proportional(10.0), TEXT);
+                    }
+
+                    let is_drag_stopped = scrub_resp.drag_stopped()
+                        || scrub_resp.drag_stopped_by(egui::PointerButton::Secondary)
+                        || !ui.input(|i| i.pointer.primary_down() || i.pointer.secondary_down());
+                    if is_drag_stopped {
+                        if self.active_timeline_drag == TimelineDrag::Playhead {
+                            if self.was_playing_before_scrub {
+                                self.was_playing_before_scrub = false;
+                                player.is_playing = true;
+                                player.seek_to_time(player.current_sec);
+                            } else if self.timeline_drag_occurred && !player.is_playing {
+                                player.seek_to_time(player.current_sec);
+                            }
+                        } else if self.active_timeline_drag == TimelineDrag::TrimStart
+                            || self.active_timeline_drag == TimelineDrag::TrimEnd
+                        {
+                            if let Some(initial) = self.trim_drag_initial.take() {
+                                let current = TrimStateSnapshot {
+                                    start: player.trim_start_sec,
+                                    end: player.trim_end_sec,
+                                };
+                                if current != initial {
+                                    pending_undo_snapshot = Some(initial);
+                                }
+                            }
+                        }
+                        self.active_timeline_drag = TimelineDrag::None;
+                        self.timeline_drag_occurred = false;
+                    }
+
+                    let right_clicked = scrub_resp.secondary_clicked()
+                        || scrub_resp.drag_started_by(egui::PointerButton::Secondary)
+                        || (scrub_resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary) || i.pointer.button_clicked(egui::PointerButton::Secondary)));
+
+                    if right_clicked {
+                        let origin_pos = ui.input(|i| i.pointer.press_origin())
+                            .or_else(|| scrub_resp.interact_pointer_pos())
+                            .or_else(|| scrub_resp.hover_pos())
+                            .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+
+                        if let Some(pos) = origin_pos {
+                            if pos.y < split_y {
+                                let rel = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0) as f64;
+                                let clicked_sec = rel * dur;
+                                match evaluate_trim_click(true, pos.x, trim_x_min, trim_x_max, clicked_sec, player.trim_start(), player.trim_end(), dur) {
+                                    TrimClickDecision::BlockRightClickFlashRed => {
+                                        self.end_trim_error_flash_start = Some(Instant::now());
+                                        ui.ctx().request_repaint();
+                                        self.status = "Blocked: Right-click moves End Trim only (minimum trim reached)".into();
+                                    }
+                                    TrimClickDecision::SetEndTrim(new_e) => {
+                                        self.trim_drag_initial = Some(TrimStateSnapshot {
+                                            start: player.trim_start_sec,
+                                            end: player.trim_end_sec,
+                                        });
+                                        player.trim_end_sec = Some(new_e);
+                                        self.active_timeline_drag = TimelineDrag::TrimEnd;
+                                        player.seek_to_time(new_e);
+                                        interacted_with_trim = true;
+                                    }
+                                    TrimClickDecision::SetStartTrim(_) => {}
+                                }
+                            }
+                        }
+                    }
+
+                    let left_clicked = scrub_resp.clicked()
+                        || scrub_resp.drag_started()
+                        || (scrub_resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary) || i.pointer.button_clicked(egui::PointerButton::Primary)));
+
+                    if !right_clicked && self.active_timeline_drag == TimelineDrag::None && left_clicked {
+                        let origin_pos = ui.input(|i| i.pointer.press_origin())
+                            .or_else(|| scrub_resp.interact_pointer_pos())
+                            .or_else(|| scrub_resp.hover_pos())
+                            .or_else(|| ui.input(|i| i.pointer.latest_pos()));
+
+                        if let Some(pos) = origin_pos {
+                            let rel = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0) as f64;
+                            let target_sec = rel * dur;
+
+                            if pos.y < split_y {
+                                self.trim_drag_initial = Some(TrimStateSnapshot {
+                                    start: player.trim_start_sec,
+                                    end: player.trim_end_sec,
+                                });
+                                match evaluate_trim_click(false, pos.x, trim_x_min, trim_x_max, target_sec, player.trim_start(), player.trim_end(), dur) {
+                                    TrimClickDecision::SetEndTrim(new_e) => {
+                                        player.trim_end_sec = Some(new_e);
+                                        self.active_timeline_drag = TimelineDrag::TrimEnd;
+                                        player.seek_to_time(new_e);
+                                        interacted_with_trim = true;
+                                    }
+                                    TrimClickDecision::SetStartTrim(new_s) => {
+                                        player.trim_start_sec = Some(new_s);
+                                        self.active_timeline_drag = TimelineDrag::TrimStart;
+                                        player.seek_to_time(new_s);
+                                        interacted_with_trim = true;
+                                    }
+                                    TrimClickDecision::BlockRightClickFlashRed => {}
+                                }
+                            } else {
+                                self.active_timeline_drag = TimelineDrag::Playhead;
+                                self.timeline_drag_occurred = false;
+                                if player.is_playing {
+                                    if scrub_resp.drag_started() {
+                                        self.was_playing_before_scrub = true;
+                                        player.pause();
+                                        player.scrub_to_time(target_sec, true);
+                                    } else {
+                                        self.was_playing_before_scrub = false;
+                                        player.seek_to_time(target_sec);
+                                    }
+                                } else {
+                                    self.was_playing_before_scrub = false;
+                                    player.seek_to_time(target_sec);
+                                }
+                            }
+                        }
+                    }
+
+                    let is_dragged = scrub_resp.dragged()
+                        || scrub_resp.dragged_by(egui::PointerButton::Secondary)
+                        || (self.active_timeline_drag != TimelineDrag::None && ui.input(|i| i.pointer.primary_down() || i.pointer.secondary_down()));
+
+                    if is_dragged {
+                        if let Some(pos) = scrub_resp.interact_pointer_pos().or_else(|| scrub_resp.hover_pos()).or_else(|| ui.input(|i| i.pointer.latest_pos())) {
+                            let rel = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0) as f64;
+                            let target_sec = rel * dur;
+                            match self.active_timeline_drag {
+                                TimelineDrag::TrimStart => {
+                                    self.timeline_drag_occurred = true;
+                                    let end_s = player.trim_end();
+                                    let new_s = target_sec.clamp(0.0, (end_s - 0.05).max(0.0));
+                                    player.trim_start_sec = Some(new_s);
+                                    player.scrub_to_time(new_s, false);
+                                    interacted_with_trim = true;
+                                }
+                                TimelineDrag::TrimEnd => {
+                                    self.timeline_drag_occurred = true;
+                                    let start_s = player.trim_start();
+                                    let new_e = target_sec.clamp((start_s + 0.05).min(dur), dur);
+                                    player.trim_end_sec = Some(new_e);
+                                    player.scrub_to_time(new_e, false);
+                                    interacted_with_trim = true;
+                                }
+                                TimelineDrag::Playhead => {
+                                    self.timeline_drag_occurred = true;
+                                    if player.is_playing {
+                                        self.was_playing_before_scrub = true;
+                                        player.pause();
+                                    }
+                                    player.scrub_to_time(target_sec, self.was_playing_before_scrub);
+                                }
+                                TimelineDrag::None => {}
+                            }
+                        }
+                    }
+
+                    ui.add_space(3.0);
+
+                    // Transport Controls Row with drawn SVG Play/Pause button
+                    ui.horizontal(|ui| {
+                        let is_playing = player.is_playing;
+                        let (play_rect, play_resp) = ui.allocate_exact_size(vec2(48.0, 26.0), Sense::click());
+                        if play_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if play_resp.clicked() {
+                            player.toggle_play();
+                        }
+                        let play_resp = play_resp.on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" });
+
+                        let is_pressed = play_resp.is_pointer_button_down_on();
+                        let is_hovered = play_resp.hovered();
+                        let bg = if is_playing {
+                            if is_pressed {
+                                Color32::from_rgb(109, 40, 217)
+                            } else if is_hovered {
+                                Color32::from_rgb(139, 92, 246)
+                            } else {
+                                ACCENT
+                            }
+                        } else if is_pressed {
+                            Color32::from_rgb(26, 28, 34)
+                        } else if is_hovered {
+                            Color32::from_rgb(46, 50, 60)
                         } else {
-                            ui.label(RichText::new("No Audio").size(10.5).color(DIM));
+                            CARD_HI
+                        };
+                        let border = if is_hovered {
+                            Stroke::new(1.0, if is_playing { Color32::from_rgb(196, 181, 253) } else { Color32::from_rgb(90, 95, 110) })
+                        } else {
+                            Stroke::new(1.0, LINE)
+                        };
+                        let pp = ui.painter();
+                        pp.rect_filled(play_rect, 6.0, bg);
+                        pp.rect_stroke(play_rect, 6.0, border, StrokeKind::Inside);
+                        if is_playing {
+                            draw_pause_icon(pp, play_rect.center(), Color32::WHITE);
+                        } else {
+                            draw_play_icon(pp, play_rect.center(), Color32::WHITE);
                         }
+
+                        if ui.button("< 1f").on_hover_text("Step 1 frame back (Left Arrow)").clicked() {
+                            player.step_frames(-1);
+                        }
+                        if ui.button("1f >").on_hover_text("Step 1 frame forward (Right Arrow)").clicked() {
+                            player.step_frames(1);
+                        }
+
+                        ui.add_space(4.0);
+                        if ui.button("[ Set Start (I)").clicked() {
+                            let snap = TrimStateSnapshot {
+                                start: player.trim_start_sec,
+                                end: player.trim_end_sec,
+                            };
+                            player.set_trim_start_to_current();
+                            if player.trim_start_sec != snap.start {
+                                pending_undo_snapshot = Some(snap);
+                                interacted_with_trim = true;
+                            }
+                        }
+                        if ui.button("Set End (O) ]").clicked() {
+                            let snap = TrimStateSnapshot {
+                                start: player.trim_start_sec,
+                                end: player.trim_end_sec,
+                            };
+                            player.set_trim_end_to_current();
+                            if player.trim_end_sec != snap.end {
+                                pending_undo_snapshot = Some(snap);
+                                interacted_with_trim = true;
+                            }
+                        }
+                        if player.has_custom_trim() && ui.button("Reset Trim").clicked() {
+                            let snap = TrimStateSnapshot {
+                                start: player.trim_start_sec,
+                                end: player.trim_end_sec,
+                            };
+                            player.reset_trim();
+                            pending_undo_snapshot = Some(snap);
+                            self.end_trim_error_flash_start = None;
+                        }
+
+                        ui.add_space(6.0);
+                        let time_str = format!(
+                            "{:02}:{:04.1} / {:02}:{:04.1}",
+                            (cur_s / 60.0) as u32, cur_s % 60.0,
+                            (dur / 60.0) as u32, dur % 60.0
+                        );
+                        ui.label(RichText::new(time_str).size(12.0).monospace().color(TEXT));
+
+                        if player.has_custom_trim() {
+                            let trimmed_len = player.trimmed_duration();
+                            let pct_saved = ((1.0 - (trimmed_len / dur)) * 100.0).clamp(0.0, 100.0);
+                            let cut_info = format!("Trim: {:.1}s (-{:.0}%)", trimmed_len, pct_saved);
+                            ui.label(RichText::new(cut_info).size(11.0).color(GREEN));
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let loop_txt = if player.loop_playback { "Loop: On" } else { "Loop: Off" };
+                            let loop_btn = egui::Button::new(
+                                RichText::new(loop_txt)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(if player.loop_playback { Color32::WHITE } else { DIM }),
+                            )
+                            .fill(if player.loop_playback { ACCENT } else { CARD_HI })
+                            .stroke(Stroke::new(1.0, if player.loop_playback { ACCENT_GLOW } else { LINE }))
+                            .corner_radius(6);
+                            if ui.add(loop_btn).clicked() {
+                                player.loop_playback = !player.loop_playback;
+                            }
+
+                            if let Some(ref mut audio) = player.audio {
+                                let mut vol = audio.volume;
+                                let vol_slider = egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false);
+                                if ui.add_sized([64.0, 16.0], vol_slider).changed() {
+                                    audio.set_volume(vol);
+                                }
+                                let mute_txt = if audio.is_muted || audio.volume == 0.0 { "Unmute" } else { "Mute" };
+                                if ui.button(mute_txt).on_hover_text("Mute / Unmute audio").clicked() {
+                                    audio.toggle_mute();
+                                }
+                                ui.label(RichText::new("Vol:").size(10.5).color(DIM));
+                            } else {
+                                ui.label(RichText::new("No Audio").size(10.5).color(DIM));
+                            }
+                        });
                     });
                 });
             });
-        });
+        }
+
+        if let Some(snap) = pending_undo_snapshot {
+            self.record_trim_undo(snap);
+        }
+        if interacted_with_trim && !self.has_seen_trim_hint {
+            self.has_seen_trim_hint = true;
+        }
 
         if close_video {
             self.video_player = None;
             return;
         }
 
+        if trigger_trim {
+            self.trigger_trim_and_compress();
+        }
+
         if save_video {
-            let filename = player.filename.clone();
-            let mp4_data = player.mp4_bytes.clone();
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name(&filename)
-                .add_filter("MP4 Video", &["mp4"])
-                .save_file()
-            {
-                if let Err(e) = std::fs::write(&path, &mp4_data) {
-                    self.error = Some(format!("Could not save MP4: {e}"));
+            if let Some(ref player) = self.video_player {
+                let filename = player.filename.clone();
+                let mp4_data = player.mp4_bytes.clone().or_else(|| std::fs::read(&player.file_path).ok());
+                if let Some(mp4_data) = mp4_data {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(&filename)
+                        .add_filter("MP4 Video", &["mp4"])
+                        .save_file()
+                    {
+                        if let Err(e) = std::fs::write(&path, &mp4_data) {
+                            self.error = Some(format!("Could not save MP4: {e}"));
+                        }
+                    }
                 }
             }
         }
 
         if extract_frame {
-            let cur_img = player.frames[player.current_frame.min(player.frames.len() - 1)].clone();
-            let [f_w, f_h] = cur_img.size;
-            let mut png_bytes = Vec::new();
-            if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
-                let _ = image::DynamicImage::ImageRgba8(rgba)
-                    .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+            let extracted = self
+                .video_player
+                .as_ref()
+                .and_then(|p| p.current_image.as_ref().map(|ci| (ci.clone(), p.current_sec)));
+            if let Some((cur_img, cur_sec)) = extracted {
+                let [f_w, f_h] = cur_img.size;
+                let mut png_bytes = Vec::new();
+                if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
+                    let _ = image::DynamicImage::ImageRgba8(rgba)
+                        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+                }
+                let id = self.next_node_id;
+                self.next_node_id += 1;
+                let tex = ctx.load_texture(format!("extracted_frame_{id}"), cur_img, egui::TextureOptions::LINEAR);
+                let node = HistoryNode {
+                    id,
+                    parent_id: self.active_node_id,
+                    label: format!("Video Frame {:.1}s", cur_sec),
+                    prompt: self.prompt.clone(),
+                    png: png_bytes,
+                    tex,
+                    width: f_w as u32,
+                    height: f_h as u32,
+                    step_num: self.active_node().map(|n| n.step_num + 1).unwrap_or(0),
+                    output_filename: String::new(),
+                    output_subfolder: String::new(),
+                    temp_files: Vec::new(),
+                    mp4_bytes: None,
+                };
+                self.nodes.push(node);
+                self.select_node(id);
+                self.mode = StudioMode::Image;
+                self.video_player = None;
             }
-            let id = self.next_node_id;
-            self.next_node_id += 1;
-            let tex = ctx.load_texture(format!("extracted_frame_{id}"), cur_img, egui::TextureOptions::LINEAR);
-            let node = HistoryNode {
-                id,
-                parent_id: self.active_node_id,
-                label: format!("Video Frame {}", player.current_frame + 1),
-                prompt: self.prompt.clone(),
-                png: png_bytes,
-                tex,
-                width: f_w as u32,
-                height: f_h as u32,
-                step_num: self.active_node().map(|n| n.step_num + 1).unwrap_or(0),
-                output_filename: String::new(),
-                output_subfolder: String::new(),
-                temp_files: Vec::new(),
-                mp4_bytes: None,
-            };
-            self.nodes.push(node);
-            self.select_node(id);
-            self.mode = StudioMode::Image;
-            self.video_player = None;
         }
     }
 
@@ -4199,11 +5382,7 @@ fn is_win_ctrl_v() -> bool {
                                 .fill(ACCENT)
                                 .min_size(vec2(180.0, 32.0));
                             if ui.add(dl_btn).clicked() {
-                                self.sh.dl_video_model.store(true, Ordering::SeqCst);
-                                let mut cfg = self.sh.cfg.lock().unwrap();
-                                cfg.dl_video_model = true;
-                                cfg.save();
-                                self.sh.retry.store(true, Ordering::SeqCst);
+                                engine::toggle_model_download(&self.sh, ctx, false, true);
                                 should_close = true;
                             }
                             let cancel_btn = egui::Button::new("Not Now").min_size(vec2(80.0, 32.0));
@@ -4294,6 +5473,7 @@ impl eframe::App for App {
         if self.show_video_dl_modal {
             self.video_dl_window(&ctx);
         }
+        self.new_video_preset_modal(&ctx);
         self.download_pane.show(&ctx, &self.sh);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -4301,10 +5481,10 @@ impl eframe::App for App {
             let r = ctx.content_rect();
             painter.rect_filled(r, 0, Color32::from_rgba_unmultiplied(12, 14, 19, 215));
             painter.rect_stroke(r.shrink(18.0), 16, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
-            let msg = if self.active_node().is_none() {
-                "Drop image here to load onto canvas"
+            let msg = if self.active_node().is_none() || self.mode == StudioMode::Video {
+                "Drop image or video here to load"
             } else {
-                "Drop images to add as references"
+                "Drop images to add as references (or drop a video to play)"
             };
             painter.text(r.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(22.0), TEXT);
         }

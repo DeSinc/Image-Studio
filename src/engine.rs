@@ -343,6 +343,18 @@ pub enum EngState {
     Failed(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct ModelDownloadProgress {
+    pub current_file: String,
+    pub file_index: usize,
+    pub total_files: usize,
+    pub file_progress: f32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_mb: f32,
+    pub overall_progress: f32,
+}
+
 #[derive(Default, Clone)]
 pub struct Paths {
     pub comfy: Option<PathBuf>,
@@ -354,6 +366,8 @@ pub struct Shared {
     pub state: Mutex<EngState>,
     pub paths: Mutex<Paths>,
     pub models_found: Mutex<Vec<(String, bool)>>,
+    pub model_dl_progress: Mutex<Option<ModelDownloadProgress>>,
+    pub model_dl_running: AtomicBool,
     pub restart: AtomicBool,
     pub retry: AtomicBool,
     pub clean_engine: AtomicBool,
@@ -380,6 +394,8 @@ impl Shared {
             state: Mutex::new(EngState::Detecting),
             paths: Mutex::new(Paths::default()),
             models_found: Mutex::new(vec![]),
+            model_dl_progress: Mutex::new(None),
+            model_dl_running: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             retry: AtomicBool::new(false),
             clean_engine: AtomicBool::new(false),
@@ -543,6 +559,16 @@ pub fn repair_environment(sh: Arc<Shared>, ctx: eframe::egui::Context) {
             }
         };
 
+        {
+            let cfg = sh.cfg.lock().unwrap().clone();
+            let models_dir = find_models(&cfg, &comfy);
+            let mut p = sh.paths.lock().unwrap();
+            if p.models.as_os_str().is_empty() {
+                p.models = models_dir;
+            }
+        }
+        spawn_model_downloads_if_needed(&sh, &ctx);
+
         match install_or_repair_dependencies(&py, &comfy, &sh, &ctx) {
             Ok(()) => {
                 log("repair: dependencies installed successfully; restarting supervisor");
@@ -596,7 +622,7 @@ pub fn install_or_repair_dependencies(
         let (torch_args, torch_desc) = match vendor_name {
             "AMD" => (
                 vec!["install", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/rocm6.2"],
-                "PyTorch (ROCm 6.2 for AMD)",
+                "PyTorch (ROCm 6.2)",
             ),
             "Intel" => (
                 vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cpu"],
@@ -604,26 +630,16 @@ pub fn install_or_repair_dependencies(
             ),
             _ => (
                 vec!["install", "torch", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu124"],
-                "PyTorch (CUDA 12.4 for NVIDIA)",
+                "PyTorch (CUDA 12.4)",
             ),
         };
 
-        *sh.state.lock().unwrap() = EngState::RepairingEngine {
-            step: format!("Installing {torch_desc}..."),
-        };
-        ctx.request_repaint();
+        let base_step = format!("Installing {torch_desc} (may take several min)");
         log(&format!("repair: installing {torch_desc} via pip"));
 
-        let mut cmd = Command::new(py);
-        cmd.args(["-m", "pip"])
-            .args(&torch_args)
-            .current_dir(comfy)
-            .creation_flags(CREATE_NO_WINDOW);
-
-        let out = cmd.output().map_err(|e| format!("Failed to spawn pip for PyTorch: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let out_txt = String::from_utf8_lossy(&out.stdout);
+        let (ok, out_txt, err) = run_pip_with_progress(py, comfy, &torch_args, &base_step, sh, ctx)
+            .map_err(|e| format!("Failed to spawn pip for PyTorch: {e}"))?;
+        if !ok {
             log(&format!("repair: PyTorch installation warning/error:\n{err}\n{out_txt}"));
         } else {
             log(&format!("repair: {torch_desc} installed successfully"));
@@ -631,21 +647,18 @@ pub fn install_or_repair_dependencies(
     }
 
     // Install ComfyUI requirements from PyPI
-    *sh.state.lock().unwrap() = EngState::RepairingEngine {
-        step: "Installing ComfyUI requirements and comfy-aimdo...".into(),
-    };
-    ctx.request_repaint();
     log("repair: installing ComfyUI requirements and comfy-aimdo via pip");
-
-    let mut cmd = Command::new(py);
-    cmd.args(["-m", "pip", "install", "-r", "requirements.txt", "comfy-aimdo", "aiohttp", "async-timeout"])
-        .current_dir(comfy)
-        .creation_flags(CREATE_NO_WINDOW);
-
-    let out = cmd.output().map_err(|e| format!("Failed to spawn pip for requirements: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let out_txt = String::from_utf8_lossy(&out.stdout);
+    let req_args = ["install", "-r", "requirements.txt", "comfy-aimdo", "aiohttp", "async-timeout"];
+    let (ok, out_txt, err) = run_pip_with_progress(
+        py,
+        comfy,
+        &req_args,
+        "Installing ComfyUI packages & comfy-aimdo",
+        sh,
+        ctx,
+    )
+    .map_err(|e| format!("Failed to spawn pip for requirements: {e}"))?;
+    if !ok {
         log(&format!("repair: pip requirements warning/error:\n{err}\n{out_txt}"));
     } else {
         log("repair: requirements installed successfully");
@@ -660,21 +673,18 @@ pub fn install_or_repair_dependencies(
     let aimdo_ok = aimdo_probe.map(|o| o.status.success()).unwrap_or(false);
 
     if !aimdo_ok {
-        *sh.state.lock().unwrap() = EngState::RepairingEngine {
-            step: "Installing comfy-aimdo dynamic VRAM manager...".into(),
-        };
-        ctx.request_repaint();
         log("repair: installing comfy-aimdo directly via pip");
-
-        let mut cmd = Command::new(py);
-        cmd.args(["-m", "pip", "install", "--upgrade", "comfy-aimdo"])
-            .current_dir(comfy)
-            .creation_flags(CREATE_NO_WINDOW);
-
-        let out = cmd.output().map_err(|e| format!("Failed to install comfy-aimdo: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let out_txt = String::from_utf8_lossy(&out.stdout);
+        let aimdo_args = ["install", "--upgrade", "comfy-aimdo"];
+        let (ok, out_txt, err) = run_pip_with_progress(
+            py,
+            comfy,
+            &aimdo_args,
+            "Installing comfy-aimdo VRAM manager",
+            sh,
+            ctx,
+        )
+        .map_err(|e| format!("Failed to install comfy-aimdo: {e}"))?;
+        if !ok {
             log(&format!("repair: comfy-aimdo install failed:\n{err}\n{out_txt}"));
             return Err(format!("Failed to install comfy-aimdo:\n{}", if !err.is_empty() { err } else { out_txt }));
         }
@@ -699,6 +709,84 @@ pub fn install_or_repair_dependencies(
     } else {
         Err("Failed to execute verification probe.".into())
     }
+}
+
+/// Extracts a concise status summary from a `pip` output line for UI display.
+fn summarize_pip_line(line: &str) -> Option<String> {
+    let t = line.trim();
+    if let Some(rest) = t.strip_prefix("Downloading ") {
+        let pkg = rest.split_whitespace().next().unwrap_or(rest);
+        let short = pkg.rsplit('/').next().unwrap_or(pkg);
+        return Some(format!("Downloading {short}"));
+    }
+    if let Some(rest) = t.strip_prefix("Collecting ") {
+        let pkg = rest.split([' ', '>', '<', '=', ';']).next().unwrap_or(rest);
+        return Some(format!("Collecting {pkg}"));
+    }
+    if t.starts_with("Installing collected packages:") {
+        return Some("Unpacking & installing packages...".to_string());
+    }
+    if t.starts_with("Successfully installed ") {
+        return Some("Finalizing packages...".to_string());
+    }
+    None
+}
+
+/// Runs `py -m pip <args>` while streaming stdout lines into `EngState::RepairingEngine`.
+fn run_pip_with_progress(
+    py: &Path,
+    comfy: &Path,
+    args: &[&str],
+    base_desc: &str,
+    sh: &Shared,
+    ctx: &eframe::egui::Context,
+) -> std::io::Result<(bool, String, String)> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    *sh.state.lock().unwrap() = EngState::RepairingEngine {
+        step: format!("{base_desc}..."),
+    };
+    ctx.request_repaint();
+
+    let mut child = Command::new(py)
+        .args(["-m", "pip"])
+        .args(args)
+        .env("PYTHONUNBUFFERED", "1")
+        .current_dir(comfy)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+
+    let stderr_handle = child.stderr.take().map(|mut se| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = se.read_to_string(&mut s);
+            s
+        })
+    });
+
+    let mut stdout_buf = String::new();
+    if let Some(so) = child.stdout.take() {
+        let reader = BufReader::new(so);
+        let t0 = Instant::now();
+        for line in reader.lines().map_while(Result::ok) {
+            stdout_buf.push_str(&line);
+            stdout_buf.push('\n');
+            if let Some(detail) = summarize_pip_line(&line) {
+                let secs = t0.elapsed().as_secs();
+                *sh.state.lock().unwrap() = EngState::RepairingEngine {
+                    step: format!("{base_desc}: {detail} ({secs}s)"),
+                };
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    let status = child.wait()?;
+    let stderr_buf = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    Ok((status.success(), stdout_buf, stderr_buf))
 }
 
 fn detect_gpu_vendor() -> &'static str {
@@ -1539,7 +1627,7 @@ where
 }
 
 fn bootstrap_engine(
-    sh: &Shared,
+    sh: &Arc<Shared>,
     ctx: &eframe::egui::Context,
     dl_client: &reqwest::blocking::Client,
     recovering: bool,
@@ -1593,7 +1681,7 @@ fn bootstrap_engine(
                 },
                 &sh.cancel,
                 ctx,
-                Some(sh),
+                Some(sh.as_ref()),
             );
             if let Err(e) = dl_res {
                 return Err(format!("Could not acquire ComfyUI on Linux: {e}\nPlease install ComfyUI and set its path in Settings."));
@@ -1612,6 +1700,14 @@ fn bootstrap_engine(
         if !comfy_target.join("main.py").is_file() {
             return Err("ComfyUI download finished but main.py was not found. Please specify ComfyUI directory in Settings.".into());
         }
+
+        // Engine source files are downloaded; start ticked model downloads immediately while venv & deps set up
+        {
+            let cfg = sh.cfg.lock().unwrap().clone();
+            let models_dir = find_models(&cfg, &comfy_target);
+            sh.paths.lock().unwrap().models = models_dir;
+        }
+        spawn_model_downloads_if_needed(sh, ctx);
 
         // Initialize virtualenv
         *sh.state.lock().unwrap() = EngState::ExtractingEngine {
@@ -1680,12 +1776,21 @@ fn bootstrap_engine(
                 },
                 &sh.cancel,
                 ctx,
-                Some(sh),
+                Some(sh.as_ref()),
             );
             if let Err(e) = res {
                 return Err(format!("Engine download failed: {e}"));
             }
         }
+
+        // Engine archive is downloaded; start ticked model downloads immediately while extracting
+        {
+            let cfg = sh.cfg.lock().unwrap().clone();
+            let expected_comfy = engine_dir.join("ComfyUI_windows_portable/ComfyUI");
+            let models_dir = find_models(&cfg, &expected_comfy);
+            sh.paths.lock().unwrap().models = models_dir;
+        }
+        spawn_model_downloads_if_needed(sh, ctx);
 
         *sh.state.lock().unwrap() = EngState::ExtractingEngine {
             step: format!("Extracting ComfyUI Portable ({vendor_name}) components..."),
@@ -1808,15 +1913,19 @@ fn bootstrap_models(
                 } else {
                     f_prog
                 };
-                *sh.state.lock().unwrap() = EngState::ModelDownloadPaused {
-                    current_file: cur_file.clone(),
-                    file_index: cur_idx,
-                    total_files,
-                    file_progress: f_prog,
-                    bytes_done: part_len,
-                    bytes_total: file_expected,
-                    overall_progress: overall,
-                };
+                set_model_dl_state(
+                    sh,
+                    None,
+                    Some(EngState::ModelDownloadPaused {
+                        current_file: cur_file.clone(),
+                        file_index: cur_idx,
+                        total_files,
+                        file_progress: f_prog,
+                        bytes_done: part_len,
+                        bytes_total: file_expected,
+                        overall_progress: overall,
+                    }),
+                );
                 ctx.request_repaint();
                 return Ok(());
             }
@@ -1873,16 +1982,29 @@ fn bootstrap_models(
                         } else {
                             f_prog
                         };
-                        *sh.state.lock().unwrap() = EngState::DownloadingModels {
-                            current_file: cur_file.clone(),
-                            file_index: cur_idx,
-                            total_files,
-                            file_progress: f_prog,
-                            bytes_done: done,
-                            bytes_total: total,
-                            speed_mb: speed,
-                            overall_progress: overall,
-                        };
+                        set_model_dl_state(
+                            sh,
+                            Some(ModelDownloadProgress {
+                                current_file: cur_file.clone(),
+                                file_index: cur_idx,
+                                total_files,
+                                file_progress: f_prog,
+                                bytes_done: done,
+                                bytes_total: total,
+                                speed_mb: speed,
+                                overall_progress: overall,
+                            }),
+                            Some(EngState::DownloadingModels {
+                                current_file: cur_file.clone(),
+                                file_index: cur_idx,
+                                total_files,
+                                file_progress: f_prog,
+                                bytes_done: done,
+                                bytes_total: total,
+                                speed_mb: speed,
+                                overall_progress: overall,
+                            }),
+                        );
                     },
                     cancel_ref,
                     ctx,
@@ -1918,15 +2040,19 @@ fn bootstrap_models(
                 } else {
                     f_prog
                 };
-                *sh.state.lock().unwrap() = EngState::ModelDownloadPaused {
-                    current_file: cur_file.clone(),
-                    file_index: cur_idx,
-                    total_files,
-                    file_progress: f_prog,
-                    bytes_done: part_len,
-                    bytes_total: file_expected,
-                    overall_progress: overall,
-                };
+                set_model_dl_state(
+                    sh,
+                    None,
+                    Some(EngState::ModelDownloadPaused {
+                        current_file: cur_file.clone(),
+                        file_index: cur_idx,
+                        total_files,
+                        file_progress: f_prog,
+                        bytes_done: part_len,
+                        bytes_total: file_expected,
+                        overall_progress: overall,
+                    }),
+                );
                 ctx.request_repaint();
                 return Ok(());
             }
@@ -1948,6 +2074,11 @@ fn bootstrap_models(
             }
 
             completed_bytes += file_expected;
+            *sh.models_found.lock().unwrap() = profile
+                .models
+                .iter()
+                .map(|pm| (pm.filename.clone(), current_models_dir.join(&pm.category).join(&pm.filename).exists()))
+                .collect();
         }
 
         if sh.download_paused.load(Ordering::SeqCst) {
@@ -1959,22 +2090,152 @@ fn bootstrap_models(
         }
     }
 
+    *sh.model_dl_progress.lock().unwrap() = None;
     Ok(())
+}
+
+fn build_dl_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(7200))
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .no_proxy()
+        .http1_only()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .build()
+        .unwrap()
+}
+
+fn set_model_dl_state(sh: &Shared, progress: Option<ModelDownloadProgress>, eng_state: Option<EngState>) {
+    *sh.model_dl_progress.lock().unwrap() = progress;
+    if let Some(new_st) = eng_state {
+        let mut st = sh.state.lock().unwrap();
+        let engine_busy_or_ready = matches!(
+            *st,
+            EngState::DownloadingEngine { .. }
+                | EngState::ExtractingEngine { .. }
+                | EngState::RepairingEngine { .. }
+                | EngState::Starting { .. }
+                | EngState::Ready { .. }
+                | EngState::Failed(_)
+        );
+        if !engine_busy_or_ready {
+            *st = new_st;
+        }
+    }
+}
+
+struct ModelDlRunningGuard(Arc<Shared>);
+impl Drop for ModelDlRunningGuard {
+    fn drop(&mut self) {
+        self.0.model_dl_running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Spawns a background model downloader thread if any ticked models are missing and no
+/// model download worker is currently active. Safe to call during engine extraction/repair.
+pub fn spawn_model_downloads_if_needed(sh: &Arc<Shared>, ctx: &eframe::egui::Context) {
+    if sh.download_paused.load(Ordering::SeqCst) {
+        return;
+    }
+    if Profile::missing_models(sh).is_empty() {
+        return;
+    }
+    if is_metered_connection() && !sh.metered_allowed.load(Ordering::SeqCst) && !sh.download_confirmed.load(Ordering::SeqCst) {
+        return;
+    }
+    if sh.model_dl_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return;
+    }
+
+    let sh = sh.clone();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _guard = ModelDlRunningGuard(sh.clone());
+        sh.cancel_model_dl.store(false, Ordering::SeqCst);
+
+        let models_dir = sh
+            .pending_models_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| sh.paths.lock().unwrap().models.clone());
+        let profile = sh.active_profile.lock().unwrap().clone();
+        let dl_client = build_dl_client();
+
+        match bootstrap_models(&sh, &ctx, &dl_client, &models_dir, &profile) {
+            Ok(()) => {
+                *sh.model_dl_progress.lock().unwrap() = None;
+                let cur_dir = sh
+                    .pending_models_dir
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| sh.paths.lock().unwrap().models.clone());
+                *sh.models_found.lock().unwrap() = profile
+                    .models
+                    .iter()
+                    .map(|m| (m.filename.clone(), cur_dir.join(&m.category).join(&m.filename).exists()))
+                    .collect();
+            }
+            Err((file, e)) => {
+                set_model_dl_state(
+                    &sh,
+                    None,
+                    Some(EngState::ModelDownloadFailed {
+                        current_file: file,
+                        error: e,
+                    }),
+                );
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+pub fn toggle_model_download(sh: &Arc<Shared>, ctx: &eframe::egui::Context, is_image: bool, enabled: bool) {
+    if is_image {
+        sh.dl_image_model.store(enabled, Ordering::SeqCst);
+    } else {
+        sh.dl_video_model.store(enabled, Ordering::SeqCst);
+    }
+    {
+        let mut cfg = sh.cfg.lock().unwrap();
+        if is_image {
+            cfg.dl_image_model = enabled;
+        } else {
+            cfg.dl_video_model = enabled;
+        }
+        cfg.save();
+    }
+    if !enabled {
+        let dl_active = sh.model_dl_running.load(Ordering::SeqCst)
+            || matches!(*sh.state.lock().unwrap(), EngState::DownloadingModels { .. });
+        if dl_active {
+            sh.cancel_model_dl.store(true, Ordering::SeqCst);
+        }
+        if !sh.dl_image_model.load(Ordering::SeqCst) && !sh.dl_video_model.load(Ordering::SeqCst) {
+            *sh.model_dl_progress.lock().unwrap() = None;
+            let mut st = sh.state.lock().unwrap();
+            if matches!(*st, EngState::DownloadingModels { .. } | EngState::ModelDownloadPaused { .. }) {
+                *st = EngState::Detecting;
+            }
+        }
+    } else {
+        sh.cancel_model_dl.store(false, Ordering::SeqCst);
+        sh.download_paused.store(false, Ordering::SeqCst);
+        let paths = sh.paths.lock().unwrap().clone();
+        if !paths.models.as_os_str().is_empty() {
+            spawn_model_downloads_if_needed(sh, ctx);
+        }
+    }
 }
 
 
 pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let ping_client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(3500)).build().unwrap();
-        let dl_client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(7200))
-            .connect_timeout(Duration::from_secs(30))
-            .tcp_nodelay(true)
-            .no_proxy()
-            .http1_only()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-            .build()
-            .unwrap();
+        let dl_client = build_dl_client();
 
         let mut child: Option<Child> = None;
         let mut attempt = 0usize;
@@ -2078,47 +2339,23 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 *sh.paths.lock().unwrap() = Paths { comfy: Some(cd.clone()), python: pys.first().cloned(), models: models.clone() };
             }
 
-            // 3. Are all profile models present? (requires confirmation if on metered connection)
+            // 3. Start ticked model downloads in background (requires confirmation if on metered connection)
             let missing_models = Profile::missing_models(&sh);
-            if !missing_models.is_empty() && is_metered_connection() && !sh.metered_allowed.load(Ordering::SeqCst) && !sh.download_confirmed.load(Ordering::SeqCst) {
-                *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
-                ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-
-            match bootstrap_models(&sh, &ctx, &dl_client, &models, &profile) {
-                Ok(()) => {
-                    *sh.models_found.lock().unwrap() = profile
-                        .models
-                        .iter()
-                        .map(|m| (m.filename.clone(), models.join(&m.category).join(&m.filename).exists()))
-                        .collect();
-                }
-                Err((file, e)) => {
-                    failed = true;
-                    *sh.state.lock().unwrap() = EngState::ModelDownloadFailed {
-                        current_file: file,
-                        error: e,
-                    };
+            if !missing_models.is_empty() {
+                if is_metered_connection() && !sh.metered_allowed.load(Ordering::SeqCst) && !sh.download_confirmed.load(Ordering::SeqCst) {
+                    *sh.state.lock().unwrap() = EngState::AwaitingDownloadConfirmation { metered: true };
                     ctx.request_repaint();
-                    std::thread::sleep(Duration::from_millis(600));
+                    std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
+                spawn_model_downloads_if_needed(&sh, &ctx);
             }
 
-            if sh.download_paused.load(Ordering::SeqCst) {
-                ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-
-            let still_missing = Profile::missing_models(&sh);
-            if !still_missing.is_empty() {
-                ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
-            }
+            *sh.models_found.lock().unwrap() = profile
+                .models
+                .iter()
+                .map(|m| (m.filename.clone(), models.join(&m.category).join(&m.filename).exists()))
+                .collect();
 
             // 4. Launch ComfyUI process
             if child.is_none() {
@@ -2491,5 +2728,84 @@ mod tests {
         assert_eq!(candidates[0], custom_py);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_set_model_dl_state_preserves_engine_setup_states() {
+        let sh = Shared::new();
+        *sh.state.lock().unwrap() = EngState::RepairingEngine {
+            step: "Installing PyTorch...".into(),
+        };
+
+        let prog = ModelDownloadProgress {
+            current_file: "qwen.safetensors".into(),
+            file_index: 1,
+            total_files: 3,
+            file_progress: 0.4,
+            bytes_done: 400,
+            bytes_total: 1000,
+            speed_mb: 42.0,
+            overall_progress: 0.2,
+        };
+        set_model_dl_state(
+            &sh,
+            Some(prog),
+            Some(EngState::DownloadingModels {
+                current_file: "qwen.safetensors".into(),
+                file_index: 1,
+                total_files: 3,
+                file_progress: 0.4,
+                bytes_done: 400,
+                bytes_total: 1000,
+                speed_mb: 42.0,
+                overall_progress: 0.2,
+            }),
+        );
+
+        assert!(matches!(*sh.state.lock().unwrap(), EngState::RepairingEngine { .. }));
+        assert_eq!(sh.model_dl_progress.lock().unwrap().as_ref().unwrap().current_file, "qwen.safetensors");
+    }
+
+    #[test]
+    fn test_untick_image_model_with_video_unticked_cancels_cleanly() {
+        let sh = Shared::new();
+        sh.dl_image_model.store(true, Ordering::SeqCst);
+        sh.dl_video_model.store(false, Ordering::SeqCst);
+        sh.model_dl_running.store(true, Ordering::SeqCst);
+        *sh.state.lock().unwrap() = EngState::DownloadingModels {
+            current_file: "qwen.safetensors".into(),
+            file_index: 1,
+            total_files: 3,
+            file_progress: 0.1,
+            bytes_done: 100,
+            bytes_total: 1000,
+            speed_mb: 10.0,
+            overall_progress: 0.05,
+        };
+
+        let ctx = eframe::egui::Context::default();
+        toggle_model_download(&sh, &ctx, true, false);
+
+        assert!(!sh.dl_image_model.load(Ordering::SeqCst));
+        assert!(sh.cancel_model_dl.load(Ordering::SeqCst));
+        assert!(sh.model_dl_progress.lock().unwrap().is_none());
+        assert!(matches!(*sh.state.lock().unwrap(), EngState::Detecting));
+    }
+
+    #[test]
+    fn summarize_pip_line_extracts_progress() {
+        assert_eq!(
+            summarize_pip_line("Collecting torch>=2.0"),
+            Some("Collecting torch".to_string())
+        );
+        assert_eq!(
+            summarize_pip_line("  Downloading https://example.com/torch-2.6.0-cp312.whl (2.5 GB)"),
+            Some("Downloading torch-2.6.0-cp312.whl".to_string())
+        );
+        assert_eq!(
+            summarize_pip_line("Installing collected packages: torch, comfy-aimdo"),
+            Some("Unpacking & installing packages...".to_string())
+        );
+        assert_eq!(summarize_pip_line("Requirement already satisfied: pip"), None);
     }
 }
