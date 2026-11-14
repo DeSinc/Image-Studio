@@ -1772,11 +1772,7 @@ fn is_win_ctrl_v() -> bool {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if pill_click.clicked() {
-                            self.download_pane.is_expanded = !self.download_pane.is_expanded;
-                            self.download_pane.user_opened = self.download_pane.is_expanded;
-                            if self.download_pane.is_expanded {
-                                self.download_pane.user_acknowledged = true;
-                            }
+                            self.download_pane.toggle(&self.sh);
                         }
                         pill_click.on_hover_text("Click to toggle download manager");
                         let local_time = build_timestamp_display();

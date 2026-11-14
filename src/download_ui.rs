@@ -42,10 +42,8 @@ fn draw_minimize_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
 #[derive(Clone, Debug)]
 pub struct DownloadPaneState {
     pub is_expanded: bool,
-    pub user_acknowledged: bool,
     pub user_opened: bool,
     pub highlight_until: Option<Instant>,
-    pub mouse_left_at: Option<Instant>,
     pub show_metered_dialog: bool,
 }
 
@@ -53,16 +51,24 @@ impl Default for DownloadPaneState {
     fn default() -> Self {
         Self {
             is_expanded: true, // Starts maximized
-            user_acknowledged: false, // Stays maximized until user acknowledges
             user_opened: false,
             highlight_until: None,
-            mouse_left_at: None,
             show_metered_dialog: false,
         }
     }
 }
 
 impl DownloadPaneState {
+    pub fn toggle(&mut self, sh: &Shared) {
+        if self.is_active(sh) && self.is_expanded {
+            self.is_expanded = false;
+            self.user_opened = false;
+        } else {
+            self.is_expanded = true;
+            self.user_opened = true;
+        }
+    }
+
     pub fn is_active(&self, sh: &Shared) -> bool {
         let st = sh.state.lock().unwrap();
         let in_dl_state = matches!(
@@ -105,7 +111,7 @@ impl DownloadPaneState {
             .anchor(egui::Align2::LEFT_BOTTOM, vec2(16.0, -82.0))
             .show(ctx, |ui| {
                 if self.is_expanded {
-                    self.render_expanded_pane(ui, ctx, sh, &st);
+                    self.render_expanded_pane(ui, sh, &st);
                 } else {
                     self.render_mini_bar(ui, ctx, sh, &st);
                 }
@@ -227,7 +233,6 @@ impl DownloadPaneState {
             } else {
                 sh.download_paused.store(true, Ordering::SeqCst);
             }
-            self.user_acknowledged = true;
         } else if resp.clicked() {
             // Click outside button expands floating pane
             self.is_expanded = true;
@@ -237,7 +242,7 @@ impl DownloadPaneState {
             .on_hover_text("Click to expand download manager");
     }
 
-    fn render_expanded_pane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sh: &Arc<Shared>, st: &EngState) {
+    fn render_expanded_pane(&mut self, ui: &mut egui::Ui, sh: &Arc<Shared>, st: &EngState) {
         let card_w = 480.0f32;
         let card_frame = egui::Frame::new()
             .fill(CARD)
@@ -245,7 +250,7 @@ impl DownloadPaneState {
             .corner_radius(10)
             .inner_margin(egui::Margin::symmetric(14, 12));
 
-        let card_response = card_frame.show(ui, |ui| {
+        card_frame.show(ui, |ui| {
             ui.set_width(card_w);
 
             // 1. Header with title, speed, and minimize button
@@ -262,7 +267,6 @@ impl DownloadPaneState {
                     draw_minimize_icon(&p, min_rect.center(), if min_resp.hovered() { Color32::WHITE } else { DIM });
                     if min_resp.on_hover_text("Minimize to download bar").clicked() {
                         self.is_expanded = false;
-                        self.user_acknowledged = true;
                         self.user_opened = false;
                     }
 
@@ -412,7 +416,6 @@ impl DownloadPaneState {
                     if ui.add(start_btn).clicked() {
                         sh.download_confirmed.store(true, Ordering::SeqCst);
                         sh.retry.store(true, Ordering::SeqCst);
-                        self.user_acknowledged = true;
                     }
                 } else if is_paused {
                     let resume_btn = egui::Button::new(RichText::new("Resume Download").size(12.0).strong().color(Color32::WHITE))
@@ -421,7 +424,6 @@ impl DownloadPaneState {
                     if ui.add(resume_btn).clicked() {
                         sh.download_paused.store(false, Ordering::SeqCst);
                         sh.retry.store(true, Ordering::SeqCst);
-                        self.user_acknowledged = true;
                     }
                 } else if is_downloading {
                     let pause_btn = egui::Button::new(RichText::new("Pause Download").size(12.0).strong().color(TEXT))
@@ -430,7 +432,6 @@ impl DownloadPaneState {
                         .min_size(vec2(120.0, 28.0));
                     if ui.add(pause_btn).clicked() {
                         sh.download_paused.store(true, Ordering::SeqCst);
-                        self.user_acknowledged = true;
                     }
                 } else if is_dl_failed {
                     let retry_btn = egui::Button::new(RichText::new("Retry Download").size(12.0).strong().color(Color32::WHITE))
@@ -438,7 +439,6 @@ impl DownloadPaneState {
                         .min_size(vec2(130.0, 28.0));
                     if ui.add(retry_btn).clicked() {
                         sh.retry.store(true, Ordering::SeqCst);
-                        self.user_acknowledged = true;
                     }
                 } else if is_eng_failed {
                     let repair_btn = egui::Button::new(RichText::new("Repair Dependencies & Retry").size(12.0).strong().color(Color32::WHITE))
@@ -446,7 +446,6 @@ impl DownloadPaneState {
                         .min_size(vec2(180.0, 28.0));
                     if ui.add(repair_btn).clicked() {
                         crate::engine::repair_environment(sh.clone(), ui.ctx().clone());
-                        self.user_acknowledged = true;
                     }
                 }
             });
@@ -490,30 +489,6 @@ impl DownloadPaneState {
                 });
             }
         });
-
-        // Hover restore-down handling:
-        // Once the user has acknowledged the pane, moving the mouse away restores down to mini bar.
-        let pane_rect = card_response.response.rect;
-        let is_hovered = ctx.input(|i| i.pointer.hover_pos().map(|p| pane_rect.contains(p)).unwrap_or(false));
-
-        if is_hovered {
-            self.mouse_left_at = None;
-        } else if self.user_acknowledged {
-            match self.mouse_left_at {
-                None => {
-                    self.mouse_left_at = Some(Instant::now());
-                    ctx.request_repaint_after(Duration::from_millis(260));
-                }
-                Some(t) if t.elapsed() >= Duration::from_millis(250) => {
-                    self.is_expanded = false;
-                    self.user_opened = false;
-                    self.mouse_left_at = None;
-                }
-                _ => {
-                    ctx.request_repaint_after(Duration::from_millis(50));
-                }
-            }
-        }
     }
 
     fn render_storage_location_row(&mut self, ui: &mut egui::Ui, sh: &Arc<Shared>) {
@@ -531,8 +506,6 @@ impl DownloadPaneState {
                 let change_btn = ui.button(RichText::new("Change Location...").size(11.5))
                     .on_hover_text("Change model folder to another drive (e.g. D:\\ImageStudio).");
                 if change_btn.clicked() {
-                    self.user_acknowledged = true;
-                    self.mouse_left_at = None;
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         let target_models = folder.join("models");
                         *sh.pending_models_dir.lock().unwrap() = Some(target_models.clone());
@@ -559,7 +532,6 @@ impl DownloadPaneState {
         ui.horizontal(|ui| {
             let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(11.5));
             if resp_img.changed() {
-                self.user_acknowledged = true;
                 sh.dl_image_model.store(dl_img, Ordering::SeqCst);
                 let mut cfg = sh.cfg.lock().unwrap();
                 cfg.dl_image_model = dl_img;
@@ -575,7 +547,6 @@ impl DownloadPaneState {
 
             let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(11.5));
             if resp_vid.changed() {
-                self.user_acknowledged = true;
                 sh.dl_video_model.store(dl_vid, Ordering::SeqCst);
                 let mut cfg = sh.cfg.lock().unwrap();
                 cfg.dl_video_model = dl_vid;
@@ -680,7 +651,6 @@ mod tests {
     fn test_download_pane_state_default() {
         let state = DownloadPaneState::default();
         assert!(state.is_expanded);
-        assert!(!state.user_acknowledged);
         assert!(!state.user_opened);
         assert!(!state.show_metered_dialog);
     }
@@ -746,5 +716,49 @@ mod tests {
         state.is_expanded = false;
         state.user_opened = false;
         assert!(!state.is_active(&sh_ready));
+    }
+
+    #[test]
+    fn test_download_pane_toggle() {
+        let mut state = DownloadPaneState::default();
+        let sh_ready = make_test_shared(EngState::Ready {
+            ours: true,
+            gpu: "NVIDIA RTX 4070".into(),
+        });
+
+        // Initially inactive when Ready, even though is_expanded starts true
+        assert!(!state.is_active(&sh_ready));
+
+        // First toggle opens it immediately
+        state.toggle(&sh_ready);
+        assert!(state.is_active(&sh_ready));
+        assert!(state.is_expanded);
+        assert!(state.user_opened);
+
+        // Second toggle closes it
+        state.toggle(&sh_ready);
+        assert!(!state.is_active(&sh_ready));
+        assert!(!state.is_expanded);
+        assert!(!state.user_opened);
+
+        // During download, toggling minimizes to mini-bar and expands back
+        let sh_downloading = make_test_shared(EngState::DownloadingModels {
+            current_file: "model.safetensors".into(),
+            file_index: 1,
+            total_files: 2,
+            file_progress: 0.5,
+            bytes_done: 500,
+            bytes_total: 1000,
+            speed_mb: 25.0,
+            overall_progress: 0.25,
+        });
+        state.is_expanded = true;
+        state.toggle(&sh_downloading);
+        assert!(state.is_active(&sh_downloading));
+        assert!(!state.is_expanded);
+
+        state.toggle(&sh_downloading);
+        assert!(state.is_active(&sh_downloading));
+        assert!(state.is_expanded);
     }
 }
