@@ -77,10 +77,14 @@ pub struct Config {
     pub ignore_paths: Vec<PathBuf>,
     #[serde(default)]
     pub active_profile: Option<String>,
+    #[serde(default)]
+    pub active_video_profile: Option<String>,
     #[serde(default = "default_true")]
     pub dl_image_model: bool,
     #[serde(default)]
     pub dl_video_model: bool,
+    #[serde(default)]
+    pub dl_r2v_model: bool,
 }
 
 impl Default for Config {
@@ -91,8 +95,10 @@ impl Default for Config {
             python_path: None,
             ignore_paths: Vec::new(),
             active_profile: None,
+            active_video_profile: None,
             dl_image_model: true,
             dl_video_model: false,
+            dl_r2v_model: false,
         }
     }
 }
@@ -113,16 +119,27 @@ impl Config {
 }
 
 // ---------------------------------------------------------------- profiles
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Deserialize, Clone)]
 pub struct ModelFile {
     pub category: String,
     pub filename: String,
     #[serde(default)]
     pub size_bytes: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub hf_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub modelscope_url: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 #[derive(Deserialize, Clone)]
 #[allow(dead_code)]
@@ -197,7 +214,11 @@ pub fn candidate_models_dirs(cfg: &Config) -> Vec<PathBuf> {
 }
 
 impl Profile {
-    pub fn all() -> Vec<Profile> {
+    pub fn is_video_profile_id(id: &str) -> bool {
+        id.starts_with("minimax_h3") || id.starts_with("ltx_")
+    }
+
+    pub fn all_raw() -> Vec<Profile> {
         let exe_json = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("models.json")))
@@ -207,6 +228,20 @@ impl Profile {
             .or_else(|_| serde_json::from_str(include_str!("../models.json")))
             .expect("models.json");
         pf.profiles
+    }
+
+    pub fn all() -> Vec<Profile> {
+        Self::all_raw()
+            .into_iter()
+            .filter(|p| !Self::is_video_profile_id(&p.id))
+            .collect()
+    }
+
+    pub fn all_video_profiles() -> Vec<Profile> {
+        Self::all_raw()
+            .into_iter()
+            .filter(|p| Self::is_video_profile_id(&p.id))
+            .collect()
     }
 
     pub fn load_with_cfg(cfg: &Config) -> Profile {
@@ -257,6 +292,47 @@ impl Profile {
         }
     }
 
+    pub fn load_video_with_cfg(cfg: &Config) -> Profile {
+        let profiles = Self::all_video_profiles();
+        // 1. Explicit user choice in config.json
+        if let Some(ref aid) = cfg.active_video_profile {
+            if let Some(p) = profiles.iter().find(|p| &p.id == aid) {
+                return p.clone();
+            }
+        }
+
+        // 2. Preserve existing MiniMax H3 or LTX-2.5 models if already downloaded on disk
+        let candidates = candidate_models_dirs(cfg);
+        for p in &profiles {
+            if p.id == "ltx_2.3" {
+                continue;
+            }
+            if let Some(primary) = p.models.iter().find(|m| m.category == "diffusion_models") {
+                if candidates.iter().any(|d| safe_model_path(d, &primary.category, &primary.filename).is_file()) {
+                    log(&format!("Video Profile: detected existing {} on disk; preserving {}", primary.filename, p.id));
+                    return p.clone();
+                }
+            }
+        }
+
+        // 3. Auto-detect GPU VRAM and choose optimal default video quantization
+        // >= 18GB: INT8 ConvRot (listed as 22-24GB+); >= 15GB: Q6_K; >= 11GB: Q4_K_M;
+        // 9-10GB: Q3_K_M; < 9GB: LTX-2.5 UD-Q3_K_XL
+        let target_id = match detect_gpu_vram_gb() {
+            Some(vram) if vram >= 18 => "minimax_h3_24gb",
+            Some(vram) if vram >= 15 => "minimax_h3_16gb",
+            Some(vram) if vram >= 11 => "minimax_h3_12gb",
+            Some(vram) if vram >= 9 => "minimax_h3_10gb",
+            Some(_) => "ltx_2.5_10gb",
+            None => "minimax_h3_12gb",
+        };
+        if let Some(p) = profiles.iter().find(|p| p.id == target_id) {
+            log(&format!("Video Profile: auto-selected {target_id} for detected GPU VRAM"));
+            return p.clone();
+        }
+        profiles.first().cloned().expect("at least one video profile")
+    }
+
     pub fn load() -> Profile {
         let cfg = Config::load();
         Self::load_with_cfg(&cfg)
@@ -266,23 +342,112 @@ impl Profile {
         self.models.iter().find(|m| m.category == cat).map(|m| m.filename.clone()).unwrap_or_default()
     }
 
-    pub fn missing_models(sh: &Shared) -> Vec<ModelFile> {
-        let all_profiles = Self::all();
-        let ltx_profile = all_profiles.iter().find(|p| p.id == "ltx_2.3").cloned();
+    pub fn total_size_gb(&self) -> f64 {
+        self.models.iter().filter(|m| !m.optional).map(|m| m.size_bytes).sum::<u64>() as f64 / 1_000_000_000.0
+    }
+
+    pub fn is_minimax_h3(&self) -> bool {
+        self.id.starts_with("minimax_h3")
+    }
+
+    pub fn is_ltx25(&self) -> bool {
+        self.id.starts_with("ltx_2.5")
+    }
+
+    pub fn fl2va_unet_name(&self) -> String {
+        if self.is_minimax_h3() {
+            if let Some(m) = self.models.iter().find(|m| {
+                m.category == "diffusion_models" && m.filename.to_ascii_lowercase().contains("fl2va")
+            }) {
+                return m.filename.clone();
+            }
+        }
+        let d = self.file("diffusion_models");
+        if !d.is_empty() { d } else { self.file("checkpoints") }
+    }
+
+    pub fn ref2va_unet_name(&self) -> String {
+        self.models
+            .iter()
+            .find(|m| m.category == "diffusion_models" && m.filename.to_ascii_lowercase().contains("ref2va"))
+            .map(|m| m.filename.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn clip_name(&self) -> String {
+        self.file("text_encoders")
+    }
+
+    pub fn video_vae_name(&self) -> String {
+        self.models
+            .iter()
+            .find(|m| m.category == "vae" && m.filename.to_ascii_lowercase().contains("video"))
+            .map(|m| m.filename.clone())
+            .unwrap_or_else(|| self.file("vae"))
+    }
+
+    pub fn audio_vae_name(&self) -> String {
+        self.models
+            .iter()
+            .find(|m| m.category == "vae" && m.filename.to_ascii_lowercase().contains("audio"))
+            .map(|m| m.filename.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn upscaler_name(&self) -> String {
+        self.file("latent_upscale_models")
+    }
+
+    pub fn r2v_model_file(&self) -> Option<ModelFile> {
+        self.models
+            .iter()
+            .find(|m| m.optional && m.category == "diffusion_models")
+            .cloned()
+    }
+
+    pub fn has_r2v_model(&self, models_dir: &Path) -> bool {
+        self.r2v_model_file()
+            .map(|m| safe_model_path(models_dir, &m.category, &m.filename).is_file())
+            .unwrap_or(false)
+    }
+
+    pub fn missing_in_dir(&self, models_dir: &Path) -> Vec<ModelFile> {
+        self.models
+            .iter()
+            .filter(|m| !m.optional && !safe_model_path(models_dir, &m.category, &m.filename).exists())
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the first video profile whose files are all present on disk in `models_dir`.
+    pub fn find_downloaded_video_profile(models_dir: &Path) -> Option<Profile> {
+        Self::all_video_profiles()
+            .into_iter()
+            .find(|p| p.missing_in_dir(models_dir).is_empty())
+    }
+
+    pub fn target_download_models(sh: &Shared) -> Vec<ModelFile> {
         let profile = sh.active_profile.lock().unwrap().clone();
-        let models_dir = sh.paths.lock().unwrap().models.clone();
+        let vid_profile = sh.active_video_profile.lock().unwrap().clone();
 
         let mut target_models: Vec<ModelFile> = Vec::new();
         if sh.dl_image_model.load(Ordering::SeqCst) {
-            target_models.extend(profile.models.clone());
+            target_models.extend(profile.models.iter().filter(|m| !m.optional).cloned());
         }
         if sh.dl_video_model.load(Ordering::SeqCst) {
-            if let Some(ref vid_p) = ltx_profile {
-                target_models.extend(vid_p.models.clone());
-            }
+            target_models.extend(vid_profile.models.iter().filter(|m| !m.optional).cloned());
         }
-
+        // Optional models (e.g. MiniMax H3 Ref2VA) are only queued if explicitly requested,
+        // and always placed very last after all required image/video weights.
+        if sh.dl_r2v_model.load(Ordering::SeqCst) {
+            target_models.extend(vid_profile.models.iter().filter(|m| m.optional).cloned());
+        }
         target_models
+    }
+
+    pub fn missing_models(sh: &Shared) -> Vec<ModelFile> {
+        let models_dir = sh.paths.lock().unwrap().models.clone();
+        Self::target_download_models(sh)
             .into_iter()
             .filter(|m| !safe_model_path(&models_dir, &m.category, &m.filename).exists())
             .collect()
@@ -379,10 +544,12 @@ pub struct Shared {
     pub metered_switch_detected: AtomicBool,
     pub dl_image_model: AtomicBool,
     pub dl_video_model: AtomicBool,
+    pub dl_r2v_model: AtomicBool,
     pub cfg: Mutex<Config>,
     pub pending_models_dir: Mutex<Option<PathBuf>>,
     pub migration_status: Mutex<Option<String>>,
     pub active_profile: Mutex<Profile>,
+    pub active_video_profile: Mutex<Profile>,
 }
 
 impl Shared {
@@ -390,6 +557,9 @@ impl Shared {
         let cfg = Config::load();
         let dl_img = cfg.dl_image_model;
         let dl_vid = cfg.dl_video_model;
+        let dl_r2v = cfg.dl_r2v_model;
+        let img_profile = Profile::load_with_cfg(&cfg);
+        let vid_profile = Profile::load_video_with_cfg(&cfg);
         Arc::new(Shared {
             state: Mutex::new(EngState::Detecting),
             paths: Mutex::new(Paths::default()),
@@ -407,10 +577,12 @@ impl Shared {
             metered_switch_detected: AtomicBool::new(false),
             dl_image_model: AtomicBool::new(dl_img),
             dl_video_model: AtomicBool::new(dl_vid),
+            dl_r2v_model: AtomicBool::new(dl_r2v),
             cfg: Mutex::new(cfg),
             pending_models_dir: Mutex::new(None),
             migration_status: Mutex::new(None),
-            active_profile: Mutex::new(Profile::load()),
+            active_profile: Mutex::new(img_profile),
+            active_video_profile: Mutex::new(vid_profile),
         })
     }
 }
@@ -690,6 +862,8 @@ pub fn install_or_repair_dependencies(
         }
     }
 
+    ensure_gguf_custom_node(comfy, Some(py));
+
     // Verify both comfy_aimdo and torch are working
     let verify = Command::new(py)
         .args(["-c", "import comfy_aimdo; import torch"])
@@ -709,6 +883,254 @@ pub fn install_or_repair_dependencies(
     } else {
         Err("Failed to execute verification probe.".into())
     }
+}
+
+/// Writes the LTX-2.5 transformer metadata sidecar into `models/diffusion_models/`
+/// so `ComfyUI-GGUF-Loader` detects the 48-layer, 9-parameter AdaLN architecture
+/// without leaking onto MiniMax H3 or other diffusion GGUFs.
+pub fn ensure_ltx25_gguf_sidecar(models_dir: &Path) {
+    if models_dir.as_os_str().is_empty() {
+        return;
+    }
+    let diff_dir = models_dir.join("diffusion_models");
+    let _ = std::fs::create_dir_all(&diff_dir);
+    let sidecar_path = diff_dir.join("ltx-2.5-transformer-metadata.json");
+    if sidecar_path.is_file() {
+        if let Ok(existing) = std::fs::read_to_string(&sidecar_path) {
+            if existing.contains("\"applies_to\"") && existing.contains("\"transformer\"") {
+                return;
+            }
+        }
+    }
+    let sidecar_json = serde_json::json!({
+        "applies_to": ["*ltx*2.5*.gguf", "*ltx25*.gguf"],
+        "config": {
+            "transformer": {
+                "num_layers": 48,
+                "num_attention_heads": 32,
+                "attention_head_dim": 128,
+                "cross_attention_adaln": true,
+                "apply_gated_attention": true,
+                "connector_apply_gated_attention": true,
+                "caption_proj_before_connector": true,
+                "caption_projection_first_linear": false,
+                "cross_attention_dim": 4096,
+                "caption_channels": 3840,
+                "connector_attention_head_dim": 128,
+                "connector_num_attention_heads": 32,
+                "connector_num_layers": 8,
+                "audio_num_attention_heads": 32,
+                "audio_attention_head_dim": 64,
+                "audio_cross_attention_dim": 2048,
+                "audio_connector_attention_head_dim": 64,
+                "audio_connector_num_attention_heads": 32,
+                "audio_connector_num_layers": 8,
+                "positional_embedding_theta": 10000.0,
+                "positional_embedding_max_pos": [20, 2048, 2048],
+                "audio_positional_embedding_max_pos": [20],
+                "timestep_scale_multiplier": 1000,
+                "av_ca_timestep_scale_multiplier": 1000
+            }
+        }
+    });
+    if let Ok(pretty) = serde_json::to_string_pretty(&sidecar_json) {
+        if let Err(e) = std::fs::write(&sidecar_path, pretty) {
+            log(&format!("gguf sidecar: failed writing {}: {e}", sidecar_path.display()));
+        } else {
+            log(&format!("gguf sidecar: wrote {}", sidecar_path.display()));
+        }
+    }
+}
+
+/// Ensures `ChrisColeTech/ComfyUI-GGUF-Loader` and its Python dependencies
+/// (`gguf>=0.13.0`, `sentencepiece`, `protobuf`, `opencv-python-headless`) are installed inside `ComfyUI/custom_nodes`.
+pub fn ensure_gguf_custom_node(comfy: &Path, py: Option<&Path>) {
+    let custom_nodes = comfy.join("custom_nodes");
+    let loader_dir = custom_nodes.join("ComfyUI-GGUF-Loader");
+    let gguf_py = loader_dir.join("nodes").join("gguf.py");
+
+    if !gguf_py.is_file() {
+        log("gguf: installing ChrisColeTech/ComfyUI-GGUF-Loader custom node");
+        let _ = std::fs::create_dir_all(&custom_nodes);
+
+        // Move legacy city96 ComfyUI-GGUF aside if present so node registrations do not collide
+        let legacy_dir = custom_nodes.join("ComfyUI-GGUF");
+        if legacy_dir.exists() {
+            let disabled_root = comfy.join("custom_nodes_disabled");
+            let _ = std::fs::create_dir_all(&disabled_root);
+            let backup = disabled_root.join("ComfyUI-GGUF");
+            if backup.exists() {
+                let _ = std::fs::remove_dir_all(&backup);
+            }
+            if let Err(e) = std::fs::rename(&legacy_dir, &backup) {
+                log(&format!("gguf: could not move legacy ComfyUI-GGUF aside: {e}"));
+                let _ = std::fs::remove_dir_all(&legacy_dir);
+            } else {
+                log("gguf: moved legacy ComfyUI-GGUF to custom_nodes_disabled");
+            }
+        }
+
+        if loader_dir.exists() {
+            let _ = std::fs::remove_dir_all(&loader_dir);
+        }
+
+        let clone_ok = Command::new("git")
+            .args(["clone", "--depth", "1", "https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader.git"])
+            .arg(&loader_dir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !clone_ok || !gguf_py.is_file() {
+            log("gguf: git clone unavailable or incomplete; downloading GitHub archive zip");
+            let zip_path = custom_nodes.join("ComfyUI-GGUF-Loader-main.zip");
+            let client = build_dl_client();
+            if let Ok(resp) = client
+                .get("https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader/archive/refs/heads/main.zip")
+                .send()
+            {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes() {
+                        if std::fs::write(&zip_path, &bytes).is_ok() {
+                            #[cfg(windows)]
+                            let ext_ok = Command::new("powershell")
+                                .args([
+                                    "-NoProfile",
+                                    "-Command",
+                                    &format!(
+                                        "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
+                                        zip_path.display().to_string().replace('\'', "''"),
+                                        custom_nodes.display().to_string().replace('\'', "''")
+                                    ),
+                                ])
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .status()
+                                .map(|s| s.success())
+                                .unwrap_or(false);
+                            #[cfg(not(windows))]
+                            let ext_ok = Command::new("python3")
+                                .args(["-m", "zipfile", "-e"])
+                                .arg(&zip_path)
+                                .arg(&custom_nodes)
+                                .status()
+                                .map(|s| s.success())
+                                .unwrap_or(false);
+
+                            let _ = std::fs::remove_file(&zip_path);
+                            let extracted = custom_nodes.join("ComfyUI-GGUF-Loader-main");
+                            if ext_ok && extracted.is_dir() {
+                                if loader_dir.exists() {
+                                    let _ = std::fs::remove_dir_all(&loader_dir);
+                                }
+                                let _ = std::fs::rename(&extracted, &loader_dir);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if gguf_py.is_file() {
+            log("gguf: ComfyUI-GGUF-Loader installed successfully");
+        } else {
+            log("gguf: WARNING - failed to install ComfyUI-GGUF-Loader");
+        }
+    }
+
+    if gguf_py.is_file() {
+        let deps_marker = loader_dir.join(".studio_deps_v2_ok");
+        if !deps_marker.is_file() {
+            if let Some(py_exe) = py {
+                let probe = Command::new(py_exe)
+                    .args(["-c", "import gguf, sentencepiece, google.protobuf, cv2"])
+                    .current_dir(comfy)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                let deps_present = probe.map(|o| o.status.success()).unwrap_or(false);
+                if !deps_present {
+                    log("gguf: installing Python dependencies (gguf>=0.13.0 sentencepiece protobuf opencv-python-headless)");
+                    let _ = Command::new(py_exe)
+                        .args([
+                            "-m",
+                            "pip",
+                            "install",
+                            "--no-warn-script-location",
+                            "gguf>=0.13.0",
+                            "sentencepiece",
+                            "protobuf",
+                            "opencv-python-headless",
+                        ])
+                        .current_dir(comfy)
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                }
+                let verify = Command::new(py_exe)
+                    .args(["-c", "import gguf, sentencepiece, google.protobuf, cv2"])
+                    .current_dir(comfy)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if verify {
+                    let _ = std::fs::write(&deps_marker, "ok\n");
+                    log("gguf: Python dependencies verified");
+                } else {
+                    log("gguf: WARNING - gguf/sentencepiece/protobuf/cv2 probe failed after pip install");
+                }
+            }
+        }
+    }
+}
+
+fn collect_safetensors_rel(base: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_safetensors_rel(base, &p, depth + 1, out);
+        } else if p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("safetensors"))
+            .unwrap_or(false)
+        {
+            if let Ok(rel) = p.strip_prefix(base) {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                if !s.is_empty() && !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+}
+
+/// Lists all `.safetensors` LoRA filenames found in configured `models/loras` folders.
+#[allow(dead_code)]
+pub fn list_available_loras(sh: &Shared) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let active_models = sh.paths.lock().unwrap().models.clone();
+    if !active_models.as_os_str().is_empty() {
+        dirs.push(active_models.join("loras"));
+    }
+    let cfg = sh.cfg.lock().unwrap().clone();
+    for base in candidate_models_dirs(&cfg) {
+        let d = base.join("loras");
+        if d.is_dir() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    let mut out = Vec::new();
+    for d in dirs {
+        collect_safetensors_rel(&d, &d, 0, &mut out);
+    }
+    out.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    out
 }
 
 /// Extracts a concise status summary from a `pip` output line for UI display.
@@ -1031,6 +1453,28 @@ pub fn kill_tree(c: &mut Child) {
     let _ = c.wait();
 }
 
+fn supports_ck_attention(py: &Path, comfy: &Path) -> bool {
+    let cli_args = comfy.join("comfy").join("cli_args.py");
+    let has_flag = std::fs::read_to_string(&cli_args)
+        .map(|s| s.contains("--use-ck-attention"))
+        .unwrap_or(false);
+    if !has_flag {
+        return false;
+    }
+
+    let mut check = Command::new(py);
+    check
+        .args([
+            "-c",
+            "import comfy_kitchen; raise SystemExit(0 if comfy_kitchen.int8_attention_is_available() else 1)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    check.status().map(|s| s.success()).unwrap_or(false)
+}
+
 fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
     let log_file = data_dir().join("comfyui.log");
     if log_file.exists() {
@@ -1053,8 +1497,12 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
         "--disable-smart-memory",
         "--vram-headroom",
         "1.0",
-        "--models-directory",
-    ])
+    ]);
+    if supports_ck_attention(py, comfy) {
+        log("ComfyUI: enabling built-in INT8 attention (--use-ck-attention)");
+        cmd.arg("--use-ck-attention");
+    }
+    cmd.arg("--models-directory")
     .arg(models)
     .current_dir(comfy)
     .env("PYTHONUNBUFFERED", "1")
@@ -1841,25 +2289,19 @@ fn bootstrap_models(
     models_dir: &Path,
     profile: &Profile,
 ) -> Result<(), (String, String)> {
-    let all_profiles = Profile::all();
-    let ltx_profile = all_profiles.iter().find(|p| p.id == "ltx_2.3").cloned();
-
     loop {
+        let vid_profile = sh.active_video_profile.lock().unwrap().clone();
         let mut current_models_dir = if let Some(p) = sh.pending_models_dir.lock().unwrap().clone() {
             p
         } else {
             models_dir.to_path_buf()
         };
 
-        let mut target_models: Vec<ModelFile> = Vec::new();
-        if sh.dl_image_model.load(Ordering::SeqCst) {
-            target_models.extend(profile.models.clone());
+        if vid_profile.is_ltx25() {
+            ensure_ltx25_gguf_sidecar(&current_models_dir);
         }
-        if sh.dl_video_model.load(Ordering::SeqCst) {
-            if let Some(ref vid_p) = ltx_profile {
-                target_models.extend(vid_p.models.clone());
-            }
-        }
+
+        let target_models = Profile::target_download_models(sh);
 
         let missing: Vec<_> = target_models
             .iter()
@@ -1876,11 +2318,15 @@ fn bootstrap_models(
         let mut any_interrupted = false;
 
         for (idx, m) in missing.iter().enumerate() {
-            let is_video_model = ltx_profile.as_ref().map(|vp| vp.models.iter().any(|vm| vm.filename == m.filename)).unwrap_or(false);
+            let is_optional_r2v = m.optional && vid_profile.models.iter().any(|vm| vm.filename == m.filename);
+            let is_video_model = !m.optional && vid_profile.models.iter().any(|vm| vm.filename == m.filename);
+            if is_optional_r2v && !sh.dl_r2v_model.load(Ordering::SeqCst) {
+                continue;
+            }
             if is_video_model && !sh.dl_video_model.load(Ordering::SeqCst) {
                 continue;
             }
-            if !is_video_model && !sh.dl_image_model.load(Ordering::SeqCst) {
+            if !is_optional_r2v && !is_video_model && !sh.dl_image_model.load(Ordering::SeqCst) {
                 continue;
             }
 
@@ -2134,6 +2580,26 @@ impl Drop for ModelDlRunningGuard {
 
 /// Spawns a background model downloader thread if any ticked models are missing and no
 /// model download worker is currently active. Safe to call during engine extraction/repair.
+/// Cancels any in-flight model download and starts downloading missing models
+/// for the newly selected profile in the background, without restarting ComfyUI
+/// or interrupting any active generation in VRAM.
+pub fn restart_model_downloads_for_profile_change(sh: &Arc<Shared>, ctx: &eframe::egui::Context) {
+    sh.cancel_model_dl.store(true, Ordering::SeqCst);
+    sh.download_paused.store(false, Ordering::SeqCst);
+    let sh = sh.clone();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            if !sh.model_dl_running.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        sh.cancel_model_dl.store(false, Ordering::SeqCst);
+        spawn_model_downloads_if_needed(&sh, &ctx);
+    });
+}
+
 pub fn spawn_model_downloads_if_needed(sh: &Arc<Shared>, ctx: &eframe::egui::Context) {
     if sh.download_paused.load(Ordering::SeqCst) {
         return;
@@ -2214,7 +2680,45 @@ pub fn toggle_model_download(sh: &Arc<Shared>, ctx: &eframe::egui::Context, is_i
         if dl_active {
             sh.cancel_model_dl.store(true, Ordering::SeqCst);
         }
-        if !sh.dl_image_model.load(Ordering::SeqCst) && !sh.dl_video_model.load(Ordering::SeqCst) {
+        if !sh.dl_image_model.load(Ordering::SeqCst)
+            && !sh.dl_video_model.load(Ordering::SeqCst)
+            && !sh.dl_r2v_model.load(Ordering::SeqCst)
+        {
+            *sh.model_dl_progress.lock().unwrap() = None;
+            let mut st = sh.state.lock().unwrap();
+            if matches!(*st, EngState::DownloadingModels { .. } | EngState::ModelDownloadPaused { .. }) {
+                *st = EngState::Detecting;
+            }
+        }
+    } else {
+        sh.cancel_model_dl.store(false, Ordering::SeqCst);
+        sh.download_paused.store(false, Ordering::SeqCst);
+        let paths = sh.paths.lock().unwrap().clone();
+        if !paths.models.as_os_str().is_empty() {
+            spawn_model_downloads_if_needed(sh, ctx);
+        }
+    }
+}
+
+pub fn toggle_r2v_download(sh: &Arc<Shared>, ctx: &eframe::egui::Context, enabled: bool) {
+    sh.dl_r2v_model.store(enabled, Ordering::SeqCst);
+    {
+        let mut cfg = sh.cfg.lock().unwrap();
+        cfg.dl_r2v_model = enabled;
+        cfg.save();
+    }
+    if !enabled {
+        let dl_r2v_active = sh.model_dl_running.load(Ordering::SeqCst)
+            && sh.model_dl_progress.lock().unwrap().as_ref().is_some_and(|p| {
+                p.current_file.to_ascii_lowercase().contains("ref2va")
+            });
+        if dl_r2v_active {
+            sh.cancel_model_dl.store(true, Ordering::SeqCst);
+        }
+        if !sh.dl_image_model.load(Ordering::SeqCst)
+            && !sh.dl_video_model.load(Ordering::SeqCst)
+            && !sh.dl_r2v_model.load(Ordering::SeqCst)
+        {
             *sh.model_dl_progress.lock().unwrap() = None;
             let mut st = sh.state.lock().unwrap();
             if matches!(*st, EngState::DownloadingModels { .. } | EngState::ModelDownloadPaused { .. }) {
@@ -2422,6 +2926,9 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                             }
                         }
                     }
+
+                    ensure_gguf_custom_node(cd, Some(py));
+                    ensure_ltx25_gguf_sidecar(&models);
 
                     log(&format!("launching {} (attempt {attempt})", py.display()));
                     match spawn(py, cd, &models) {
@@ -2807,5 +3314,92 @@ mod tests {
             Some("Unpacking & installing packages...".to_string())
         );
         assert_eq!(summarize_pip_line("Requirement already satisfied: pip"), None);
+    }
+
+    #[test]
+    fn video_and_image_profiles_partition_cleanly() {
+        let img = Profile::all();
+        let vid = Profile::all_video_profiles();
+        assert!(!img.is_empty());
+        assert!(img.iter().all(|p| !Profile::is_video_profile_id(&p.id)));
+        assert!(vid.iter().all(|p| Profile::is_video_profile_id(&p.id)));
+        for expected in [
+            "minimax_h3_10gb",
+            "minimax_h3_12gb",
+            "minimax_h3_16gb",
+            "minimax_h3_24gb",
+            "ltx_2.5_10gb",
+            "ltx_2.5_12gb",
+            "ltx_2.5_16gb",
+            "ltx_2.5_24gb",
+            "ltx_2.3",
+        ] {
+            assert!(vid.iter().any(|p| p.id == expected), "missing video profile {expected}");
+        }
+
+        let h3_16 = vid.iter().find(|p| p.id == "minimax_h3_16gb").unwrap();
+        assert!(h3_16.is_minimax_h3());
+        assert_eq!(h3_16.fl2va_unet_name(), "MiniMax-H3-FL2VA-Pruned-Q6_K.gguf");
+        assert_eq!(h3_16.ref2va_unet_name(), "MiniMax-H3-Ref2VA-Pruned-Q6_K.gguf");
+        assert_eq!(h3_16.clip_name(), "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors");
+        assert_eq!(h3_16.video_vae_name(), "minimax_h3_video_vae_int8_convrot.safetensors");
+        assert_eq!(h3_16.audio_vae_name(), "minimax_h3_audio_vae_fp32.safetensors");
+        assert_eq!(h3_16.default_steps, 20);
+        assert_eq!(h3_16.sampler, "er_sde");
+        assert_eq!(h3_16.scheduler, "sgm_uniform");
+
+        // Ref2VA is optional and excluded from required size & missing_in_dir
+        let r2v_file = h3_16.r2v_model_file().expect("h3_16 has optional r2v file");
+        assert!(r2v_file.optional);
+        assert_eq!(r2v_file.filename, "MiniMax-H3-Ref2VA-Pruned-Q6_K.gguf");
+        let root = sandbox();
+        assert!(!h3_16.missing_in_dir(&root).iter().any(|m| m.filename == r2v_file.filename));
+        assert!(!h3_16.has_r2v_model(&root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn optional_r2v_model_downloads_only_when_requested_and_very_last() {
+        let sh = Shared::new();
+        *sh.active_video_profile.lock().unwrap() = Profile::all_video_profiles()
+            .into_iter()
+            .find(|p| p.id == "minimax_h3_16gb")
+            .unwrap();
+        sh.dl_image_model.store(true, Ordering::SeqCst);
+        sh.dl_video_model.store(true, Ordering::SeqCst);
+        sh.dl_r2v_model.store(false, Ordering::SeqCst);
+
+        let without_r2v = Profile::target_download_models(&sh);
+        assert!(!without_r2v.iter().any(|m| m.optional));
+
+        sh.dl_r2v_model.store(true, Ordering::SeqCst);
+        let with_r2v = Profile::target_download_models(&sh);
+        assert!(with_r2v.last().is_some_and(|m| m.optional && m.filename.contains("Ref2VA")));
+        assert_eq!(with_r2v.iter().filter(|m| m.optional).count(), 1);
+    }
+
+    #[test]
+    fn ltx25_sidecar_writes_valid_schema_and_lora_scan_works() {
+        let root = sandbox();
+        ensure_ltx25_gguf_sidecar(&root);
+        let sidecar = root.join("diffusion_models").join("ltx-2.5-transformer-metadata.json");
+        assert!(sidecar.is_file());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(parsed["applies_to"].is_array());
+        assert_eq!(parsed["config"]["transformer"]["num_layers"], 48);
+        assert_eq!(parsed["config"]["transformer"]["cross_attention_adaln"], true);
+
+        let loras_dir = root.join("loras");
+        std::fs::create_dir_all(loras_dir.join("sub")).unwrap();
+        std::fs::write(loras_dir.join("turbo.safetensors"), b"x").unwrap();
+        std::fs::write(loras_dir.join("sub").join("style.safetensors"), b"x").unwrap();
+        std::fs::write(loras_dir.join("ignore.txt"), b"x").unwrap();
+        let mut found = Vec::new();
+        collect_safetensors_rel(&loras_dir, &loras_dir, 0, &mut found);
+        found.sort();
+        assert_eq!(found, vec!["sub/style.safetensors", "turbo.safetensors"]);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

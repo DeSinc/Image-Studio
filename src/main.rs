@@ -4,8 +4,11 @@ mod comfy;
 pub mod download_ui;
 mod engine;
 pub mod history;
+pub mod lora;
+pub mod model_picker;
 pub mod presets;
 pub mod render;
+mod taskbar;
 mod updater;
 pub mod video;
 

@@ -84,6 +84,7 @@ enum Ev {
     LoadErr(String),
     Status(String),
     Progress { value: u32, max: u32 },
+    TotalProgress(f32),
     Preview(ColorImage),
     Done {
         png: Vec<u8>,
@@ -258,6 +259,8 @@ pub struct App {
     prompt: String,
     focus_prompt: bool,
     progress: Option<(u32, u32)>,
+    total_gen_progress: Option<f32>,
+    taskbar_progress: crate::taskbar::TaskbarProgress,
     preview_tex: Option<TextureHandle>,
     negative: String,
     steps: u32,
@@ -283,6 +286,7 @@ pub struct App {
     canvas_zoom: f32,
     canvas_pan: Vec2,
     show_setup: bool,
+    pub model_picker: crate::model_picker::ModelPickerState,
     loading: usize,
     queue: Vec<QueuedItem>,
     last_ctrl_v_down: bool,
@@ -299,6 +303,13 @@ pub struct App {
     pub video_height: u32,
     pub video_prompt_enhance: bool,
     pub video_negative: String,
+    pub video_steps: u32,
+    pub video_sampler: String,
+    pub video_scheduler: String,
+    pub video_lora: String,
+    pub video_lora_strength: f32,
+    pub lora_browser: crate::lora::LoraBrowserState,
+    pub video_r2v_mode: bool,
     pub show_video_dl_modal: bool,
     pub download_pane: crate::download_ui::DownloadPaneState,
     pub last_progress_time: Option<Instant>,
@@ -583,6 +594,21 @@ impl App {
             .cloned()
             .unwrap_or_else(|| QualityPreset::default_presets()[0].clone());
 
+        let initial_vid_prof = sh.active_video_profile.lock().unwrap().clone();
+        let initial_vsteps = initial_vid_prof.default_steps.max(4);
+        let initial_vsampler = if initial_vid_prof.sampler.is_empty() {
+            "er_sde".to_string()
+        } else {
+            initial_vid_prof.sampler.clone()
+        };
+        let initial_vscheduler = if initial_vid_prof.scheduler.is_empty() {
+            "sgm_uniform".to_string()
+        } else {
+            initial_vid_prof.scheduler.clone()
+        };
+        let mut lora_browser = crate::lora::LoraBrowserState::default();
+        lora_browser.items = crate::lora::scan_local_loras(&sh);
+
         App {
             sh,
             tx,
@@ -598,6 +624,8 @@ impl App {
             prompt: String::new(),
             focus_prompt: false,
             progress: None,
+            total_gen_progress: None,
+            taskbar_progress: Default::default(),
             preview_tex: None,
             negative: String::new(),
             steps: initial_steps,
@@ -624,6 +652,7 @@ impl App {
             canvas_zoom: 1.0,
             canvas_pan: vec2(0.0, 0.0),
             show_setup: false,
+            model_picker: crate::model_picker::ModelPickerState::new(&initial_vid_prof),
             loading: 0,
             queue: Vec::new(),
             last_ctrl_v_down: false,
@@ -640,6 +669,13 @@ impl App {
             video_height: 720,
             video_prompt_enhance: true,
             video_negative: String::new(),
+            video_steps: initial_vsteps,
+            video_sampler: initial_vsampler,
+            video_scheduler: initial_vscheduler,
+            video_lora: "None".to_string(),
+            video_lora_strength: 1.0,
+            lora_browser,
+            video_r2v_mode: false,
             show_video_dl_modal: false,
             download_pane: crate::download_ui::DownloadPaneState::default(),
             last_progress_time: None,
@@ -652,7 +688,7 @@ impl App {
             video_presets,
             selected_video_preset_idx: 0,
             auto_quality_level: AutoQualityLevel::Med,
-            compress_enabled: true,
+            compress_enabled: false,
             avg_bitrate: default_preset.avg_bitrate_mbps,
             max_bitrate: default_preset.max_bitrate_mbps,
             selected_codec: default_preset.codec,
@@ -1181,10 +1217,35 @@ impl App {
         });
     }
 
+    pub fn active_video_models_dir(&self) -> PathBuf {
+        let models_dir = self.sh.paths.lock().unwrap().models.clone();
+        if !models_dir.as_os_str().is_empty() {
+            return models_dir;
+        }
+        let cfg = self.sh.cfg.lock().unwrap().clone();
+        engine::candidate_models_dirs(&cfg)
+            .into_iter()
+            .find(|d| d.exists())
+            .unwrap_or_default()
+    }
+
+    /// Returns the active video profile if all its files are downloaded, or falls back
+    /// to any other completely downloaded video profile (e.g. LTX-Video 2.5 or 2.3)
+    /// so generation isn't blocked while a newly selected default is downloading.
+    pub fn effective_video_profile(&self) -> Option<engine::Profile> {
+        let dir = self.active_video_models_dir();
+        if dir.as_os_str().is_empty() {
+            return None;
+        }
+        let vprof = self.sh.active_video_profile.lock().unwrap().clone();
+        if vprof.missing_in_dir(&dir).is_empty() {
+            return Some(vprof);
+        }
+        engine::Profile::find_downloaded_video_profile(&dir)
+    }
+
     pub fn has_video_models(&self) -> bool {
-        let paths = self.sh.paths.lock().unwrap();
-        let models_dir = &paths.models;
-        models_dir.join("checkpoints").join("ltx-2.3-22b-dev-fp8.safetensors").exists()
+        self.effective_video_profile().is_some()
     }
 
     fn start_generation(&mut self, ctx: &egui::Context) {
@@ -1199,6 +1260,24 @@ impl App {
     }
 
     fn start_video_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
+        let active_vprof = self.sh.active_video_profile.lock().unwrap().clone();
+        let vprof = self.effective_video_profile().unwrap_or_else(|| active_vprof.clone());
+        let is_fallback = vprof.id != active_vprof.id;
+        let arch = if vprof.is_minimax_h3() {
+            comfy::VideoArch::MiniMaxH3
+        } else if vprof.is_ltx25() {
+            comfy::VideoArch::Ltx25
+        } else {
+            comfy::VideoArch::Ltx23
+        };
+        let model_label = if vprof.is_minimax_h3() {
+            if is_fallback { "MiniMax H3 (fallback)" } else { "MiniMax H3" }
+        } else if vprof.is_ltx25() {
+            if is_fallback { "LTX-Video 2.5 (fallback)" } else { "LTX-Video 2.5" }
+        } else {
+            if is_fallback { "LTX-Video 2.3 (fallback)" } else { "LTX-Video 2.3" }
+        };
+
         // If a video is currently loaded in the player, automatically extract the frame
         // the user has scrubbed to as the start frame for the next shot!
         let (base_png_opt, scrubbed_frame_ci) = if let Some(ref player) = self.video_player {
@@ -1221,13 +1300,37 @@ impl App {
         } else {
             (self.active_node().map(|n| n.png.clone()), None)
         };
-        let is_t2v = base_png_opt.is_none();
+
+        let use_r2v = arch == comfy::VideoArch::MiniMaxH3 && self.video_r2v_mode && !self.refs.is_empty();
+        if use_r2v {
+            let models_dir = self.active_video_models_dir();
+            if !vprof.has_r2v_model(&models_dir) {
+                self.prompt = prompt;
+                self.status = "Reference-to-Video requires the Ref2VA model. Download it in the top-left References panel.".to_string();
+                return;
+            }
+        }
+        let ref_images = if use_r2v {
+            self.refs.iter().map(|r| r.png.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let last_frame = if arch == comfy::VideoArch::MiniMaxH3 && !use_r2v && base_png_opt.is_some() && !self.refs.is_empty() {
+            Some(self.refs[0].png.clone())
+        } else {
+            None
+        };
+        let is_t2v = base_png_opt.is_none() && !use_r2v;
 
         self.generating = true;
-        self.status = if is_t2v {
-            "Generating video from text (LTX-2.3)...".into()
+        self.status = if use_r2v {
+            format!("Generating Reference-to-Video with {} ref(s) ({model_label})...", ref_images.len())
+        } else if last_frame.is_some() {
+            format!("Generating First+Last frame continuation ({model_label})...")
+        } else if is_t2v {
+            format!("Generating video from text ({model_label})...")
         } else {
-            "Generating next shot from start frame (LTX-2.3)...".into()
+            format!("Generating next shot from start frame ({model_label})...")
         };
         self.error = None;
         self.generating_parent_id = self.active_node_id;
@@ -1251,7 +1354,14 @@ impl App {
 
         self.generating_dims = Some((self.video_width, self.video_height));
 
+        let lora_name = if self.video_lora != "None" && !self.video_lora.is_empty() {
+            Some(self.video_lora.clone())
+        } else {
+            None
+        };
+
         let vparams = comfy::VideoParams {
+            arch,
             prompt: self.generating_prompt.clone(),
             negative: self.video_negative.clone(),
             width: self.video_width,
@@ -1259,11 +1369,30 @@ impl App {
             duration: self.video_duration,
             fps: self.video_fps,
             seed,
+            steps: self.video_steps,
+            cfg: vprof.default_cfg,
+            sampler: self.video_sampler.clone(),
+            scheduler: self.video_scheduler.clone(),
+            denoise: 1.0,
             prompt_enhance: self.video_prompt_enhance,
+            last_frame,
+            ref_images,
+            use_r2v,
+            lora_name,
+            lora_strength: self.video_lora_strength,
+            unet_name: vprof.fl2va_unet_name(),
+            ref2va_unet_name: vprof.ref2va_unet_name(),
+            clip_name: vprof.clip_name(),
+            vae_name: vprof.video_vae_name(),
+            audio_vae_name: vprof.audio_vae_name(),
+            ckpt_name: vprof.file("checkpoints"),
+            text_encoder: vprof.clip_name(),
+            latent_upscale_model: vprof.upscaler_name(),
             ..Default::default()
         };
 
         self.progress = None;
+        self.total_gen_progress = Some(0.02);
         if let Some(ci) = scrubbed_frame_ci {
             self.preview_tex = Some(ctx.load_texture("locked_start_frame", ci, egui::TextureOptions::LINEAR));
         } else {
@@ -1280,6 +1409,13 @@ impl App {
         let prog_cb = Arc::new(move |value: u32, max: u32| {
             let _ = tx_p.send(Ev::Progress { value, max });
             ctx_p.request_repaint();
+        });
+
+        let tx_tp = tx.clone();
+        let ctx_tp = ctx.clone();
+        let total_prog_cb = Arc::new(move |frac: f32| {
+            let _ = tx_tp.send(Ev::TotalProgress(frac));
+            ctx_tp.request_repaint();
         });
 
         let tx_prev = tx.clone();
@@ -1306,6 +1442,7 @@ impl App {
                     ctx.request_repaint();
                 },
                 prog_cb,
+                total_prog_cb,
                 prev_cb,
             );
             match res {
@@ -1399,6 +1536,7 @@ impl App {
         };
 
         self.progress = None;
+        self.total_gen_progress = Some(0.02);
         self.preview_tex = None;
         self.last_progress_time = None;
         self.last_progress_val = 0;
@@ -1409,6 +1547,13 @@ impl App {
         let prog_cb = Arc::new(move |value: u32, max: u32| {
             let _ = tx_p.send(Ev::Progress { value, max });
             ctx_p.request_repaint();
+        });
+
+        let tx_tp = tx.clone();
+        let ctx_tp = ctx.clone();
+        let total_prog_cb = Arc::new(move |frac: f32| {
+            let _ = tx_tp.send(Ev::TotalProgress(frac));
+            ctx_tp.request_repaint();
         });
 
         let tx_prev = tx.clone();
@@ -1435,6 +1580,7 @@ impl App {
                     ctx.request_repaint();
                 },
                 prog_cb,
+                total_prog_cb,
                 prev_cb,
             );
             match res {
@@ -1564,6 +1710,9 @@ impl App {
                     self.last_progress_time = Some(now);
                     self.last_progress_val = value;
                 }
+                Ev::TotalProgress(frac) => {
+                    self.total_gen_progress = Some(frac.clamp(0.0, 1.0));
+                }
                 Ev::Preview(img) => {
                     if self.generating {
                         self.preview_tex = Some(ctx.load_texture("live_preview", img, egui::TextureOptions::LINEAR));
@@ -1574,6 +1723,7 @@ impl App {
                     self.generating_dims = None;
                     self.status = "Idle".into();
                     self.progress = None;
+                    self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
                     let [out_w, out_h] = img.size;
@@ -1647,6 +1797,7 @@ impl App {
                     self.generating_dims = None;
                     self.status = "Idle".into();
                     self.progress = None;
+                    self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
                     self.generation_retries = 0;
@@ -1722,6 +1873,7 @@ impl App {
                     self.generating = false;
                     self.generating_dims = None;
                     self.progress = None;
+                    self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
                     self.queue.clear();
@@ -2423,7 +2575,7 @@ fn is_win_ctrl_v() -> bool {
             });
     }
 
-    fn render_update_button(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn render_update_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let (up_avail, latest, is_dl, dl_prog, applied, checked) = {
             let st = self.updater.lock().unwrap();
             (
@@ -2435,6 +2587,7 @@ fn is_win_ctrl_v() -> bool {
                 st.checked,
             )
         };
+        let model_dl = crate::download_ui::active_download_progress(&self.sh);
 
         if applied {
             let (rect, resp) = ui.allocate_exact_size(vec2(80.0, 24.0), Sense::click());
@@ -2458,7 +2611,7 @@ fn is_win_ctrl_v() -> bool {
                 crate::updater::restart_application();
             }
         } else if is_dl {
-            let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 24.0), Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 24.0), Sense::click());
             let p = ui.painter();
             p.rect_filled(rect, 12.0, Color32::from_rgb(20, 24, 34));
             p.rect_stroke(rect, 12.0, Stroke::new(1.0, DISCORD_GREEN), StrokeKind::Inside);
@@ -2470,7 +2623,28 @@ fn is_win_ctrl_v() -> bool {
                 egui::FontId::proportional(11.5),
                 Color32::WHITE,
             );
-            let _ = resp.on_hover_text(format!("Downloading update: {:.0}%", dl_prog * 100.0));
+            let resp = resp.on_hover_text(format!("Downloading app update: {:.0}%\nClick to open Updates & Downloads", dl_prog * 100.0));
+            if resp.clicked() {
+                self.download_pane.toggle(&self.sh);
+            }
+        } else if let Some((m_prog, paused, summary)) = model_dl {
+            let border_col = if paused { AMBER } else { ACCENT };
+            let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 24.0), Sense::click());
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, Color32::from_rgb(20, 24, 34));
+            p.rect_stroke(rect, 12.0, Stroke::new(1.0, border_col), StrokeKind::Inside);
+            draw_update_arrow_icon(&p, rect.left_center() + vec2(14.0, 0.0), border_col);
+            p.text(
+                rect.center() + vec2(8.0, 0.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.0}%", m_prog * 100.0),
+                egui::FontId::proportional(11.5),
+                Color32::WHITE,
+            );
+            let resp = resp.on_hover_text(format!("{summary}\nClick to open Updates & Downloads"));
+            if resp.clicked() {
+                self.download_pane.toggle(&self.sh);
+            }
         } else if up_avail {
             let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 24.0), Sense::click());
             let bg = if resp.hovered() {
@@ -2481,35 +2655,176 @@ fn is_win_ctrl_v() -> bool {
             let p = ui.painter();
             p.rect_filled(rect, 12.0, bg);
             draw_update_arrow_icon(&p, rect.center(), Color32::WHITE);
-            let resp = resp.on_hover_text(format!("Update v{latest} available! Click to update now"));
+            let resp = resp.on_hover_text(format!("Update v{latest} available! Click to open Updates & Downloads"));
             if resp.clicked() {
-                crate::updater::download_and_install_update(self.updater.clone(), ctx.clone());
+                self.download_pane.toggle(&self.sh);
             }
         } else {
             let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 24.0), Sense::click());
-            let bg = if resp.hovered() { CARD_HI } else { Color32::TRANSPARENT };
+            let bg = if resp.hovered() || self.download_pane.is_expanded { CARD_HI } else { Color32::TRANSPARENT };
             let p = ui.painter();
-            if resp.hovered() {
+            if resp.hovered() || self.download_pane.is_expanded {
                 p.rect_filled(rect, 4.0, bg);
             }
-            let icon_col = if resp.hovered() { TEXT } else { DIM };
+            let icon_col = if resp.hovered() || self.download_pane.is_expanded { TEXT } else { DIM };
             draw_update_arrow_icon(&p, rect.center(), icon_col);
             let cur_ver = env!("CARGO_PKG_VERSION");
             let tip = if checked {
-                format!("Image Studio v{cur_ver} (Up to date)\nClick to check for updates")
+                format!("Image Studio v{cur_ver} (Up to date)\nClick for Updates & Downloads")
             } else {
-                format!("Image Studio v{cur_ver}\nClick to check for updates")
+                format!("Image Studio v{cur_ver}\nClick for Updates & Downloads")
             };
             let resp = resp.on_hover_text(tip);
             if resp.clicked() {
-                crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
+                self.download_pane.toggle(&self.sh);
+                if self.download_pane.is_expanded {
+                    crate::updater::check_for_updates(self.updater.clone(), ctx.clone());
+                }
             }
         }
     }
 
-    // Left Panel: Compact Reference Strip (+ Docked History if Left)
+    fn render_refs_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_h: Option<f32>, subtitle: &str, compact: bool) {
+        ui.horizontal(|ui| {
+            heading(ui, "REFERENCES");
+            ui.label(RichText::new(format!("{}/{}", self.refs.len(), MAX_REFS)).color(DIM).size(11.0));
+        });
+        ui.label(RichText::new(subtitle).color(DIM).size(if compact { 10.5 } else { 11.0 }));
+        ui.add_space(if compact { 2.0 } else { 3.0 });
+
+        let mut remove = None;
+        let thumb_sz = if compact { 44.0 } else { 50.0 };
+        let mut area = egui::ScrollArea::vertical().id_salt("refs_scroll");
+        if let Some(h) = max_h {
+            area = area.max_height(h);
+        }
+        area.show(ui, |ui| {
+            for (i, r) in self.refs.iter().enumerate() {
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0, LINE))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::same(if compact { 5 } else { 6 }))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(vec2(thumb_sz, thumb_sz), Sense::hover());
+                            let p = ui.painter_at(rect);
+                            p.rect_filled(rect, 4, Color32::from_rgb(15, 17, 24));
+                            let s = fit(r.tex.size_vec2(), rect.shrink(2.0).size());
+                            p.image(r.tex.id(), Rect::from_center_size(rect.center(), s), FULL_UV, Color32::WHITE);
+                            p.rect_stroke(rect, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
+
+                            ui.vertical(|ui| {
+                                ui.add(egui::Label::new(RichText::new(&r.name).size(if compact { 10.5 } else { 11.0 }).strong()).truncate());
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(RichText::new(format!("{}x{}", r.width, r.height)).size(if compact { 10.0 } else { 10.5 }).color(DIM));
+                                    if ui.small_button("X").on_hover_text("Remove reference").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            });
+                        });
+                    });
+                ui.add_space(if compact { 2.0 } else { 3.0 });
+            }
+
+            let add_btn = egui::Button::new(RichText::new("+ Add Reference").size(if compact { 11.5 } else { 12.0 }).strong().color(ACCENT_GLOW))
+                .fill(CARD_HI)
+                .stroke(Stroke::new(1.0, ACCENT.linear_multiply(0.5)))
+                .corner_radius(6)
+                .min_size(vec2(ui.available_width(), if compact { 26.0 } else { 30.0 }));
+            if ui.add(add_btn).clicked() {
+                self.pick_images(ctx, Target::Ref, true);
+            }
+        });
+
+        if let Some(i) = remove {
+            self.refs.remove(i);
+        }
+    }
+
+    // Left Panel: Compact Reference Strip (+ Docked History / Video Trim History)
     fn refs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.mode == StudioMode::Video {
+            let vprof = self.sh.active_video_profile.lock().unwrap().clone();
+            let is_h3 = vprof.is_minimax_h3();
+            let models_dir = self.active_video_models_dir();
+            let has_r2v = !is_h3 || (!models_dir.as_os_str().is_empty() && vprof.has_r2v_model(&models_dir));
+            let avail_h = ui.available_height();
+            let refs_max_h = (avail_h * 0.30).clamp(90.0, 200.0);
+            let sub = if is_h3 {
+                "R2V refs (<Picture 1>..) or End Frame"
+            } else {
+                "Reference images (switch to MiniMax H3 for R2V)"
+            };
+            self.render_refs_list(ui, ctx, Some(refs_max_h), sub, true);
+            if is_h3 && !self.refs.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.video_r2v_mode, false, "End Frame");
+                    ui.selectable_value(&mut self.video_r2v_mode, true, "R2V Multi-Ref");
+                });
+            }
+            if is_h3 && !has_r2v {
+                if let Some(r2v_file) = vprof.r2v_model_file() {
+                    let r2v_gb = r2v_file.size_bytes as f64 / 1_000_000_000.0;
+                    let r2v_dl = self.sh.dl_r2v_model.load(Ordering::SeqCst);
+                    let is_dl_this = self
+                        .sh
+                        .model_dl_progress
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|p| p.current_file == r2v_file.filename);
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(CARD)
+                        .stroke(Stroke::new(1.0, AMBER.linear_multiply(0.5)))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Reference-to-Video (R2V) requires a separate Ref2VA model (~{r2v_gb:.1} GB). End Frame continuation uses the base FL2VA model."
+                                ))
+                                .size(10.5)
+                                .color(DIM),
+                            );
+                            ui.add_space(3.0);
+                            if is_dl_this {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Downloading Ref2VA...").size(10.5).color(ACCENT_GLOW).strong());
+                                    if ui.small_button("Cancel").clicked() {
+                                        engine::toggle_r2v_download(&self.sh, ctx, false);
+                                    }
+                                });
+                            } else if r2v_dl {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Ref2VA queued (downloads last)").size(10.5).color(ACCENT_GLOW));
+                                    if ui.small_button("Cancel").clicked() {
+                                        engine::toggle_r2v_download(&self.sh, ctx, false);
+                                    }
+                                });
+                            } else {
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("Download R2V Model (~{r2v_gb:.1} GB)"))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(TEXT),
+                                )
+                                .fill(CARD_HI)
+                                .stroke(Stroke::new(1.0, ACCENT.linear_multiply(0.6)))
+                                .min_size(vec2(ui.available_width(), 24.0));
+                                if ui.add(btn).clicked() {
+                                    engine::toggle_r2v_download(&self.sh, ctx, true);
+                                }
+                            }
+                        });
+                }
+            }
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
             self.render_trim_history_ui(ui, ctx);
             ui.add_space(6.0);
             ui.separator();
@@ -2520,60 +2835,7 @@ fn is_win_ctrl_v() -> bool {
         if self.history_dock == HistoryDock::Left {
             let avail_h = ui.available_height();
             let refs_max_h = (avail_h * 0.40).clamp(110.0, 240.0);
-
-            ui.horizontal(|ui| {
-                heading(ui, "REFERENCES");
-                ui.label(RichText::new(format!("{}/{}", self.refs.len(), MAX_REFS)).color(DIM).size(11.0));
-            });
-            ui.label(RichText::new("Drag extra images for reference").color(DIM).size(10.5));
-            ui.add_space(2.0);
-
-            let mut remove = None;
-
-            egui::ScrollArea::vertical().id_salt("refs_scroll").max_height(refs_max_h).show(ui, |ui| {
-                for (i, r) in self.refs.iter().enumerate() {
-                    egui::Frame::new()
-                        .fill(CARD)
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(5))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                                let p = ui.painter_at(rect);
-                                p.rect_filled(rect, 4, Color32::from_rgb(15, 17, 24));
-                                let s = fit(r.tex.size_vec2(), rect.shrink(2.0).size());
-                                p.image(r.tex.id(), Rect::from_center_size(rect.center(), s), FULL_UV, Color32::WHITE);
-                                p.rect_stroke(rect, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
-
-                                ui.vertical(|ui| {
-                                    ui.add(egui::Label::new(RichText::new(&r.name).size(10.5).strong()).truncate());
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.label(RichText::new(format!("{}x{}", r.width, r.height)).size(10.0).color(DIM));
-                                        if ui.small_button("X").on_hover_text("Remove reference").clicked() {
-                                            remove = Some(i);
-                                        }
-                                    });
-                                });
-                            });
-                        });
-                    ui.add_space(2.0);
-                }
-
-                let add_btn = egui::Button::new(RichText::new("+ Add Reference").size(11.5).strong().color(ACCENT_GLOW))
-                    .fill(CARD_HI)
-                    .stroke(Stroke::new(1.0, ACCENT.linear_multiply(0.5)))
-                    .corner_radius(6)
-                    .min_size(vec2(ui.available_width(), 26.0));
-                if ui.add(add_btn).clicked() {
-                    self.pick_images(ctx, Target::Ref, true);
-                }
-            });
-
-            if let Some(i) = remove {
-                self.refs.remove(i);
-            }
+            self.render_refs_list(ui, ctx, Some(refs_max_h), "Drag extra images for reference", true);
 
             ui.add_space(4.0);
             ui.separator();
@@ -2581,59 +2843,7 @@ fn is_win_ctrl_v() -> bool {
 
             self.render_history_ui(ui);
         } else {
-            ui.horizontal(|ui| {
-                heading(ui, "REFERENCES");
-                ui.label(RichText::new(format!("{}/{}", self.refs.len(), MAX_REFS)).color(DIM).size(11.0));
-            });
-            ui.label(RichText::new("Drag extra images here for reference").color(DIM).size(11.0));
-            ui.add_space(3.0);
-
-            let mut remove = None;
-
-            egui::ScrollArea::vertical().id_salt("refs_scroll").show(ui, |ui| {
-                for (i, r) in self.refs.iter().enumerate() {
-                    egui::Frame::new()
-                        .fill(CARD)
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(vec2(50.0, 50.0), Sense::hover());
-                                let p = ui.painter_at(rect);
-                                p.rect_filled(rect, 4, Color32::from_rgb(15, 17, 24));
-                                let s = fit(r.tex.size_vec2(), rect.shrink(2.0).size());
-                                p.image(r.tex.id(), Rect::from_center_size(rect.center(), s), FULL_UV, Color32::WHITE);
-                                p.rect_stroke(rect, 4, Stroke::new(1.0, LINE), StrokeKind::Inside);
-
-                                ui.vertical(|ui| {
-                                    ui.add(egui::Label::new(RichText::new(&r.name).size(11.0).strong()).truncate());
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.label(RichText::new(format!("{}x{}", r.width, r.height)).size(10.5).color(DIM));
-                                        if ui.small_button("X").on_hover_text("Remove reference").clicked() {
-                                            remove = Some(i);
-                                        }
-                                    });
-                                });
-                            });
-                        });
-                    ui.add_space(3.0);
-                }
-
-                let add_btn = egui::Button::new(RichText::new("+ Add Reference").size(12.0).strong().color(ACCENT_GLOW))
-                    .fill(CARD_HI)
-                    .stroke(Stroke::new(1.0, ACCENT.linear_multiply(0.5)))
-                    .corner_radius(6)
-                    .min_size(vec2(ui.available_width(), 30.0));
-                if ui.add(add_btn).clicked() {
-                    self.pick_images(ctx, Target::Ref, true);
-                }
-            });
-
-            if let Some(i) = remove {
-                self.refs.remove(i);
-            }
+            self.render_refs_list(ui, ctx, None, "Drag extra images here for reference", false);
         }
     }
 
@@ -2686,10 +2896,89 @@ fn is_win_ctrl_v() -> bool {
     }
 
     fn render_video_settings(&mut self, ui: &mut egui::Ui) {
+        let active_vprof = self.sh.active_video_profile.lock().unwrap().clone();
+        let vprof = self.effective_video_profile().unwrap_or_else(|| active_vprof.clone());
+        let is_fallback = vprof.id != active_vprof.id;
+        let is_h3 = vprof.is_minimax_h3();
+        let is_ltx25 = vprof.is_ltx25();
+        let lora_family = crate::lora::VideoModelFamily::from_profile(&vprof);
+
+        if !self.lora_browser.remote_fetched && !self.lora_browser.remote_fetching {
+            crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ui.ctx());
+        }
+
         egui::ScrollArea::vertical().id_salt("video_settings_scroll").show(ui, |ui| {
             card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    heading(ui, "VIDEO MODEL");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Change in Setup...").clicked() {
+                            self.show_setup = true;
+                        }
+                    });
+                });
+                ui.label(RichText::new(&vprof.name).size(11.5).strong().color(TEXT));
+                if is_fallback {
+                    ui.label(
+                        RichText::new(format!(
+                            "Using {} while {} downloads in background.",
+                            vprof.name, active_vprof.name
+                        ))
+                        .size(10.5)
+                        .color(AMBER),
+                    );
+                }
+                if let Some(gpu_vram) = engine::detect_gpu_vram_gb() {
+                    if vprof.recommended_vram_gb > gpu_vram {
+                        ui.label(
+                            RichText::new(format!(
+                                "[!] Profile recommends {}GB VRAM (detected {}GB) - may page RAM or OOM",
+                                vprof.recommended_vram_gb, gpu_vram
+                            ))
+                            .size(10.5)
+                            .color(AMBER),
+                        );
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+
+            card(ui, |ui| {
                 heading(ui, "WORKFLOW");
-                if self.active_node().is_some() {
+                if is_h3 {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.video_r2v_mode, false, "T2V / I2V / Continuation");
+                        ui.selectable_value(&mut self.video_r2v_mode, true, "Reference (R2V)");
+                    });
+                    ui.add_space(2.0);
+                    if self.video_r2v_mode {
+                        let models_dir = self.active_video_models_dir();
+                        let has_r2v = !models_dir.as_os_str().is_empty() && vprof.has_r2v_model(&models_dir);
+                        if !has_r2v {
+                            ui.label(RichText::new("Ref2VA model required for R2V. Download it in the top-left References panel.").size(10.5).color(AMBER));
+                        } else if self.refs.is_empty() {
+                            ui.label(RichText::new("Add 1-9 reference images in the left References panel, then cite them in your prompt as <Picture 1>, <Picture 2>, etc.").size(10.5).color(AMBER));
+                        } else {
+                            ui.label(RichText::new(format!("Reference-to-Video Active ({} ref image(s) linked as <Picture 1>..)", self.refs.len())).size(11.0).strong().color(ACCENT_GLOW));
+                        }
+                    } else if self.active_node().is_some() && !self.refs.is_empty() {
+                        ui.label(RichText::new("First + Last Frame Continuation").strong().color(ACCENT_GLOW));
+                        ui.label(RichText::new("Canvas frame is Start Frame; Reference #1 is End Frame.").size(10.5).color(DIM));
+                    } else if self.active_node().is_some() {
+                        ui.label(RichText::new("Image-to-Video").strong().color(ACCENT_GLOW));
+                        ui.label(RichText::new("Canvas image/scrubbed frame is Start Frame. Add a Reference to set an End Frame.").size(10.5).color(DIM));
+                        if ui.button("Switch to Text-to-Video (Deselect Image)").clicked() {
+                            self.active_node_id = None;
+                        }
+                    } else {
+                        ui.label(RichText::new("Text-to-Video").strong().color(GREEN));
+                        ui.label(RichText::new("Generates video + synced stereo audio from your text prompt.").size(10.5).color(DIM));
+                        if ui.button("Load Image for Image-to-Video...").clicked() {
+                            self.pick_images(ui.ctx(), Target::Base, false);
+                        }
+                    }
+                } else if self.active_node().is_some() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Image-to-Video").strong().color(ACCENT_GLOW));
                     });
@@ -2745,12 +3034,12 @@ fn is_win_ctrl_v() -> bool {
                 // 2. Clean Presets: 360p, 480p, 720p, 1080p, 1440p, 4K
                 let is_portrait = self.video_orientation == VideoOrientation::Portrait;
                 let presets: [(&str, u32, u32, &str); 6] = [
-                    ("360p", 640, 384, "640x384 • Fast preview, minimal VRAM"),
-                    ("480p", 832, 448, "832x448 • Smooth preview, standard definition"),
-                    ("720p", 1280, 704, "1280x704 • Standard HD (Recommended standard)"),
-                    ("1080p", 1920, 1088, "1920x1088 • Full HD (Crisp, requires ~16GB VRAM)"),
-                    ("1440p", 2560, 1408, "2560x1408 • 2K Quad HD (Requires ~22GB VRAM)"),
-                    ("4K", 3840, 2176, "3840x2176 • Ultra HD (Requires 32GB+ VRAM or heavy paging)"),
+                    ("360p", 640, 384, "640x384 - Fast preview, minimal VRAM"),
+                    ("480p", 832, 448, "832x448 - Smooth preview, standard definition"),
+                    ("720p", 1280, 704, "1280x704 - Standard HD (Recommended standard)"),
+                    ("1080p", 1920, 1088, "1920x1088 - Full HD (Requires ~16GB+ VRAM)"),
+                    ("1440p", 2560, 1408, "2560x1408 - 2K Quad HD (Requires ~22GB+ VRAM)"),
+                    ("4K", 3840, 2176, "3840x2176 - Ultra HD (Requires 32GB+ VRAM or heavy paging)"),
                 ];
 
                 ui.horizontal_wrapped(|ui| {
@@ -2761,7 +3050,7 @@ fn is_win_ctrl_v() -> bool {
                             .fill(if is_sel { ACCENT } else { CARD_HI })
                             .stroke(Stroke::new(1.0, if is_sel { ACCENT_GLOW } else { LINE }))
                             .corner_radius(5);
-                        if ui.add(btn).on_hover_text(format!("{}x{} px • {}", target_w, target_h, desc)).clicked() {
+                        if ui.add(btn).on_hover_text(format!("{}x{} px - {}", target_w, target_h, desc)).clicked() {
                             self.video_base_w = target_w;
                             self.video_base_h = target_h;
                             self.video_scale = 1.0;
@@ -2806,7 +3095,7 @@ fn is_win_ctrl_v() -> bool {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Output: {} × {} px", self.video_width, self.video_height)).size(11.0).color(TEXT).strong());
+                    ui.label(RichText::new(format!("Output: {} x {} px", self.video_width, self.video_height)).size(11.0).color(TEXT).strong());
                     let ratio = self.video_width as f32 / self.video_height.max(1) as f32;
                     ui.label(RichText::new(format!("({:.2}:1)", ratio)).size(10.5).color(DIM));
                 });
@@ -2831,7 +3120,7 @@ fn is_win_ctrl_v() -> bool {
                                     });
                                 });
                                 ui.label(
-                                    RichText::new("This resolution & duration combination exceeds your GPU's dedicated VRAM. Windows will use shared system RAM paging, causing generation steps to slow down by 10x–100x or appear stalled.\n\nTip: Reduce duration, lower the Resolution Scale slider, or choose 480p / 360p for fast generation.")
+                                    RichText::new("This resolution & duration combination exceeds your GPU's dedicated VRAM. Windows will use shared system RAM paging, causing generation steps to slow down by 10x-100x or appear stalled.\n\nTip: Reduce duration, lower the Resolution Scale slider, or choose 480p / 360p for fast generation.")
                                         .size(10.5)
                                         .color(Color32::from_rgb(235, 205, 185)),
                                 );
@@ -2864,32 +3153,70 @@ fn is_win_ctrl_v() -> bool {
                     ui.add(egui::Slider::new(&mut self.video_duration, 1..=15).suffix("s"));
                 });
 
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Framerate:").size(11.5).color(TEXT));
-                    for fps_opt in [24, 25, 30] {
-                        let sel = self.video_fps == fps_opt;
-                        if ui.selectable_label(sel, format!("{fps_opt} fps")).clicked() {
-                            self.video_fps = fps_opt;
+                if is_h3 {
+                    self.video_fps = 24;
+                    let raw_frames = (self.video_duration * 24).max(5);
+                    let rem = (5 - (raw_frames % 17) as i32).rem_euclid(17) as u32;
+                    let snapped = raw_frames + rem;
+                    ui.label(RichText::new(format!("Output grid: {} frames ({}s @ 24 fps)", snapped, self.video_duration)).size(11.0).color(DIM));
+                } else {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Framerate:").size(11.5).color(TEXT));
+                        for fps_opt in [24, 25, 30] {
+                            let sel = self.video_fps == fps_opt;
+                            if ui.selectable_label(sel, format!("{fps_opt} fps")).clicked() {
+                                self.video_fps = fps_opt;
+                            }
                         }
-                    }
-                });
+                    });
 
-                let total_frames = self.video_duration * self.video_fps;
-                ui.add_space(2.0);
-                ui.label(RichText::new(format!("Total frames: {} frames ({}s @ {} fps)", total_frames, self.video_duration, self.video_fps)).size(11.0).color(DIM));
+                    let total_frames = self.video_duration * self.video_fps;
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(format!("Total frames: {} frames ({}s @ {} fps)", total_frames, self.video_duration, self.video_fps)).size(11.0).color(DIM));
+                }
             });
+
+            if !is_h3 && !is_ltx25 {
+                ui.add_space(6.0);
+
+                card(ui, |ui| {
+                    heading(ui, "AI PROMPT ENHANCER");
+                    let chk = egui::Checkbox::new(&mut self.video_prompt_enhance, RichText::new("Gemma 3 12B Enhancer").strong());
+                    ui.add(chk);
+                    ui.label(
+                        RichText::new("Expands short prompts into detailed cinematic visual scripts using local Gemma 3 12B before rendering.")
+                            .size(10.5)
+                            .color(DIM),
+                    );
+                });
+            }
 
             ui.add_space(6.0);
 
             card(ui, |ui| {
-                heading(ui, "AI PROMPT ENHANCER");
-                let chk = egui::Checkbox::new(&mut self.video_prompt_enhance, RichText::new("Gemma 3 12B Enhancer").strong());
-                ui.add(chk);
-                ui.label(
-                    RichText::new("Expands short prompts into detailed cinematic visual scripts using local Gemma 3 12B before rendering.")
-                        .size(10.5)
-                        .color(DIM),
+                ui.horizontal(|ui| {
+                    heading(ui, "VIDEO LORA");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Refresh").on_hover_text("Rescan models/loras and ComfyUI LoRA browser thumbnails").clicked() {
+                            self.lora_browser.items = crate::lora::scan_local_loras(&self.sh);
+                            self.lora_browser.thumbs.clear();
+                            self.lora_browser.loading_thumbs.clear();
+                            self.lora_browser.remote_fetched = false;
+                            crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ui.ctx());
+                        }
+                    });
+                });
+                let ctx = ui.ctx().clone();
+                crate::lora::render_lora_carousel(
+                    ui,
+                    &ctx,
+                    &mut self.lora_browser,
+                    &mut self.video_lora,
+                    &mut self.video_lora_strength,
+                    lora_family,
+                    vprof.default_steps,
+                    &mut self.video_steps,
                 );
             });
 
@@ -2897,6 +3224,35 @@ fn is_win_ctrl_v() -> bool {
 
             card(ui, |ui| {
                 heading(ui, "SAMPLING & SEED");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Sampler:").size(11.0).color(TEXT));
+                    egui::ComboBox::from_id_salt("video_sampler_combo")
+                        .selected_text(&self.video_sampler)
+                        .show_ui(ui, |ui| {
+                            for s in ["er_sde", "euler", "res_multistep", "euler_ancestral", "dpmpp_2m_sde"] {
+                                ui.selectable_value(&mut self.video_sampler, s.to_string(), s);
+                            }
+                        });
+                });
+                if is_h3 {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Scheduler:").size(11.0).color(TEXT));
+                        egui::ComboBox::from_id_salt("video_scheduler_combo")
+                            .selected_text(&self.video_scheduler)
+                            .show_ui(ui, |ui| {
+                                for sc in ["sgm_uniform", "simple", "beta", "normal"] {
+                                    ui.selectable_value(&mut self.video_scheduler, sc.to_string(), sc);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Steps:").size(11.0).color(TEXT));
+                        ui.add(egui::Slider::new(&mut self.video_steps, 4..=40));
+                    });
+                } else {
+                    ui.label(RichText::new("Distilled 2-stage schedule (8 + 3 steps @ CFG 1.0)").size(10.5).color(DIM));
+                }
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.random_seed, "Random");
                     if !self.random_seed {
@@ -2909,17 +3265,19 @@ fn is_win_ctrl_v() -> bool {
                 });
             });
 
-            ui.add_space(6.0);
+            if !is_h3 {
+                ui.add_space(6.0);
 
-            card(ui, |ui| {
-                heading(ui, "NEGATIVE PROMPT");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.video_negative)
-                        .desired_rows(3)
-                        .desired_width(ui.available_width())
-                        .hint_text("e.g. video game, cartoon, CGI, 3D render, ugly, blurry, deformed"),
-                );
-            });
+                card(ui, |ui| {
+                    heading(ui, "NEGATIVE PROMPT");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.video_negative)
+                            .desired_rows(3)
+                            .desired_width(ui.available_width())
+                            .hint_text("e.g. video game, cartoon, CGI, 3D render, ugly, blurry, deformed"),
+                    );
+                });
+            }
 
             ui.add_space(6.0);
 
@@ -3036,6 +3394,54 @@ fn is_win_ctrl_v() -> bool {
                             self.apply_auto_bitrate();
                         }
                     });
+
+                    ui.add_space(6.0);
+                    let (est_dur, src_bytes_opt) = if let Some(ref player) = self.video_player {
+                        let dur = (player.trim_end_sec.unwrap_or(player.duration_sec) - player.trim_start_sec.unwrap_or(0.0)).max(0.1);
+                        let full_dur = player.duration_sec.max(0.001);
+                        let src_bytes = std::fs::metadata(&player.file_path).map(|m| m.len()).unwrap_or(0);
+                        let scaled_src = ((src_bytes as f64) * (dur / full_dur).clamp(0.0, 1.0)) as u64;
+                        (dur, if scaled_src > 0 { Some(scaled_src) } else { None })
+                    } else {
+                        (self.video_duration.max(1) as f64, None)
+                    };
+                    let est_bytes = (((self.avg_bitrate as f64) + 0.128) * 1_000_000.0 / 8.0 * est_dur) as u64;
+                    let fmt_size = |b: u64| -> String {
+                        if b >= 1_000_000 {
+                            format!("{:.2} MB", b as f64 / 1_000_000.0)
+                        } else {
+                            format!("{} KB", (b / 1024).max(1))
+                        }
+                    };
+                    if let Some(src_bytes) = src_bytes_opt {
+                        if est_bytes > src_bytes {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Warning: Estimated output ({}) is larger than source ({}). Lower bitrate or uncheck compression.",
+                                    fmt_size(est_bytes),
+                                    fmt_size(src_bytes)
+                                ))
+                                .size(10.5)
+                                .color(AMBER),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Estimated output: ~{} (source: {})",
+                                    fmt_size(est_bytes),
+                                    fmt_size(src_bytes)
+                                ))
+                                .size(10.5)
+                                .color(DIM),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(format!("Estimated output: ~{}", fmt_size(est_bytes)))
+                                .size(10.5)
+                                .color(DIM),
+                        );
+                    }
 
                     ui.add_space(6.0);
                     if ui.button("+ Save as New Preset...").clicked() {
@@ -3615,6 +4021,15 @@ fn is_win_ctrl_v() -> bool {
 
     fn render_model_checkboxes(&self, ui: &mut egui::Ui) {
         let sh = &self.sh;
+        let vid_prof = sh.active_video_profile.lock().unwrap().clone();
+        let vid_gb = vid_prof.total_size_gb();
+        let vid_short = if vid_prof.is_minimax_h3() {
+            "MiniMax H3"
+        } else if vid_prof.is_ltx25() {
+            "LTX-2.5"
+        } else {
+            "LTX-2.3"
+        };
         egui::Frame::new()
             .fill(Color32::from_rgb(20, 23, 32))
             .stroke(Stroke::new(1.0, LINE))
@@ -3625,14 +4040,14 @@ fn is_win_ctrl_v() -> bool {
                     let mut dl_img = sh.dl_image_model.load(Ordering::SeqCst);
                     let mut dl_vid = sh.dl_video_model.load(Ordering::SeqCst);
 
-                    let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(12.0).strong());
+                    let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 - ~16 GB)").size(12.0).strong());
                     if resp_img.changed() {
                         engine::toggle_model_download(sh, ui.ctx(), true, dl_img);
                     }
 
                     ui.add_space(16.0);
 
-                    let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(12.0).strong());
+                    let resp_vid = ui.checkbox(&mut dl_vid, RichText::new(format!("Video Model ({vid_short} - ~{vid_gb:.0} GB)")).size(12.0).strong());
                     if resp_vid.changed() {
                         engine::toggle_model_download(sh, ui.ctx(), false, dl_vid);
                     }
@@ -4683,10 +5098,18 @@ fn is_win_ctrl_v() -> bool {
 
             let c = rect.center();
             if self.mode == StudioMode::Video {
+                let vid_prof = self.sh.active_video_profile.lock().unwrap().clone();
+                let vid_title = if vid_prof.is_minimax_h3() {
+                    "Video Generation Mode (MiniMax H3)"
+                } else if vid_prof.is_ltx25() {
+                    "Video Generation Mode (LTX-Video 2.5)"
+                } else {
+                    "Video Generation Mode (LTX-Video 2.3)"
+                };
                 p.text(
                     c - vec2(0.0, 36.0),
                     egui::Align2::CENTER_CENTER,
-                    "Video Generation Mode (LTX-Video 2.3)",
+                    vid_title,
                     egui::FontId::proportional(19.0),
                     TEXT,
                 );
@@ -4784,8 +5207,13 @@ fn is_win_ctrl_v() -> bool {
         let err_clone = self.error.clone();
         if let Some(err) = err_clone {
             let mut dismiss = false;
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Error: {err}")).color(RED).size(12.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(RichText::new(format!("Error: {err}")).color(RED).size(12.0)).selectable(true));
+                if ui.small_button("Copy").on_hover_text("Copy error message to clipboard").clicked() {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(err.clone());
+                    }
+                }
                 if ui.small_button("Dismiss").clicked() {
                     dismiss = true;
                 }
@@ -4858,10 +5286,36 @@ fn is_win_ctrl_v() -> bool {
                     } else {
                         "Describe an image to generate from scratch, or paste/drop an image..."
                     };
+                    let st = self.sh.state.lock().unwrap().clone();
+                    let is_ready = matches!(st, EngState::Ready { .. });
+                    let fallback_info: Option<(String, String)> = if self.mode == StudioMode::Video && !self.generating && is_ready {
+                        let active_vprof = self.sh.active_video_profile.lock().unwrap().clone();
+                        self.effective_video_profile().and_then(|eff| {
+                            if eff.id != active_vprof.id {
+                                let short = if eff.is_minimax_h3() {
+                                    "MiniMax H3"
+                                } else if eff.is_ltx25() {
+                                    "LTX 2.5"
+                                } else {
+                                    "LTX 2.3"
+                                };
+                                let tip = format!(
+                                    "Using {} (best available downloaded model) while {} finishes downloading.",
+                                    eff.name, active_vprof.name
+                                );
+                                Some((format!("Using fallback {short}"), tip))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    let controls_w = if fallback_info.is_some() { 304.0 } else { 266.0 };
                     let text_edit = egui::TextEdit::multiline(&mut self.prompt)
                         .id(prompt_id)
                         .desired_rows(2)
-                        .desired_width((ui.available_width() - 320.0).max(180.0))
+                        .desired_width((ui.available_width() - controls_w).max(80.0))
                         .hint_text(hint);
                     let text_resp = ui.add(text_edit);
 
@@ -4878,8 +5332,6 @@ fn is_win_ctrl_v() -> bool {
                         state.store(ctx, prompt_id);
                     }
 
-                    let st = self.sh.state.lock().unwrap().clone();
-                    let is_ready = matches!(st, EngState::Ready { .. });
                     let should_queue = self.generating || !is_ready;
 
                     // Submit on Enter (without Shift)
@@ -4923,33 +5375,91 @@ fn is_win_ctrl_v() -> bool {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+
                         let (is_ok, btn_text, tip) = if self.generating {
                             let q_can = self.can_queue();
                             let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
-                            (ok, "Queue", q_can.err())
+                            (ok, "Queue", q_can.err().map(|s| s.to_string()))
                         } else if !is_ready {
                             let q_can = self.can_queue();
                             let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
-                            (ok, "Queue", Some("Engine setup in progress; prompt will be queued and will generate automatically once ready."))
+                            (ok, "Queue", Some("Engine setup in progress; prompt will be queued and will generate automatically once ready.".to_string()))
                         } else {
                             let g_can = self.can_generate();
                             let ok = g_can.is_ok() && !self.prompt.trim().is_empty();
-                            (ok, "Generate", g_can.err())
+                            let fallback_tip = fallback_info.as_ref().map(|(_, t)| t.clone());
+                            (ok, "Generate", g_can.err().map(|s| s.to_string()).or(fallback_tip))
                         };
 
-                        let send_btn = egui::Button::new(
-                            RichText::new(btn_text)
-                                .size(13.5)
-                                .strong()
-                                .color(if is_ok { Color32::WHITE } else { DIM }),
-                        )
-                        .fill(if is_ok { ACCENT } else { CARD })
-                        .stroke(Stroke::new(1.0, if is_ok { ACCENT_GLOW } else { LINE }))
-                        .corner_radius(8)
-                        .min_size(vec2(100.0, 36.0));
+                        let btn_w = if fallback_info.is_some() { 138.0 } else { 100.0 };
+                        let btn_h = 38.0;
+                        let sense = if is_ok { Sense::click() } else { Sense::hover() };
+                        let (btn_rect, resp) = ui.allocate_exact_size(vec2(btn_w, btn_h), sense);
+                        if is_ok && resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let btn_fill = if !is_ok {
+                            CARD
+                        } else if resp.is_pointer_button_down_on() {
+                            Color32::from_rgb(79, 70, 229)
+                        } else if resp.hovered() {
+                            Color32::from_rgb(112, 115, 248)
+                        } else {
+                            ACCENT
+                        };
+                        let btn_stroke = Stroke::new(1.0, if is_ok { ACCENT_GLOW } else { LINE });
+                        let bp = ui.painter();
+                        bp.rect_filled(btn_rect, 8.0, btn_fill);
+                        bp.rect_stroke(btn_rect, 8.0, btn_stroke, StrokeKind::Inside);
 
-                        let resp = ui.add_enabled(is_ok, send_btn);
-                        if resp.clicked() {
+                        let title_color = if is_ok { Color32::WHITE } else { DIM };
+                        if let Some((ref sub, ref fallback_tip)) = fallback_info {
+                            bp.text(
+                                Pos2::new(btn_rect.center().x, btn_rect.center().y - 6.0),
+                                egui::Align2::CENTER_CENTER,
+                                btn_text,
+                                egui::FontId::proportional(13.0),
+                                title_color,
+                            );
+                            bp.text(
+                                Pos2::new(btn_rect.center().x, btn_rect.center().y + 8.5),
+                                egui::Align2::CENTER_CENTER,
+                                sub,
+                                egui::FontId::proportional(9.5),
+                                if is_ok { Color32::from_rgb(224, 231, 255) } else { DIM },
+                            );
+
+                            // Show fallback tooltip immediately on mouseover without hover delay
+                            if resp.hovered() {
+                                egui::Area::new(egui::Id::new("fallback_generate_tooltip"))
+                                    .order(egui::Order::Tooltip)
+                                    .interactable(false)
+                                    .constrain(true)
+                                    .fixed_pos(Pos2::new(btn_rect.center().x, btn_rect.top() - 6.0))
+                                    .pivot(egui::Align2::CENTER_BOTTOM)
+                                    .show(ctx, |ui| {
+                                        egui::Frame::new()
+                                            .fill(Color32::from_rgb(24, 28, 40))
+                                            .stroke(Stroke::new(1.0, ACCENT_GLOW))
+                                            .corner_radius(6)
+                                            .inner_margin(egui::Margin::symmetric(10, 6))
+                                            .show(ui, |ui| {
+                                                ui.set_max_width(280.0);
+                                                ui.label(RichText::new(fallback_tip).size(11.0).color(TEXT));
+                                            });
+                                    });
+                            }
+                        } else {
+                            bp.text(
+                                btn_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                btn_text,
+                                egui::FontId::proportional(13.5),
+                                title_color,
+                            );
+                        }
+
+                        if is_ok && resp.clicked() {
                             let p_text = self.prompt.trim().to_string();
                             if !p_text.is_empty() {
                                 if should_queue {
@@ -4965,8 +5475,10 @@ fn is_win_ctrl_v() -> bool {
                                 }
                             }
                         }
-                        if let Some(why) = tip {
-                            resp.on_hover_text(why);
+                        if fallback_info.is_none() {
+                            if let Some(why) = tip {
+                                resp.on_hover_text(why);
+                            }
                         }
 
                         // Segmented pill buttons [ Image | Video ] placed to the LEFT of the generate button:
@@ -5004,7 +5516,17 @@ fn is_win_ctrl_v() -> bool {
                                     .fill(if is_vid { ACCENT } else { Color32::TRANSPARENT })
                                     .corner_radius(6)
                                     .min_size(vec2(64.0, 28.0));
-                                    if ui.add(vid_btn).on_hover_text("Switch to Video Generation (LTX-Video 2.3)").clicked() {
+                                    let vid_hover = {
+                                        let vp = self.sh.active_video_profile.lock().unwrap();
+                                        if vp.is_minimax_h3() {
+                                            "Switch to Video Generation (MiniMax H3)"
+                                        } else if vp.is_ltx25() {
+                                            "Switch to Video Generation (LTX-Video 2.5)"
+                                        } else {
+                                            "Switch to Video Generation (LTX-Video 2.3)"
+                                        }
+                                    };
+                                    if ui.add(vid_btn).on_hover_text(vid_hover).clicked() {
                                         self.mode = StudioMode::Video;
                                         if !self.has_video_models() && !self.sh.dl_video_model.load(Ordering::SeqCst) {
                                             self.show_video_dl_modal = true;
@@ -5093,12 +5615,40 @@ fn is_win_ctrl_v() -> bool {
             });
     }
 
+    fn apply_image_profile(&mut self, p: &Profile, ctx: &egui::Context) {
+        let mut cfg = self.sh.cfg.lock().unwrap();
+        cfg.active_profile = Some(p.id.clone());
+        cfg.save();
+        drop(cfg);
+        *self.sh.active_profile.lock().unwrap() = p.clone();
+        self.profile = p.clone();
+        engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
+    }
+
+    fn apply_video_profile(&mut self, vp: &Profile, ctx: &egui::Context) {
+        {
+            let mut cfg = self.sh.cfg.lock().unwrap();
+            cfg.active_video_profile = Some(vp.id.clone());
+            cfg.save();
+        }
+        *self.sh.active_video_profile.lock().unwrap() = vp.clone();
+        self.video_steps = vp.default_steps.max(4);
+        if !vp.sampler.is_empty() {
+            self.video_sampler = vp.sampler.clone();
+        }
+        if !vp.scheduler.is_empty() {
+            self.video_scheduler = vp.scheduler.clone();
+        }
+        engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
+    }
+
     fn setup_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_setup;
         egui::Window::new("Setup & diagnostics")
             .open(&mut open)
-            .default_width(640.0)
-            .default_height(580.0)
+            .default_width(700.0)
+            .min_width(620.0)
+            .default_height(620.0)
             .max_height(ctx.content_rect().height() - 60.0)
             .resizable(true)
             .show(ctx, |ui| {
@@ -5183,37 +5733,64 @@ fn is_win_ctrl_v() -> bool {
                             if let Some(vram) = vram_detected {
                                 ui.label(RichText::new(format!("~{vram} GB")).strong().color(GREEN));
                                 if vram <= 8 {
-                                    ui.label(RichText::new("(8GB GPU detected - 8GB W4A8 profile recommended)").size(11.0).color(AMBER));
+                                    ui.label(RichText::new("(8GB GPU detected - 8GB W4A8 image & LTX-2.5 recommended)").size(11.0).color(AMBER));
                                 }
                             } else {
                                 ui.label(RichText::new("Auto-detecting...").color(DIM));
                             }
                         });
 
-                        let all_profiles = engine::Profile::all();
-                        let cur_profile_id = self.profile.id.clone();
-                        for p in all_profiles {
-                            let active = p.id == cur_profile_id;
-                            ui.horizontal(|ui| {
-                                let b = egui::Button::new(
-                                    RichText::new(&p.name).size(12.0).color(if active { Color32::WHITE } else { TEXT })
-                                )
-                                .fill(if active { ACCENT } else { CARD_HI })
-                                .stroke(Stroke::new(1.0, if active { ACCENT_GLOW } else { LINE }))
-                                .corner_radius(4);
+                        let cur_img_prof = self.profile.clone();
+                        let cur_vid_prof = self.sh.active_video_profile.lock().unwrap().clone();
+                        let picker_action = crate::model_picker::render_model_picker(
+                            ui,
+                            &mut self.model_picker,
+                            &cur_img_prof,
+                            &cur_vid_prof,
+                            vram_detected,
+                            &paths.models,
+                        );
+                        match picker_action {
+                            crate::model_picker::PickerAction::SwitchImage(p) => {
+                                self.apply_image_profile(&p, ctx);
+                            }
+                            crate::model_picker::PickerAction::SwitchVideo(vp) => {
+                                self.apply_video_profile(&vp, ctx);
+                            }
+                            crate::model_picker::PickerAction::ModelsDeleted
+                            | crate::model_picker::PickerAction::None => {}
+                        }
 
-                                if ui.add(b).clicked() && !active {
-                                    let mut cfg = self.sh.cfg.lock().unwrap();
-                                    cfg.active_profile = Some(p.id.clone());
-                                    cfg.save();
-                                    *self.sh.active_profile.lock().unwrap() = p.clone();
-                                    self.profile = p.clone();
-                                    self.sh.retry.store(true, Ordering::SeqCst);
-                                }
-                                ui.label(RichText::new(format!("(Recommended: {}GB VRAM)", p.recommended_vram_gb)).size(11.0).color(DIM));
-                            });
-                            ui.label(RichText::new(&p.description).size(10.5).color(DIM));
-                            ui.add_space(2.0);
+                        let active_vid_after = self.sh.active_video_profile.lock().unwrap().clone();
+                        if let Some(gpu_vram) = vram_detected {
+                            if active_vid_after.recommended_vram_gb > gpu_vram
+                                && !crate::model_picker::is_allowed_step_up_variant(&active_vid_after.id, vram_detected)
+                                && active_vid_after.id != crate::model_picker::recommended_video_profile_id(
+                                    if active_vid_after.is_minimax_h3() {
+                                        crate::model_picker::VideoFamily::MiniMaxH3
+                                    } else {
+                                        crate::model_picker::VideoFamily::LtxVideo
+                                    },
+                                    vram_detected,
+                                )
+                            {
+                                ui.add_space(4.0);
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(42, 22, 18))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 90, 40)))
+                                    .corner_radius(6)
+                                    .inner_margin(egui::Margin::same(8))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "[!] VRAM Warning: '{}' recommends {} GB VRAM (detected: {} GB). Running it on this GPU will rely heavily on shared system RAM paging, causing 10x-100x slower generation or CUDA Out-Of-Memory (OOM) errors.",
+                                                active_vid_after.name, active_vid_after.recommended_vram_gb, gpu_vram
+                                            ))
+                                            .size(11.0)
+                                            .color(AMBER),
+                                        );
+                                    });
+                            }
                         }
 
                         ui.separator();
@@ -5262,11 +5839,19 @@ fn is_win_ctrl_v() -> bool {
 
                         ui.separator();
                         heading(ui, "MODEL FILES STATUS");
-                        let vid_ok = self.has_video_models();
-                        ui.label(
-                            RichText::new(format!("{}  LTX-Video 2.3 Checkpoint (ltx-2.3-22b-dev-fp8.safetensors)", if vid_ok { "found  " } else { "MISSING" }))
-                                .color(if vid_ok { GREEN } else { RED }),
-                        );
+                        let vmodels_dir = self.active_video_models_dir();
+                        let active_vid = self.sh.active_video_profile.lock().unwrap().clone();
+                        ui.label(RichText::new(format!("Video Profile: {}", active_vid.name)).size(11.5).strong().color(ACCENT_GLOW));
+                        for vm in &active_vid.models {
+                            let ok = !vmodels_dir.as_os_str().is_empty()
+                                && engine::safe_model_path(&vmodels_dir, &vm.category, &vm.filename).exists();
+                            ui.label(
+                                RichText::new(format!("{}  {}", if ok { "found  " } else { "MISSING" }, vm.filename))
+                                    .color(if ok { GREEN } else { RED }),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Image Profile: {}", self.profile.name)).size(11.5).strong().color(ACCENT_GLOW));
                         for (name, ok) in self.sh.models_found.lock().unwrap().iter() {
                             ui.label(
                                 RichText::new(format!("{}  {}", if *ok { "found  " } else { "MISSING" }, name))
@@ -5344,30 +5929,68 @@ fn is_win_ctrl_v() -> bool {
                     });
             });
         self.show_setup = open;
+        if !self.show_setup {
+            self.model_picker.pending_warning = None;
+            self.model_picker.pending_delete = None;
+        } else {
+            match crate::model_picker::render_warning_modal(ctx, &mut self.model_picker) {
+                crate::model_picker::PickerAction::SwitchImage(p) => {
+                    self.apply_image_profile(&p, ctx);
+                }
+                crate::model_picker::PickerAction::SwitchVideo(vp) => {
+                    self.apply_video_profile(&vp, ctx);
+                }
+                crate::model_picker::PickerAction::ModelsDeleted
+                | crate::model_picker::PickerAction::None => {}
+            }
+        }
     }
 
     fn video_dl_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_video_dl_modal;
         let mut should_close = false;
         let center = ctx.content_rect().center();
-        egui::Window::new("LTX-Video 2.3 Model Setup")
+        let vprof = self.sh.active_video_profile.lock().unwrap().clone();
+        let total_gb = vprof.total_size_gb();
+        let win_title = format!("Video Model Setup - {}", vprof.name);
+        let mut file_lines = Vec::new();
+        let mut has_optional_r2v = false;
+        for m in &vprof.models {
+            if m.optional {
+                has_optional_r2v = true;
+                continue;
+            }
+            file_lines.push(format!("- {} ({})", m.filename, engine::format_bytes(m.size_bytes)));
+        }
+        let optional_note = if has_optional_r2v {
+            "\n\nOptional: The separate Ref2VA model for Reference-to-Video (R2V) is excluded by default and can be downloaded from the References panel if needed."
+        } else {
+            ""
+        };
+        let details = format!(
+            "{}\n\nTotal download size: ~{:.1} GB\n{}{}",
+            vprof.description,
+            total_gb,
+            file_lines.join("\n"),
+            optional_note
+        );
+
+        egui::Window::new(win_title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(center)
-            .fixed_size(vec2(500.0, 240.0))
+            .fixed_size(vec2(540.0, 290.0))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Download Video Generation Models").size(17.0).strong().color(TEXT));
                     ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("LTX-Video 2.3 enables high-fidelity 720p/1080p video generation from text or images.\n\nTotal download size: ~42 GB\n• LTX-2.3 22B Dev Checkpoint (FP8, ~29 GB)\n• Gemma 3 12B IT Text Encoder (~9.4 GB)\n• Spatial Upscaler x2 & Dynamic LoRAs (~4.3 GB)")
-                            .size(12.0)
-                            .color(DIM),
-                    );
-                    ui.add_space(14.0);
+                    egui::ScrollArea::vertical().max_height(145.0).show(ui, |ui| {
+                        ui.label(RichText::new(&details).size(12.0).color(DIM));
+                    });
+                    ui.add_space(10.0);
 
                     let is_dl = self.sh.dl_video_model.load(Ordering::SeqCst);
                     if is_dl {
@@ -5378,11 +6001,15 @@ fn is_win_ctrl_v() -> bool {
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            let dl_btn = egui::Button::new(RichText::new("Start Download (~42 GB)").strong().color(Color32::WHITE))
+                            let dl_btn = egui::Button::new(RichText::new(format!("Start Download (~{:.1} GB)", total_gb)).strong().color(Color32::WHITE))
                                 .fill(ACCENT)
-                                .min_size(vec2(180.0, 32.0));
+                                .min_size(vec2(190.0, 32.0));
                             if ui.add(dl_btn).clicked() {
                                 engine::toggle_model_download(&self.sh, ctx, false, true);
+                                should_close = true;
+                            }
+                            if ui.button("Choose Another Profile...").clicked() {
+                                self.show_setup = true;
                                 should_close = true;
                             }
                             let cancel_btn = egui::Button::new("Not Now").min_size(vec2(80.0, 32.0));
@@ -5397,10 +6024,33 @@ fn is_win_ctrl_v() -> bool {
     }
 }
 
+impl App {
+    fn update_taskbar_progress(&mut self) {
+        use crate::taskbar::TaskbarState;
+        if self.generating {
+            let frac = self.total_gen_progress.unwrap_or(0.02);
+            self.taskbar_progress.update(TaskbarState::Generating, frac);
+        } else if let Some((dl_prog, _paused, _summary)) = crate::download_ui::active_download_progress(&self.sh) {
+            self.taskbar_progress.update(TaskbarState::Download, dl_prog);
+        } else {
+            let upd_prog = {
+                let st = self.updater.lock().unwrap();
+                if st.downloading { Some(st.download_progress) } else { None }
+            };
+            if let Some(p) = upd_prog {
+                self.taskbar_progress.update(TaskbarState::Download, p);
+            } else {
+                self.taskbar_progress.update(TaskbarState::None, 0.0);
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
+        self.update_taskbar_progress();
         self.handle_input(&ctx);
 
         let starting = matches!(
@@ -5474,7 +6124,7 @@ impl eframe::App for App {
             self.video_dl_window(&ctx);
         }
         self.new_video_preset_modal(&ctx);
-        self.download_pane.show(&ctx, &self.sh);
+        self.download_pane.show_combined(&ctx, &self.sh, &self.updater);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));

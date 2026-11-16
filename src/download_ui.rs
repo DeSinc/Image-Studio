@@ -1,10 +1,11 @@
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Rect, RichText, Sense, Stroke, StrokeKind, vec2};
 
 use crate::engine::{self, EngState, Profile, Shared};
+use crate::updater::{self, UpdaterState};
 
 const CARD: Color32 = Color32::from_rgb(25, 29, 40);
 const CARD_HI: Color32 = Color32::from_rgb(33, 38, 53);
@@ -18,6 +19,7 @@ const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
 
 /// Crisp, zero-emoji pause icon (two vertical bars).
+#[allow(dead_code)]
 fn draw_pause_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
     let stroke = Stroke::new(2.2, color);
     p.line_segment([center + vec2(-2.5, -4.5), center + vec2(-2.5, 4.5)], stroke);
@@ -25,6 +27,7 @@ fn draw_pause_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
 }
 
 /// Crisp, zero-emoji play / resume icon (right-pointing filled triangle).
+#[allow(dead_code)]
 fn draw_play_icon(p: &egui::Painter, center: egui::Pos2, color: Color32) {
     let pts = vec![
         center + vec2(-3.0, -5.0),
@@ -50,7 +53,7 @@ pub struct DownloadPaneState {
 impl Default for DownloadPaneState {
     fn default() -> Self {
         Self {
-            is_expanded: true, // Starts maximized
+            is_expanded: false, // Starts minimized into the top-right update/download icon
             user_opened: false,
             highlight_until: None,
             show_metered_dialog: false,
@@ -58,9 +61,37 @@ impl Default for DownloadPaneState {
     }
 }
 
+/// Returns `Some((progress_0_to_1, is_paused, summary))` when an engine or model download is active.
+pub fn active_download_progress(sh: &Shared) -> Option<(f32, bool, String)> {
+    let st = sh.state.lock().unwrap().clone();
+    let paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
+    if let Some(ref mp) = *sh.model_dl_progress.lock().unwrap() {
+        return Some((
+            mp.overall_progress.clamp(0.0, 1.0),
+            paused,
+            format!("Downloading {} ({}/{}): {:.0}%", mp.current_file, mp.file_index, mp.total_files, mp.overall_progress * 100.0),
+        ));
+    }
+    match st {
+        EngState::DownloadingModels { current_file, file_index, total_files, overall_progress, .. }
+        | EngState::ModelDownloadPaused { current_file, file_index, total_files, overall_progress, .. } => {
+            Some((
+                overall_progress.clamp(0.0, 1.0),
+                paused,
+                format!("Model download ({}/{}): {} ({:.0}%)", file_index, total_files, current_file, overall_progress * 100.0),
+            ))
+        }
+        EngState::DownloadingEngine { step, progress, .. } => {
+            Some((progress.clamp(0.0, 1.0), paused, format!("{step} ({:.0}%)", progress * 100.0)))
+        }
+        EngState::ExtractingEngine { step } => Some((0.0, false, step)),
+        _ => None,
+    }
+}
+
 impl DownloadPaneState {
-    pub fn toggle(&mut self, sh: &Shared) {
-        if self.is_active(sh) && self.is_expanded {
+    pub fn toggle(&mut self, _sh: &Shared) {
+        if self.is_expanded {
             self.is_expanded = false;
             self.user_opened = false;
         } else {
@@ -87,6 +118,14 @@ impl DownloadPaneState {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, sh: &Arc<Shared>) {
+        self.show_inner(ctx, sh, None);
+    }
+
+    pub fn show_combined(&mut self, ctx: &egui::Context, sh: &Arc<Shared>, updater: &Arc<Mutex<UpdaterState>>) {
+        self.show_inner(ctx, sh, Some(updater));
+    }
+
+    fn show_inner(&mut self, ctx: &egui::Context, sh: &Arc<Shared>, updater: Option<&Arc<Mutex<UpdaterState>>>) {
         // 1. Check for metered connection switch notification
         if sh.metered_switch_detected.swap(false, Ordering::SeqCst) {
             self.show_metered_dialog = true;
@@ -99,26 +138,24 @@ impl DownloadPaneState {
             self.render_metered_modal(ctx, sh);
         }
 
-        // 3. Check if download pane should be rendered
-        if !self.is_active(sh) {
+        // 3. Only render the dropdown floater when expanded (minimized state lives in the top-right update icon)
+        if !self.is_expanded {
             return;
         }
 
         let st = sh.state.lock().unwrap().clone();
 
-        // Position at bottom-left, floating above the bottom prompt bar
+        // Top-right dropdown floater anchored directly below the update/download icon
         egui::Area::new(egui::Id::new("floating_download_pane"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::LEFT_BOTTOM, vec2(16.0, -82.0))
+            .anchor(egui::Align2::RIGHT_TOP, vec2(-16.0, 48.0))
+            .constrain(true)
             .show(ctx, |ui| {
-                if self.is_expanded {
-                    self.render_expanded_pane(ui, sh, &st);
-                } else {
-                    self.render_mini_bar(ui, ctx, sh, &st);
-                }
+                self.render_expanded_pane(ui, ctx, sh, &st, updater);
             });
     }
 
+    #[allow(dead_code)]
     fn render_mini_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sh: &Arc<Shared>, st: &EngState) {
         let w = 360.0f32;
         let h = 54.0f32;
@@ -273,8 +310,15 @@ impl DownloadPaneState {
             .on_hover_text("Click to expand download manager");
     }
 
-    fn render_expanded_pane(&mut self, ui: &mut egui::Ui, sh: &Arc<Shared>, st: &EngState) {
-        let card_w = 480.0f32;
+    fn render_expanded_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        sh: &Arc<Shared>,
+        st: &EngState,
+        updater: Option<&Arc<Mutex<UpdaterState>>>,
+    ) {
+        let card_w = 460.0f32;
         let card_frame = egui::Frame::new()
             .fill(CARD)
             .stroke(Stroke::new(1.0, LINE))
@@ -286,7 +330,7 @@ impl DownloadPaneState {
 
             // 1. Header with title, speed, and minimize button
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Download Manager").size(14.0).strong().color(TEXT));
+                ui.label(RichText::new("Updates & Downloads").size(14.0).strong().color(TEXT));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Minimize button
@@ -318,9 +362,64 @@ impl DownloadPaneState {
                 });
             });
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(6.0);
+
+            // 1b. App Update section (combined with Download Manager)
+            if let Some(upd) = updater {
+                let (up_avail, latest, is_dl, dl_prog, applied, checked, up_err) = {
+                    let u = upd.lock().unwrap();
+                    (
+                        u.update_available,
+                        u.latest_version.clone(),
+                        u.downloading,
+                        u.download_progress,
+                        u.update_applied,
+                        u.checked,
+                        u.error.clone(),
+                    )
+                };
+                let cur_ver = env!("CARGO_PKG_VERSION");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("APP UPDATE").size(11.0).strong().color(DIM));
+                    ui.label(RichText::new(format!("v{cur_ver}")).size(11.0).color(DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if applied {
+                            if ui.button(RichText::new("Restart Now").size(11.5).strong().color(Color32::WHITE)).clicked() {
+                                updater::restart_application();
+                            }
+                        } else if is_dl {
+                            ui.label(RichText::new(format!("{:.0}%", dl_prog * 100.0)).size(11.5).color(GREEN).strong());
+                        } else if up_avail {
+                            if ui.button(RichText::new(format!("Update to v{latest}")).size(11.5).strong().color(GREEN)).clicked() {
+                                updater::download_and_install_update(upd.clone(), ctx.clone());
+                            }
+                        } else if ui.small_button("Check for Updates").clicked() {
+                            updater::check_for_updates(upd.clone(), ctx.clone());
+                        }
+                    });
+                });
+                if is_dl {
+                    ui.add_space(3.0);
+                    let (bar_r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(bar_r, 2.5, CARD_HI);
+                    let fw = (bar_r.width() * dl_prog.clamp(0.0, 1.0)).max(0.0);
+                    if fw > 0.0 {
+                        p.rect_filled(Rect::from_min_size(bar_r.min, vec2(fw, bar_r.height())), 2.5, GREEN);
+                    }
+                } else if applied {
+                    ui.label(RichText::new("Update downloaded. Restart Image Studio to apply.").size(10.5).color(GREEN));
+                } else if let Some(err) = up_err {
+                    ui.label(RichText::new(format!("Update check error: {err}")).size(10.5).color(AMBER));
+                } else if checked && !up_avail {
+                    ui.label(RichText::new("Image Studio is up to date.").size(10.5).color(DIM));
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+            }
 
             // 2. Active Download Status
             let is_paused = matches!(st, EngState::ModelDownloadPaused { .. }) || sh.download_paused.load(Ordering::SeqCst);
@@ -416,7 +515,10 @@ impl DownloadPaneState {
                             ui.label(RichText::new("DOWNLOAD PAUSED").size(11.0).color(AMBER).strong());
                             ui.label(RichText::new(&mp.current_file).size(12.5).color(TEXT).strong());
                         }
-                    } else if !sh.dl_image_model.load(Ordering::SeqCst) && !sh.dl_video_model.load(Ordering::SeqCst) {
+                    } else if !sh.dl_image_model.load(Ordering::SeqCst)
+                        && !sh.dl_video_model.load(Ordering::SeqCst)
+                        && !sh.dl_r2v_model.load(Ordering::SeqCst)
+                    {
                         ui.label(RichText::new("No model downloads selected.").size(12.0).color(DIM));
                     } else {
                         ui.label(RichText::new("All models ready.").size(12.0).color(GREEN));
@@ -611,16 +713,25 @@ impl DownloadPaneState {
     fn render_model_checkboxes(&mut self, ui: &mut egui::Ui, sh: &Arc<Shared>) {
         let mut dl_img = sh.dl_image_model.load(Ordering::SeqCst);
         let mut dl_vid = sh.dl_video_model.load(Ordering::SeqCst);
+        let vid_prof = sh.active_video_profile.lock().unwrap().clone();
+        let vid_gb = vid_prof.total_size_gb();
+        let vid_short = if vid_prof.is_minimax_h3() {
+            "MiniMax H3"
+        } else if vid_prof.is_ltx25() {
+            "LTX-2.5"
+        } else {
+            "LTX-2.3"
+        };
 
         ui.horizontal(|ui| {
-            let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 • ~16 GB)").size(11.5));
+            let resp_img = ui.checkbox(&mut dl_img, RichText::new("Image Model (Qwen 2.1 - ~16 GB)").size(11.5));
             if resp_img.changed() {
                 engine::toggle_model_download(sh, ui.ctx(), true, dl_img);
             }
 
             ui.add_space(12.0);
 
-            let resp_vid = ui.checkbox(&mut dl_vid, RichText::new("Video Model (LTX-2.3 • ~42 GB)").size(11.5));
+            let resp_vid = ui.checkbox(&mut dl_vid, RichText::new(format!("Video Model ({vid_short} - ~{vid_gb:.0} GB)")).size(11.5));
             if resp_vid.changed() {
                 engine::toggle_model_download(sh, ui.ctx(), false, dl_vid);
             }
@@ -717,7 +828,7 @@ mod tests {
     #[test]
     fn test_download_pane_state_default() {
         let state = DownloadPaneState::default();
-        assert!(state.is_expanded);
+        assert!(!state.is_expanded);
         assert!(!state.user_opened);
         assert!(!state.show_metered_dialog);
     }
@@ -808,7 +919,7 @@ mod tests {
         assert!(!state.is_expanded);
         assert!(!state.user_opened);
 
-        // During download, toggling minimizes to mini-bar and expands back
+        // During download, toggling opens and collapses the dropdown
         let sh_downloading = make_test_shared(EngState::DownloadingModels {
             current_file: "model.safetensors".into(),
             file_index: 1,

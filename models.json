@@ -101,9 +101,723 @@
       ]
     },
     {
+      "id": "minimax_h3_10gb",
+      "name": "MiniMax H3 Video (10-11GB VRAM - Q3_K_M GGUF)",
+      "description": "Default for 10-11GB GPUs. High-coherence audio+video generation (T2V, I2V, End-Frame, R2V) with Q3_K_M GGUF diffusion weights.",
+      "recommended_vram_gb": 10,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q3_K_M.gguf",
+          "size_bytes": 8902845536,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q3_K_M.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q3_K_M.gguf",
+          "size_bytes": 8902845536,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q3_K_M.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_q4_k_s",
+      "name": "MiniMax H3 Video (Q4_K_S GGUF)",
+      "description": "Compact Q4_K_S GGUF weights. Higher quality than Q3_K_M (slightly slower on 10GB GPUs).",
+      "recommended_vram_gb": 11,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q4_K_S.gguf",
+          "size_bytes": 11564180576,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q4_K_S.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q4_K_S.gguf",
+          "size_bytes": 11564180576,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q4_K_S.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_12gb",
+      "name": "MiniMax H3 Video (12GB VRAM - Q4_K_M GGUF)",
+      "description": "Default for 12GB GPUs. High-coherence audio+video generation (T2V, I2V, End-Frame, R2V) with balanced Q4_K_M GGUF weights.",
+      "recommended_vram_gb": 12,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q4_K_M.gguf",
+          "size_bytes": 11564180576,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q4_K_M.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q4_K_M.gguf",
+          "size_bytes": 11564180576,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q4_K_M.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_q5_k_s",
+      "name": "MiniMax H3 Video (Q5_K_S GGUF)",
+      "description": "Higher quality Q5_K_S GGUF weights (slower on 12GB GPUs).",
+      "recommended_vram_gb": 14,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q5_K_S.gguf",
+          "size_bytes": 14068966496,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q5_K_S.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q5_K_S.gguf",
+          "size_bytes": 14068966496,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q5_K_S.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_q5_k_m",
+      "name": "MiniMax H3 Video (Q5_K_M GGUF)",
+      "description": "Higher quality Q5_K_M GGUF weights (slower on 12GB GPUs).",
+      "recommended_vram_gb": 14,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q5_K_M.gguf",
+          "size_bytes": 14068966496,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q5_K_M.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q5_K_M.gguf",
+          "size_bytes": 14068966496,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q5_K_M.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_16gb",
+      "name": "MiniMax H3 Video (16GB VRAM - Q6_K GGUF)",
+      "description": "Default for 16GB GPUs. High-coherence audio+video generation (T2V, I2V, End-Frame, R2V) with high-precision Q6_K GGUF weights.",
+      "recommended_vram_gb": 16,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-FL2VA-Pruned-Q6_K.gguf",
+          "size_bytes": 16730301536,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-FL2VA-Pruned-Q6_K.gguf",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "MiniMax-H3-Ref2VA-Pruned-Q6_K.gguf",
+          "size_bytes": 16730301536,
+          "hf_url": "https://huggingface.co/Abiray/MiniMax-H3-Pruned-GGUF/resolve/main/MiniMax-H3-Ref2VA-Pruned-Q6_K.gguf",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "minimax_h3_24gb",
+      "name": "MiniMax H3 Video (22-24GB+ VRAM - Native INT8 ConvRot)",
+      "description": "Default for 22-24GB+ GPUs (auto-selected from 18GB+). Full native INT8 ConvRot MiniMax H3 audio+video weights (T2V, I2V, End-Frame, R2V).",
+      "recommended_vram_gb": 24,
+      "default_steps": 20,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+          "size_bytes": 20970379616,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "diffusion_models",
+          "filename": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "size_bytes": 20970379616,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "modelscope_url": "",
+          "optional": true
+        },
+        {
+          "category": "text_encoders",
+          "filename": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "size_bytes": 15687142551,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_video_vae_int8_convrot.safetensors",
+          "size_bytes": 2811065184,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "minimax_h3_audio_vae_fp32.safetensors",
+          "size_bytes": 605254808,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "loras",
+          "filename": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "size_bytes": 1956193000,
+          "hf_url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+          "modelscope_url": ""
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_10gb",
+      "name": "LTX-Video 2.5 Distilled (10-11GB VRAM - UD-Q3_K_XL GGUF)",
+      "description": "Fast 2-stage distilled LTX-2.5 with spatial x2 upscaler and self-contained W4A8 Gemma 4 12B encoder.",
+      "recommended_vram_gb": 10,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-UD-Q3_K_XL.gguf",
+          "size_bytes": 12000207232,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-UD-Q3_K_XL.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-UD-Q3_K_XL.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_q4_k_m",
+      "name": "LTX-Video 2.5 Distilled (Q4_K_M GGUF)",
+      "description": "Higher quality Q4_K_M GGUF weights with W4A8 Gemma 4 12B encoder (slower on 10GB GPUs).",
+      "recommended_vram_gb": 11,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-Q4_K_M.gguf",
+          "size_bytes": 13584703872,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-Q4_K_M.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-Q4_K_M.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_12gb",
+      "name": "LTX-Video 2.5 Distilled (12GB VRAM - UD-Q4_K_XL GGUF)",
+      "description": "Fast 2-stage distilled LTX-2.5 with Unsloth UD-Q4_K_XL weights and W4A8 Gemma 4 12B encoder.",
+      "recommended_vram_gb": 12,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf",
+          "size_bytes": 14000234880,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_q5_k_m",
+      "name": "LTX-Video 2.5 Distilled (Q5_K_M GGUF)",
+      "description": "Higher quality Q5_K_M GGUF weights with W4A8 Gemma 4 12B encoder (slower on 12GB GPUs).",
+      "recommended_vram_gb": 14,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-Q5_K_M.gguf",
+          "size_bytes": 15631524224,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-Q5_K_M.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-Q5_K_M.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_q5_k_xl",
+      "name": "LTX-Video 2.5 Distilled (UD-Q5_K_XL GGUF)",
+      "description": "Higher quality Unsloth Dynamic Q5_K_XL GGUF weights with W4A8 Gemma 4 12B encoder (slower on 12GB GPUs).",
+      "recommended_vram_gb": 14,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-UD-Q5_K_XL.gguf",
+          "size_bytes": 16000033152,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-UD-Q5_K_XL.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-UD-Q5_K_XL.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_16gb",
+      "name": "LTX-Video 2.5 Distilled (16GB VRAM - Q6_K GGUF)",
+      "description": "Fast 2-stage distilled LTX-2.5 with high-precision Q6_K weights and W4A8 Gemma 4 12B encoder.",
+      "recommended_vram_gb": 16,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-Q6_K.gguf",
+          "size_bytes": 17806270848,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/distilled/ltx-2.5-22b-distilled-Q6_K.gguf",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/distilled/ltx-2.5-22b-distilled-Q6_K.gguf"
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "size_bytes": 10604342914,
+          "hf_url": "https://huggingface.co/joeygambino/LTX-2.5-Quantized/resolve/main/gemma4-12b-ltx25-comfy-w4a8.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
+      "id": "ltx_2.5_24gb",
+      "name": "LTX-Video 2.5 Distilled (22-24GB+ VRAM - Native INT8 ConvRot)",
+      "description": "Full native INT8 ConvRot LTX-2.5 distilled transformer + INT8 Gemma 4 12B encoder for 22-24GB+ GPUs (auto-selected from 18GB+).",
+      "recommended_vram_gb": 24,
+      "default_steps": 8,
+      "default_cfg": 1.0,
+      "sampler": "er_sde",
+      "scheduler": "sgm_uniform",
+      "models": [
+        {
+          "category": "diffusion_models",
+          "filename": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+          "size_bytes": 21504034224,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "text_encoders",
+          "filename": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+          "size_bytes": 15372971786,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-video-vae-bf16.safetensors",
+          "size_bytes": 1472223346,
+          "hf_url": "https://huggingface.co/comfyicu/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors",
+          "modelscope_url": ""
+        },
+        {
+          "category": "vae",
+          "filename": "ltx-2.5-audio-vae-bf16.safetensors",
+          "size_bytes": 364866540,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/vae/ltx-2.5-audio-vae-bf16.safetensors"
+        },
+        {
+          "category": "latent_upscale_models",
+          "filename": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "size_bytes": 995778752,
+          "hf_url": "https://huggingface.co/unsloth/LTX-2.5-GGUF/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+          "modelscope_url": "https://modelscope.cn/models/unsloth/LTX-2.5-GGUF/resolve/master/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+        }
+      ]
+    },
+    {
       "id": "ltx_2.3",
-      "name": "LTX-Video 2.3 (Audio + Video, 22B Dev FP8)",
-      "description": "High-fidelity text-to-video and image-to-video generation with spatial latent upscaler and Gemma 3 text encoder.",
+      "name": "LTX-Video 2.3 (Legacy 22B Dev FP8 + Gemma 3)",
+      "description": "Legacy LTX-2.3 text-to-video and image-to-video generation with spatial latent upscaler, camera LoRAs, and Gemma 3 text encoder.",
       "recommended_vram_gb": 16,
       "default_steps": 8,
       "default_cfg": 1.0,
