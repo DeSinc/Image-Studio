@@ -254,16 +254,26 @@ pub fn restart_application() {
         use std::os::windows::process::CommandExt;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
-        let target_str = target_exe.to_string_lossy().to_string();
-        let ps_cmd = format!(
-            "Start-Sleep -Milliseconds 600; Start-Process -FilePath '{}'",
-            target_str.replace('\'', "''")
-        );
-        let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
-        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
-        let _ = cmd.spawn();
+        let spawn_direct = |flags: u32| {
+            let mut cmd = std::process::Command::new(&target_exe);
+            cmd.creation_flags(flags);
+            cmd.spawn()
+        };
+
+        let primary_flags = CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        let fallback_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+        match spawn_direct(primary_flags) {
+            Ok(_) => crate::engine::log(&format!("restart_application: spawned {} (breakaway)", target_exe.display())),
+            Err(e) => {
+                crate::engine::log(&format!("restart_application: breakaway spawn failed ({e}), retrying without breakaway"));
+                if let Err(e2) = spawn_direct(fallback_flags) {
+                    crate::engine::log(&format!("restart_application: fallback spawn failed: {e2}"));
+                }
+            }
+        }
         std::process::exit(0);
     }
     #[cfg(not(windows))]
