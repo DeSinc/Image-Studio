@@ -85,7 +85,54 @@ pub fn active_download_progress(sh: &Shared) -> Option<(f32, bool, String)> {
             Some((progress.clamp(0.0, 1.0), paused, format!("{step} ({:.0}%)", progress * 100.0)))
         }
         EngState::ExtractingEngine { step } => Some((0.0, false, step)),
-        _ => None,
+        _ => {
+            let pdls = crate::engine::all_profile_download_infos(sh);
+            let loras: Vec<crate::lora::LoraDownloadStatus> = sh
+                .lora_downloads
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| !d.completed)
+                .cloned()
+                .collect();
+            if pdls.is_empty() && loras.is_empty() {
+                None
+            } else if !pdls.is_empty() {
+                let total_bytes: u64 = pdls.iter().map(|d| d.bytes_total).sum::<u64>()
+                    + loras.iter().map(|l| l.total).sum::<u64>();
+                let done_bytes: u64 = pdls.iter().map(|d| d.bytes_done).sum::<u64>()
+                    + loras.iter().map(|l| l.downloaded).sum::<u64>();
+                let prog = if total_bytes > 0 {
+                    (done_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    pdls.iter().map(|d| d.progress).sum::<f32>() / pdls.len() as f32
+                };
+                let all_paused = pdls.iter().all(|d| d.status == crate::engine::ProfileDownloadStatus::Paused)
+                    && loras.iter().all(|l| l.paused);
+                let total_count = pdls.len() + loras.len();
+                let summary = if total_count == 1 {
+                    format!("Downloading {} ({:.0}%)", pdls[0].profile_name, prog * 100.0)
+                } else {
+                    format!("Downloading {} items ({:.0}%)", total_count, prog * 100.0)
+                };
+                Some((prog, all_paused, summary))
+            } else {
+                let total_bytes: u64 = loras.iter().map(|l| l.total).sum();
+                let done_bytes: u64 = loras.iter().map(|l| l.downloaded).sum();
+                let prog = if total_bytes > 0 {
+                    (done_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let all_paused = loras.iter().all(|l| l.paused);
+                let summary = if loras.len() == 1 {
+                    format!("Downloading {} ({:.0}%)", loras[0].display_name, prog * 100.0)
+                } else {
+                    format!("Downloading {} LoRAs ({:.0}%)", loras.len(), prog * 100.0)
+                };
+                Some((prog, all_paused, summary))
+            }
+        }
     }
 }
 
@@ -102,7 +149,9 @@ impl DownloadPaneState {
 
     pub fn is_active(&self, sh: &Shared) -> bool {
         let st = sh.state.lock().unwrap();
-        let has_model_dl = sh.model_dl_progress.lock().unwrap().is_some();
+        let has_model_dl = sh.model_dl_progress.lock().unwrap().is_some()
+            || !sh.profile_downloads.lock().unwrap().is_empty()
+            || !sh.lora_downloads.lock().unwrap().is_empty();
         let in_dl_state = matches!(
             *st,
             EngState::AwaitingDownloadConfirmation { .. }
@@ -243,10 +292,37 @@ impl DownloadPaneState {
                         format!("{} / {} • {:.1} MB/s", engine::format_bytes(mp.bytes_done), engine::format_bytes(mp.bytes_total), mp.speed_mb)
                     };
                     (mp.current_file.clone(), size_str, mp.file_progress)
-                } else if matches!(st, EngState::Ready { .. }) {
-                    ("All models ready".to_string(), "Ready".to_string(), 1.0)
                 } else {
-                    ("Engine Setup".to_string(), "Waiting".to_string(), 0.0)
+                    let loras: Vec<crate::lora::LoraDownloadStatus> = sh
+                        .lora_downloads
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .filter(|d| !d.completed)
+                        .cloned()
+                        .collect();
+                    if !loras.is_empty() {
+                        let done: u64 = loras.iter().map(|l| l.downloaded).sum();
+                        let tot: u64 = loras.iter().map(|l| l.total).sum();
+                        let speed: f32 = loras.iter().filter(|l| !l.paused && l.error.is_none()).map(|l| l.speed_mb).sum();
+                        let prog = if tot > 0 { (done as f32 / tot as f32).clamp(0.0, 1.0) } else { 0.0 };
+                        let title = if loras.len() == 1 {
+                            format!("LoRA: {}", loras[0].display_name)
+                        } else {
+                            format!("{} LoRA downloads", loras.len())
+                        };
+                        let all_paused = loras.iter().all(|l| l.paused);
+                        let size_str = if all_paused {
+                            format!("{} / {} (Paused)", engine::format_bytes(done), engine::format_bytes(tot))
+                        } else {
+                            format!("{} / {} • {:.1} MB/s", engine::format_bytes(done), engine::format_bytes(tot), speed)
+                        };
+                        (title, size_str, prog)
+                    } else if matches!(st, EngState::Ready { .. }) {
+                        ("All models ready".to_string(), "Ready".to_string(), 1.0)
+                    } else {
+                        ("Engine Setup".to_string(), "Waiting".to_string(), 0.0)
+                    }
                 }
             }
             _ => ("Engine Setup".to_string(), "Waiting".to_string(), 0.0),
@@ -508,6 +584,7 @@ impl DownloadPaneState {
                     ui.label(RichText::new(msg).size(11.0).color(DIM));
                 }
                 _ => {
+                    let has_profile_dls = !sh.profile_downloads.lock().unwrap().is_empty();
                     if let Some(ref mp) = dl_prog {
                         if !is_paused {
                             Self::render_model_progress_block(ui, &mp.current_file, mp.file_index, mp.total_files, mp.file_progress, mp.bytes_done, mp.bytes_total, mp.speed_mb, mp.overall_progress);
@@ -515,6 +592,8 @@ impl DownloadPaneState {
                             ui.label(RichText::new("DOWNLOAD PAUSED").size(11.0).color(AMBER).strong());
                             ui.label(RichText::new(&mp.current_file).size(12.5).color(TEXT).strong());
                         }
+                    } else if has_profile_dls {
+                        // Rendered in the active model variant downloads section below
                     } else if !sh.dl_image_model.load(Ordering::SeqCst)
                         && !sh.dl_video_model.load(Ordering::SeqCst)
                         && !sh.dl_r2v_model.load(Ordering::SeqCst)
@@ -523,6 +602,164 @@ impl DownloadPaneState {
                     } else {
                         ui.label(RichText::new("All models ready.").size(12.0).color(GREEN));
                     }
+                }
+            }
+
+            // 2a. Active / Paused / Failed Model Quant Downloads (from Model Picker)
+            let mut profile_dl_list: Vec<(String, String, crate::engine::ProfileDownloadStatus, f32, u64, u64, f32, String)> = sh
+                .profile_downloads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, t)| {
+                    (
+                        id.clone(),
+                        t.profile.name.clone(),
+                        t.status.clone(),
+                        t.progress,
+                        t.bytes_done,
+                        t.bytes_total,
+                        t.speed_mb,
+                        t.current_file.clone(),
+                    )
+                })
+                .collect();
+            profile_dl_list.sort_by(|a, b| a.1.cmp(&b.1));
+            if !profile_dl_list.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("MODEL QUANT DOWNLOADS").size(11.0).strong().color(DIM));
+                ui.add_space(4.0);
+                for (pid, pname, pstatus, pprog, pdone, ptotal, pspeed, pfile) in &profile_dl_list {
+                    let is_err = matches!(pstatus, crate::engine::ProfileDownloadStatus::Failed(_));
+                    let is_p_paused = *pstatus == crate::engine::ProfileDownloadStatus::Paused;
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(20, 24, 34))
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(pname).size(11.5).strong().color(TEXT));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("Cancel").on_hover_text("Cancel model download").clicked() {
+                                        crate::engine::cancel_profile_download(sh, pid);
+                                    }
+                                    if is_err || is_p_paused {
+                                        let lbl = if is_err { "Retry" } else { "Resume" };
+                                        if ui.small_button(lbl).clicked() {
+                                            crate::engine::toggle_profile_download_pause(sh, pid, ctx);
+                                        }
+                                    } else if ui.small_button("Pause").clicked() {
+                                        crate::engine::toggle_profile_download_pause(sh, pid, ctx);
+                                    }
+                                });
+                            });
+                            if !pfile.is_empty() {
+                                ui.label(RichText::new(pfile).size(10.5).color(DIM));
+                            }
+                            let bar_col = if is_err {
+                                RED
+                            } else if is_p_paused {
+                                AMBER
+                            } else {
+                                ACCENT
+                            };
+                            let bar = egui::ProgressBar::new(pprog.clamp(0.0, 1.0)).fill(bar_col);
+                            ui.add_sized([ui.available_width(), 6.0], bar);
+                            let status_txt = match pstatus {
+                                crate::engine::ProfileDownloadStatus::Failed(err) => format!("Failed: {err}"),
+                                crate::engine::ProfileDownloadStatus::Paused => format!(
+                                    "Paused — {} / {} ({:.0}%)",
+                                    crate::engine::format_bytes(*pdone),
+                                    crate::engine::format_bytes(*ptotal),
+                                    pprog * 100.0
+                                ),
+                                crate::engine::ProfileDownloadStatus::Downloading => format!(
+                                    "{} / {} ({:.0}%) — {:.1} MB/s",
+                                    crate::engine::format_bytes(*pdone),
+                                    crate::engine::format_bytes(*ptotal),
+                                    pprog * 100.0,
+                                    pspeed
+                                ),
+                            };
+                            ui.label(
+                                RichText::new(status_txt)
+                                    .size(10.5)
+                                    .color(if is_err { RED } else { DIM }),
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+
+            // 2b. Active / Paused / Failed LoRA Downloads
+            let mut lora_list: Vec<crate::lora::LoraDownloadStatus> = sh
+                .lora_downloads
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| !d.completed)
+                .cloned()
+                .collect();
+            lora_list.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+            if !lora_list.is_empty() {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(RichText::new("LORA DOWNLOADS").size(11.0).strong().color(DIM));
+                ui.add_space(4.0);
+                for ld in &lora_list {
+                    let prog = if ld.total > 0 {
+                        (ld.downloaded as f32 / ld.total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(20, 24, 34))
+                        .stroke(Stroke::new(1.0, LINE))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&ld.display_name).size(11.5).strong().color(TEXT));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("Cancel").on_hover_text("Cancel download & delete partial file").clicked() {
+                                        let _ = crate::lora::cancel_and_delete_lora(sh, &ld.loras_dir, &ld.filename);
+                                    }
+                                    if ld.error.is_some() {
+                                        if ui.small_button("Retry").clicked() {
+                                            crate::lora::resume_lora_download(sh, &ld.filename, ctx);
+                                        }
+                                    } else if ld.paused {
+                                        if ui.small_button("Resume").clicked() {
+                                            crate::lora::resume_lora_download(sh, &ld.filename, ctx);
+                                        }
+                                    } else if ui.small_button("Pause").clicked() {
+                                        crate::lora::pause_lora_download(sh, &ld.filename);
+                                    }
+                                });
+                            });
+                            let bar_col = if ld.error.is_some() {
+                                RED
+                            } else if ld.paused {
+                                AMBER
+                            } else {
+                                ACCENT
+                            };
+                            ui.add_sized([ui.available_width(), 6.0], egui::ProgressBar::new(prog).fill(bar_col));
+                            ui.horizontal(|ui| {
+                                let status_txt = if let Some(ref err) = ld.error {
+                                    format!("Failed: {err}")
+                                } else if ld.paused {
+                                    format!("Paused • {} / {} ({:.0}%)", engine::format_bytes(ld.downloaded), engine::format_bytes(ld.total), prog * 100.0)
+                                } else {
+                                    format!("{} / {} ({:.0}%) • {:.1} MB/s", engine::format_bytes(ld.downloaded), engine::format_bytes(ld.total), prog * 100.0, ld.speed_mb)
+                                };
+                                let col = if ld.error.is_some() { RED } else if ld.paused { AMBER } else { DIM };
+                                ui.label(RichText::new(status_txt).size(10.5).color(col));
+                            });
+                        });
+                    ui.add_space(4.0);
                 }
             }
 

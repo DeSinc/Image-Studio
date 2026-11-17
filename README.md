@@ -20,17 +20,18 @@ Fast, native desktop app for image editing using open-weights diffusion models (
 
 ![Material Transformation](assets/demo_material_transform.gif)
 
-### Video Studio (Text-to-Video & Image-to-Video)
-Cinematic AI video generation powered by Lightricks LTX-Video 2.3 (22B Dev FP8) with built-in audio synthesis, spatial upscaling, and an integrated native player.
+### Video Studio (Text-to-Video, Image-to-Video & Video Editing)
+Cinematic AI video generation and editing powered by **MiniMax H3** (with native stereo audio, Reference-to-Video, and video editing) and **Lightricks LTX-Video 2.5 / 2.3** (2-stage distilled generation, spatial upscaling, and IC-LoRA video editing), paired with an integrated native player, trim/compression pipeline, and LoRA browser.
 
 ## Features
 
 - **Pure Native Rust UI**: Built with `egui` / `eframe` - zero WebView, zero Chromium, zero web frameworks. Instant startup and responsive native performance.
-- **Video Studio with LTX-Video 2.3**: High-fidelity text-to-video and image-to-video generation with integrated spatial latent upscaler, audio VAE, and optional Gemma 3 12B cinematic prompt enhancer.
-- **Native Video Player & Multi-Shot History**: Custom video player using OpenH264 decoding and Rodio audio playback rendered directly into egui textures with scrubbing, playback speed, looping, and instant frame extraction to branch the next shot.
+- **Video Studio (MiniMax H3 & LTX-Video 2.5 / 2.3)**: High-fidelity text-to-video, image-to-video, first/last-frame continuation, Reference-to-Video (R2V), and video-to-video editing with native audio synthesis and optional Gemma 3 12B cinematic prompt enhancer.
+- **Curated LoRA Browser & Manager**: Browse, download, manage, and apply curated LoRAs for Qwen Image, MiniMax H3, and LTX-2.5/2.3 (including Viggle Remake, IC-LoRA video editing, and turbo LoRAs) with inline prompt tag helpers.
+- **Native Video Player, Trimmer & Multi-Shot History**: Custom video player using OpenH264 decoding and Rodio audio playback rendered directly into egui textures with scrubbing, playback speed, looping, trim/compression export, and instant frame extraction to branch the next shot.
 - **Background Engine Supervisor**: Automatically detects, bootstraps, and supervises ComfyUI in the background without terminal clutter.
-- **Model Manifest & On-Demand Downloader**: Verifies required model weights on startup (`models.json`) and downloads missing weights from Hugging Face with live progress.
-- **Hardware-Aware Quantization**: Auto-detects available VRAM to choose between standard INT8 (12GB+ GPUs) and 4-bit W4A8 quantized text encoders (8GB GPUs) to prevent CUDA Out-Of-Memory errors.
+- **Model Manifest & On-Demand Downloader**: Verifies required model weights on startup (`models.json`) and downloads missing weights, quant variants, and LoRAs from Hugging Face with live progress, pause/resume, and Recycle Bin cleanup.
+- **Hardware-Aware Quantization**: Auto-detects available VRAM to pick optimal GGUF/INT8 quants (including Unsloth Dynamic `UD-Q3_K_XL` / `UD-Q4_K_XL` / `UD-Q5_K_XL` and `UD-Q2_K_XL`) and W4A8 text encoders to prevent CUDA Out-Of-Memory errors.
 - **Safe Process Lifecycle**: Uses Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) to guarantee that all ComfyUI and Python subprocesses terminate immediately when Image Studio closes or crashes.
 - **Branching History Tree**: Non-destructive editing with branching undo/redo history. Jump back to any previous step, diverge into a new branch without losing existing work, or switch between revision threads.
 - **Split Comparison & Centered Canvas**: Pan and zoom inspection canvas with an interactive A/B comparison slider.

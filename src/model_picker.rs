@@ -44,6 +44,7 @@ enum VariantIcon {
 #[derive(Clone)]
 pub struct PendingModelWarning {
     pub is_video: bool,
+    pub is_download: bool,
     pub profile: Profile,
     pub title: String,
     pub message: String,
@@ -55,6 +56,8 @@ pub struct PendingModelDelete {
     pub profile_name: String,
     pub files: Vec<(PathBuf, String, u64)>,
     pub error: Option<String>,
+    pub cancel_profile_id: Option<String>,
+    pub is_cancel_download: bool,
 }
 
 pub struct ModelPickerState {
@@ -96,6 +99,8 @@ pub enum PickerAction {
     None,
     SwitchImage(Profile),
     SwitchVideo(Profile),
+    DownloadProfile(Profile),
+    ToggleDownloadPause(String),
     ModelsDeleted,
 }
 
@@ -115,15 +120,22 @@ pub fn recommended_video_family(vram_gb: Option<u32>) -> VideoFamily {
 
 pub fn is_allowed_step_up_variant(id: &str, vram_gb: Option<u32>) -> bool {
     match vram_gb {
-        // 12GB cards can pick Q5 variants without caveat popup (yellow border + SLOWER badge)
-        Some(v) if (11..15).contains(&v) => matches!(
+        // 12GB cards can pick Q4_K_M and LTX 2.5 UD-Q4_K_XL / UD-Q5_K_XL without caveat popup (yellow border + SLOWER badge)
+        Some(v) if (11..13).contains(&v) => matches!(
             id,
-            "minimax_h3_q5_k_m" | "minimax_h3_q5_k_s" | "ltx_2.5_q5_k_xl" | "ltx_2.5_q5_k_m"
+            "minimax_h3_12gb"
+                | "ltx_2.5_12gb"
+                | "ltx_2.5_q5_k_xl"
         ),
-        // 10GB cards can pick Q4 variants without caveat popup (yellow border + SLOWER badge)
+        // 13-14GB cards can pick Q5_K_M / UD-Q5_K_XL without caveat popup
+        Some(v) if (13..15).contains(&v) => matches!(
+            id,
+            "minimax_h3_q5_k_m" | "ltx_2.5_q5_k_xl"
+        ),
+        // 9-10GB cards can pick UD-Q3_K_XL, Q4_K_M, and UD-Q4_K_XL without caveat popup (yellow border + SLOWER badge)
         Some(v) if (9..11).contains(&v) => matches!(
             id,
-            "minimax_h3_12gb" | "minimax_h3_q4_k_s" | "ltx_2.5_12gb" | "ltx_2.5_q4_k_m"
+            "minimax_h3_ud_q3_k_xl" | "minimax_h3_12gb" | "ltx_2.5_12gb" | "ltx_2.5_10gb"
         ),
         _ => false,
     }
@@ -134,16 +146,18 @@ pub fn recommended_video_profile_id(family: VideoFamily, vram_gb: Option<u32>) -
         VideoFamily::MiniMaxH3 => match vram_gb {
             Some(v) if v >= 18 => "minimax_h3_24gb",
             Some(v) if v >= 15 => "minimax_h3_16gb",
-            Some(v) if v >= 11 => "minimax_h3_12gb",
+            Some(v) if v >= 13 => "minimax_h3_12gb",
+            Some(v) if v >= 11 => "minimax_h3_ud_q3_k_xl",
             Some(_) => "minimax_h3_10gb",
-            None => "minimax_h3_12gb",
+            None => "minimax_h3_ud_q3_k_xl",
         },
         VideoFamily::LtxVideo => match vram_gb {
             Some(v) if v >= 18 => "ltx_2.5_24gb",
             Some(v) if v >= 15 => "ltx_2.5_16gb",
-            Some(v) if v >= 11 => "ltx_2.5_12gb",
-            Some(_) => "ltx_2.5_10gb",
-            None => "ltx_2.5_12gb",
+            Some(v) if v >= 13 => "ltx_2.5_12gb",
+            Some(v) if v >= 11 => "ltx_2.5_10gb",
+            Some(_) => "ltx_2.5_q2_k_xl",
+            None => "ltx_2.5_10gb",
         },
     }
 }
@@ -208,25 +222,31 @@ fn find_downloaded_family_profile(
         .cloned()
 }
 
-/// Returns files belonging to `target` that exist on disk and are NOT needed by
-/// `active_img`, `active_vid`, or any other downloaded profile on disk.
+/// Returns files belonging to `target` that exist on disk (or `.part` files when
+/// `include_part_files` is true) and are NOT needed by `active_img`, `active_vid`,
+/// or any other downloaded profile on disk.
 pub fn profile_deletable_files(
     target: &Profile,
     active_img: &Profile,
     active_vid: &Profile,
     all_profiles: &[Profile],
     models_dir: &Path,
+    include_part_files: bool,
 ) -> Vec<(PathBuf, String, u64)> {
-    if models_dir.as_os_str().is_empty()
-        || target.id == active_img.id
-        || target.id == active_vid.id
-    {
+    if models_dir.as_os_str().is_empty() {
         return Vec::new();
     }
 
     let mut protected: HashSet<(String, String)> = HashSet::new();
-    for m in active_img.models.iter().chain(active_vid.models.iter()) {
-        protected.insert((m.category.clone(), m.filename.clone()));
+    if target.id != active_img.id {
+        for m in &active_img.models {
+            protected.insert((m.category.clone(), m.filename.clone()));
+        }
+    }
+    if target.id != active_vid.id {
+        for m in &active_vid.models {
+            protected.insert((m.category.clone(), m.filename.clone()));
+        }
     }
     for other in all_profiles {
         if other.id == target.id || other.id == active_img.id || other.id == active_vid.id {
@@ -241,10 +261,17 @@ pub fn profile_deletable_files(
 
     let mut out = Vec::new();
     for m in &target.models {
+        let path = engine::safe_model_path(models_dir, &m.category, &m.filename);
+        if include_part_files {
+            let part_path = engine::part_path_for(&path);
+            if part_path.is_file() {
+                let sz = std::fs::metadata(&part_path).map(|md| md.len()).unwrap_or(0);
+                out.push((part_path, format!("{}.part", m.filename), sz));
+            }
+        }
         if protected.contains(&(m.category.clone(), m.filename.clone())) {
             continue;
         }
-        let path = engine::safe_model_path(models_dir, &m.category, &m.filename);
         if path.is_file() {
             let sz = std::fs::metadata(&path).map(|md| md.len()).unwrap_or(m.size_bytes);
             out.push((path, m.filename.clone(), sz));
@@ -317,23 +344,17 @@ fn video_variant_meta(id: &str, is_step_up: bool) -> VariantMeta<'static> {
             vram_label: "14GB+",
             icon: VariantIcon::Balanced,
         },
-        "minimax_h3_q5_k_s" => VariantMeta {
-            short_title: "Q5_K_S",
-            subtitle: if is_step_up { "Higher quality Q5_K_S" } else { "5-bit small GGUF" },
-            vram_label: "14GB+",
+        "minimax_h3_12gb" => VariantMeta {
+            short_title: "14GB Q4_K_M",
+            subtitle: if is_step_up { "Higher quality Q4_K_M" } else { "Balanced GGUF" },
+            vram_label: "13-14GB+",
             icon: VariantIcon::Balanced,
         },
-        "minimax_h3_12gb" => VariantMeta {
-            short_title: "12GB Q4_K_M",
-            subtitle: if is_step_up { "Higher quality Q4_K_M" } else { "Balanced GGUF" },
+        "minimax_h3_ud_q3_k_xl" => VariantMeta {
+            short_title: "12GB UD-Q3_K_XL",
+            subtitle: if is_step_up { "Higher quality UD-Q3_K_XL" } else { "Unsloth Dynamic GGUF" },
             vram_label: "12GB+",
             icon: VariantIcon::Balanced,
-        },
-        "minimax_h3_q4_k_s" => VariantMeta {
-            short_title: "Q4_K_S",
-            subtitle: if is_step_up { "Higher quality Q4_K_S" } else { "Compact 4-bit GGUF" },
-            vram_label: "11GB+",
-            icon: VariantIcon::Compact,
         },
         "minimax_h3_10gb" => VariantMeta {
             short_title: "10GB Q3_K_M",
@@ -343,44 +364,38 @@ fn video_variant_meta(id: &str, is_step_up: bool) -> VariantMeta<'static> {
         },
         "ltx_2.5_24gb" => VariantMeta {
             short_title: "24GB INT8",
-            subtitle: "Native INT8 + Gemma INT8",
+            subtitle: "Native INT8 (24GB+ w/ LoRAs)",
             vram_label: "22-24GB+",
             icon: VariantIcon::Quality,
         },
         "ltx_2.5_16gb" => VariantMeta {
             short_title: "16GB Q6_K",
-            subtitle: "Q6_K + W4A8 Gemma",
+            subtitle: "Q6_K (18GB+ w/ LoRA edits)",
             vram_label: "16GB+",
             icon: VariantIcon::Quality,
         },
         "ltx_2.5_q5_k_xl" => VariantMeta {
             short_title: "UD-Q5_K_XL",
-            subtitle: if is_step_up { "Higher quality Dynamic Q5" } else { "Dynamic 5-bit GGUF" },
-            vram_label: "14GB+",
-            icon: VariantIcon::Balanced,
-        },
-        "ltx_2.5_q5_k_m" => VariantMeta {
-            short_title: "Q5_K_M",
-            subtitle: if is_step_up { "Higher quality Q5_K_M" } else { "5-bit medium GGUF" },
+            subtitle: if is_step_up { "Higher quality (16GB+ LoRAs)" } else { "Dynamic Q5 (16GB+ LoRA edit)" },
             vram_label: "14GB+",
             icon: VariantIcon::Balanced,
         },
         "ltx_2.5_12gb" => VariantMeta {
-            short_title: "12GB UD-Q4",
-            subtitle: if is_step_up { "Higher quality Dynamic Q4" } else { "Balanced UD-Q4_K_XL" },
-            vram_label: "12GB+",
+            short_title: "UD-Q4_K_XL",
+            subtitle: if is_step_up { "Higher quality (16GB+ LoRAs)" } else { "Dynamic Q4 (16GB+ LoRA edit)" },
+            vram_label: "13GB+",
             icon: VariantIcon::Balanced,
         },
-        "ltx_2.5_q4_k_m" => VariantMeta {
-            short_title: "Q4_K_M",
-            subtitle: if is_step_up { "Higher quality Q4_K_M" } else { "Standard 4-bit GGUF" },
-            vram_label: "11GB+",
+        "ltx_2.5_10gb" => VariantMeta {
+            short_title: "UD-Q3_K_XL",
+            subtitle: if is_step_up { "Higher quality (14GB+ LoRAs)" } else { "UD-Q3_K_XL (14GB+ LoRA edit)" },
+            vram_label: "11-12GB",
             icon: VariantIcon::Compact,
         },
-        "ltx_2.5_10gb" => VariantMeta {
-            short_title: "10GB Q3_K",
-            subtitle: "UD-Q3_K_XL + W4A8",
-            vram_label: "<= 10GB",
+        "ltx_2.5_q2_k_xl" => VariantMeta {
+            short_title: "UD-Q2_K_XL",
+            subtitle: "+Use for editing videos w/ LoRAs",
+            vram_label: "<= 10GB / 12GB Edit",
             icon: VariantIcon::Compact,
         },
         "ltx_2.3" => VariantMeta {
@@ -401,6 +416,7 @@ fn video_variant_meta(id: &str, is_step_up: bool) -> VariantMeta<'static> {
 pub fn render_model_picker(
     ui: &mut egui::Ui,
     state: &mut ModelPickerState,
+    sh: &std::sync::Arc<engine::Shared>,
     active_image_profile: &Profile,
     active_video_profile: &Profile,
     vram_detected: Option<u32>,
@@ -470,6 +486,18 @@ pub fn render_model_picker(
                     for p in &img_variants {
                         let is_active = p.id == active_image_profile.id;
                         let is_rec = p.id == rec_img_id;
+                        let is_downloaded = all_required_models_exist(p, models_dir);
+                        let dl_info = engine::get_profile_download_info(sh, &p.id);
+                        let has_part_files = !models_dir.as_os_str().is_empty()
+                            && p.models.iter().any(|m| {
+                                engine::part_path_for(&engine::safe_model_path(
+                                    models_dir,
+                                    &m.category,
+                                    &m.filename,
+                                ))
+                                .is_file()
+                            });
+                        let is_mid_download = dl_info.is_some() || (!is_downloaded && has_part_files);
                         let meta = image_variant_meta(&p.id, vram_detected);
                         let size_line = format!("~{:.1} GB", p.total_size_gb());
                         let deletable = profile_deletable_files(
@@ -478,8 +506,16 @@ pub fn render_model_picker(
                             active_video_profile,
                             &all_raw,
                             models_dir,
+                            is_mid_download,
                         );
                         let deletable_bytes: u64 = deletable.iter().map(|(_, _, s)| *s).sum();
+                        let show_delete = if is_mid_download {
+                            Some(deletable_bytes)
+                        } else if deletable.is_empty() {
+                            None
+                        } else {
+                            Some(deletable_bytes)
+                        };
 
                         let res = draw_variant_subtile(
                             ui,
@@ -492,19 +528,37 @@ pub fn render_model_picker(
                             is_active,
                             is_rec,
                             false,
-                            if deletable.is_empty() { None } else { Some(deletable_bytes) },
+                            show_delete,
+                            dl_info.as_ref(),
+                            is_mid_download,
                         );
                         if res.delete_clicked {
                             state.pending_delete = Some(PendingModelDelete {
                                 profile_name: p.name.clone(),
                                 files: deletable,
                                 error: None,
+                                cancel_profile_id: dl_info.as_ref().map(|_| p.id.clone()),
+                                is_cancel_download: is_mid_download,
                             });
-                        } else if res.tile_clicked && !is_active {
-                            if is_rec {
-                                action = PickerAction::SwitchImage(p.clone());
+                        } else if res.tile_clicked {
+                            if let Some(ref info) = dl_info {
+                                if matches!(info.status, engine::ProfileDownloadStatus::Failed(_)) {
+                                    action = PickerAction::DownloadProfile(p.clone());
+                                } else {
+                                    action = PickerAction::ToggleDownloadPause(p.id.clone());
+                                }
+                            } else if is_downloaded {
+                                if !is_active {
+                                    if is_rec {
+                                        action = PickerAction::SwitchImage(p.clone());
+                                    } else {
+                                        state.pending_warning = Some(build_image_warning(p, vram_detected, false));
+                                    }
+                                }
+                            } else if is_rec {
+                                action = PickerAction::DownloadProfile(p.clone());
                             } else {
-                                state.pending_warning = Some(build_image_warning(p, vram_detected));
+                                state.pending_warning = Some(build_image_warning(p, vram_detected, true));
                             }
                         }
                     }
@@ -530,7 +584,7 @@ pub fn render_model_picker(
 
     let all_vid = engine::Profile::all_video_profiles();
 
-    let vid_tile_h = 158.0;
+    let vid_tile_h = 176.0;
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = main_gap;
@@ -572,6 +626,7 @@ pub fn render_model_picker(
             vec2(main_tile_w, vid_tile_h),
             "LTX-Video 2.5",
             &[
+                ("Editing video footage with LoRAs", true),
                 ("Scenery & environments", true),
                 ("2-stage x2 upscaling", true),
                 ("Voices & audio clarity", true),
@@ -606,19 +661,17 @@ pub fn render_model_picker(
             "minimax_h3_24gb",
             "minimax_h3_16gb",
             "minimax_h3_q5_k_m",
-            "minimax_h3_q5_k_s",
             "minimax_h3_12gb",
-            "minimax_h3_q4_k_s",
+            "minimax_h3_ud_q3_k_xl",
             "minimax_h3_10gb",
         ],
         VideoFamily::LtxVideo => &[
             "ltx_2.5_24gb",
             "ltx_2.5_16gb",
             "ltx_2.5_q5_k_xl",
-            "ltx_2.5_q5_k_m",
             "ltx_2.5_12gb",
-            "ltx_2.5_q4_k_m",
             "ltx_2.5_10gb",
+            "ltx_2.5_q2_k_xl",
             "ltx_2.3",
         ],
     };
@@ -641,6 +694,14 @@ pub fn render_model_picker(
             .corner_radius(8)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
+                if state.selected_video_family == VideoFamily::LtxVideo {
+                    ui.label(
+                        RichText::new("Tip: Editing videos with IC-LoRAs uses +2–3 GB extra VRAM. Pick a smaller quant (e.g. UD-Q2_K_XL on 12GB) to avoid swapping.")
+                            .size(10.5)
+                            .color(DIM),
+                    );
+                    ui.add_space(6.0);
+                }
                 let inner_w = ui.available_width();
                 let sub_gap = 7.0;
                 let cols = 4usize;
@@ -657,6 +718,18 @@ pub fn render_model_picker(
                             let is_active = vp.id == active_video_profile.id;
                             let is_rec = vp.id == rec_vid_id;
                             let is_step_up = is_allowed_step_up_variant(&vp.id, vram_detected);
+                            let is_downloaded = all_required_models_exist(vp, models_dir);
+                            let dl_info = engine::get_profile_download_info(sh, &vp.id);
+                            let has_part_files = !models_dir.as_os_str().is_empty()
+                                && vp.models.iter().any(|m| {
+                                    engine::part_path_for(&engine::safe_model_path(
+                                        models_dir,
+                                        &m.category,
+                                        &m.filename,
+                                    ))
+                                    .is_file()
+                                });
+                            let is_mid_download = dl_info.is_some() || (!is_downloaded && has_part_files);
                             let meta = video_variant_meta(&vp.id, is_step_up);
                             let size_line = format!("~{:.1} GB", vp.total_size_gb());
                             let deletable = profile_deletable_files(
@@ -665,8 +738,16 @@ pub fn render_model_picker(
                                 active_video_profile,
                                 &all_raw,
                                 models_dir,
+                                is_mid_download,
                             );
                             let deletable_bytes: u64 = deletable.iter().map(|(_, _, s)| *s).sum();
+                            let show_delete = if is_mid_download {
+                                Some(deletable_bytes)
+                            } else if deletable.is_empty() {
+                                None
+                            } else {
+                                Some(deletable_bytes)
+                            };
 
                             let res = draw_variant_subtile(
                                 ui,
@@ -679,23 +760,47 @@ pub fn render_model_picker(
                                 is_active,
                                 is_rec,
                                 is_step_up,
-                                if deletable.is_empty() { None } else { Some(deletable_bytes) },
+                                show_delete,
+                                dl_info.as_ref(),
+                                is_mid_download,
                             );
                             if res.delete_clicked {
                                 state.pending_delete = Some(PendingModelDelete {
                                     profile_name: vp.name.clone(),
                                     files: deletable,
                                     error: None,
+                                    cancel_profile_id: dl_info.as_ref().map(|_| vp.id.clone()),
+                                    is_cancel_download: is_mid_download,
                                 });
-                            } else if res.tile_clicked && !is_active {
-                                if is_rec || is_step_up {
-                                    state.record_active_video(vp);
-                                    action = PickerAction::SwitchVideo(vp.clone());
+                            } else if res.tile_clicked {
+                                if let Some(ref info) = dl_info {
+                                    if matches!(info.status, engine::ProfileDownloadStatus::Failed(_)) {
+                                        action = PickerAction::DownloadProfile(vp.clone());
+                                    } else {
+                                        action = PickerAction::ToggleDownloadPause(vp.id.clone());
+                                    }
+                                } else if is_downloaded {
+                                    if !is_active {
+                                        if is_rec || is_step_up {
+                                            state.record_active_video(vp);
+                                            action = PickerAction::SwitchVideo(vp.clone());
+                                        } else {
+                                            state.pending_warning = Some(build_video_warning(
+                                                vp,
+                                                rec_vid_vram,
+                                                vram_detected,
+                                                false,
+                                            ));
+                                        }
+                                    }
+                                } else if is_rec || is_step_up {
+                                    action = PickerAction::DownloadProfile(vp.clone());
                                 } else {
                                     state.pending_warning = Some(build_video_warning(
                                         vp,
                                         rec_vid_vram,
                                         vram_detected,
+                                        true,
                                     ));
                                 }
                             }
@@ -708,14 +813,23 @@ pub fn render_model_picker(
     action
 }
 
-pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -> PickerAction {
+pub fn render_warning_modal(
+    ctx: &egui::Context,
+    state: &mut ModelPickerState,
+    sh: &std::sync::Arc<engine::Shared>,
+) -> PickerAction {
     if let Some(ref mut del) = state.pending_delete {
         let mut do_delete = false;
         let mut cancel = false;
         let center = ctx.content_rect().center();
         let total_bytes: u64 = del.files.iter().map(|(_, _, s)| *s).sum();
+        let modal_title = if del.is_cancel_download {
+            "Cancel Download & Delete Files"
+        } else {
+            "Delete Unused Model Files"
+        };
 
-        egui::Window::new("Delete Unused Model Files")
+        egui::Window::new(modal_title)
             .id(egui::Id::new("model_picker_delete_modal"))
             .collapsible(false)
             .resizable(false)
@@ -725,15 +839,20 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.label(RichText::new(&del.profile_name).size(13.0).strong().color(TEXT));
-                ui.label(
-                    RichText::new(format!(
+                let desc = if del.is_cancel_download {
+                    format!(
+                        "This will cancel the download and permanently delete {} partial/unused file(s) ({}) from disk. Shared files used by other models are preserved.",
+                        del.files.len(),
+                        engine::format_bytes(total_bytes)
+                    )
+                } else {
+                    format!(
                         "This will permanently delete {} unused file(s) ({}) from disk. Shared files still used by your active or other downloaded models are preserved.",
                         del.files.len(),
                         engine::format_bytes(total_bytes)
-                    ))
-                    .size(11.5)
-                    .color(DIM),
-                );
+                    )
+                };
+                ui.label(RichText::new(desc).size(11.5).color(DIM));
                 ui.add_space(6.0);
                 egui::Frame::new()
                     .fill(TRAY_BG)
@@ -760,11 +879,16 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let del_label = if del.is_cancel_download {
+                            "Cancel & Delete"
+                        } else {
+                            "Delete Files"
+                        };
                         let del_btn = egui::Button::new(
-                            RichText::new("Delete Files").strong().color(Color32::WHITE),
+                            RichText::new(del_label).strong().color(Color32::WHITE),
                         )
                         .fill(Color32::from_rgb(190, 52, 52))
-                        .min_size(vec2(120.0, 30.0));
+                        .min_size(vec2(130.0, 30.0));
                         if ui.add(del_btn).clicked() {
                             do_delete = true;
                         }
@@ -776,6 +900,9 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
             });
 
         if do_delete {
+            if let Some(ref pid) = del.cancel_profile_id {
+                engine::cancel_profile_download(sh, pid);
+            }
             let mut failed = Vec::new();
             for (path, fname, _) in &del.files {
                 if path.exists() {
@@ -850,11 +977,16 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let ok_label = if warn.is_download {
+                        "OK, Download Anyway"
+                    } else {
+                        "OK, Switch Anyway"
+                    };
                     let ok_btn = egui::Button::new(
-                        RichText::new("OK, Switch Anyway").strong().color(Color32::BLACK),
+                        RichText::new(ok_label).strong().color(Color32::BLACK),
                     )
                     .fill(AMBER)
-                    .min_size(vec2(140.0, 30.0));
+                    .min_size(vec2(150.0, 30.0));
                     if ui.add(ok_btn).clicked() {
                         confirm = true;
                     }
@@ -869,7 +1001,9 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
 
     if confirm {
         let w = state.pending_warning.take().unwrap();
-        if w.is_video {
+        if w.is_download {
+            PickerAction::DownloadProfile(w.profile)
+        } else if w.is_video {
             state.record_active_video(&w.profile);
             PickerAction::SwitchVideo(w.profile)
         } else {
@@ -883,20 +1017,22 @@ pub fn render_warning_modal(ctx: &egui::Context, state: &mut ModelPickerState) -
     }
 }
 
-fn build_image_warning(p: &Profile, vram_gb: Option<u32>) -> PendingModelWarning {
+fn build_image_warning(p: &Profile, vram_gb: Option<u32>, is_download: bool) -> PendingModelWarning {
     match p.id.as_str() {
         "qwen_2.1_8gb" => PendingModelWarning {
             is_video: false,
+            is_download,
             profile: p.clone(),
-            title: "Lower Quality Image Model".to_string(),
+            title: "Lower-Precision Image Model".to_string(),
             message: format!(
-                "Your GPU{} already has enough VRAM for the Standard INT8 model. Switching to the 8GB W4A8 quantized model will not help generation speed much and will just lower output quality.",
+                "Your GPU{} can run the Standard INT8 model, so this 8GB W4A8 quantized variant trades some output quality for a smaller VRAM footprint. Useful reasons to choose it include running heavy LoRA edits (which need extra VRAM headroom) or keeping GPU memory free for other apps.",
                 vram_gb.map(|g| format!(" (~{g} GB)")).unwrap_or_default()
             ),
             is_severe: false,
         },
         "qwen_2.1_turbo_8gb" => PendingModelWarning {
             is_video: false,
+            is_download,
             profile: p.clone(),
             title: "Turbo Mode: Speed vs Quality".to_string(),
             message: "Turbo uses 8-step distilled inference instead of 25 steps. This will significantly increase generation speed, but at the cost of image quality and fine detail.".to_string(),
@@ -904,6 +1040,7 @@ fn build_image_warning(p: &Profile, vram_gb: Option<u32>) -> PendingModelWarning
         },
         "qwen_2.1_int8" => PendingModelWarning {
             is_video: false,
+            is_download,
             profile: p.clone(),
             title: "Exceeds 8GB VRAM".to_string(),
             message: format!(
@@ -914,6 +1051,7 @@ fn build_image_warning(p: &Profile, vram_gb: Option<u32>) -> PendingModelWarning
         },
         _ => PendingModelWarning {
             is_video: false,
+            is_download,
             profile: p.clone(),
             title: "Non-Recommended Profile".to_string(),
             message: "This profile is not the recommended default for your GPU. Continue anyway?".to_string(),
@@ -926,10 +1064,12 @@ fn build_video_warning(
     vp: &Profile,
     rec_vram: u32,
     vram_gb: Option<u32>,
+    is_download: bool,
 ) -> PendingModelWarning {
     if vp.id == "ltx_2.3" {
         return PendingModelWarning {
             is_video: true,
+            is_download,
             profile: vp.clone(),
             title: "Legacy Model (LTX-Video 2.3)".to_string(),
             message: "LTX-Video 2.3 is a legacy ~43 GB model. LTX-Video 2.5 is newer, faster, and produces higher quality video and audio. Switch to legacy LTX-Video 2.3 anyway?".to_string(),
@@ -944,6 +1084,7 @@ fn build_video_warning(
             .unwrap_or_else(|| "unknown".to_string());
         PendingModelWarning {
             is_video: true,
+            is_download,
             profile: vp.clone(),
             title: "VRAM Warning: Slower Generation".to_string(),
             message: format!(
@@ -958,10 +1099,11 @@ fn build_video_warning(
             .unwrap_or_default();
         PendingModelWarning {
             is_video: true,
+            is_download,
             profile: vp.clone(),
-            title: "Lower Quality Variant".to_string(),
+            title: "Lower-Precision Variant".to_string(),
             message: format!(
-                "Your GPU{} already supports a higher-precision variant. Switching to this smaller quantized model will not improve generation speed noticeably and will lower output quality.",
+                "Your GPU{} can run a higher-precision variant, so this smaller quantized model trades some output quality for a lower VRAM footprint. Reasons to choose it include LoRA video editing (which requires extra VRAM headroom) or keeping more GPU memory free alongside other apps.",
                 gpu_str
             ),
             is_severe: false,
@@ -1083,10 +1225,12 @@ fn draw_variant_subtile(
     is_recommended: bool,
     is_step_up: bool,
     deletable_bytes: Option<u64>,
+    dl_info: Option<&engine::ProfileDownloadInfo>,
+    is_mid_download: bool,
 ) -> SubtileResult {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
 
-    // Optional delete button in bottom-right corner for downloaded inactive models
+    // Optional delete button in bottom-right corner for downloaded or mid-download models
     let mut delete_clicked = false;
     let del_rect = Rect::from_min_size(pos2(rect.right() - 26.0, rect.bottom() - 22.0), vec2(20.0, 16.0));
     let mut del_hovered = false;
@@ -1097,10 +1241,18 @@ fn draw_variant_subtile(
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         delete_clicked = del_resp.clicked();
-        del_resp.on_hover_text(format!(
-            "Delete unused model files ({}) to free disk space",
-            engine::format_bytes(bytes)
-        ));
+        let tip = if is_mid_download {
+            format!(
+                "Cancel download & delete partial files ({})",
+                engine::format_bytes(bytes)
+            )
+        } else {
+            format!(
+                "Delete unused model files ({}) to free disk space",
+                engine::format_bytes(bytes)
+            )
+        };
+        del_resp.on_hover_text(tip);
     }
 
     if resp.hovered() && !del_hovered {
@@ -1111,6 +1263,21 @@ fn draw_variant_subtile(
         (GREEN_FILL, GREEN, 2.0, TEXT, DIM, GREEN)
     } else if is_active {
         (AMBER_FILL, AMBER, 2.0, TEXT, DIM, AMBER)
+    } else if let Some(info) = dl_info {
+        match info.status {
+            engine::ProfileDownloadStatus::Downloading => {
+                let bg = if resp.hovered() { Color32::from_rgb(30, 36, 56) } else { CARD_BG };
+                (bg, ACCENT_GLOW, 1.5, TEXT, DIM, ACCENT_GLOW)
+            }
+            engine::ProfileDownloadStatus::Paused => {
+                let bg = if resp.hovered() { Color32::from_rgb(40, 34, 22) } else { CARD_BG };
+                (bg, AMBER, 1.3, TEXT, DIM, AMBER)
+            }
+            engine::ProfileDownloadStatus::Failed(_) => {
+                let bg = if resp.hovered() { Color32::from_rgb(46, 24, 26) } else { CARD_BG };
+                (bg, RED, 1.3, TEXT, DIM, RED)
+            }
+        }
     } else if is_recommended {
         let bg = if resp.hovered() { Color32::from_rgb(24, 48, 40) } else { CARD_BG };
         (bg, Color32::from_rgb(45, 130, 98), 1.5, TEXT, DIM, GREEN)
@@ -1150,21 +1317,58 @@ fn draw_variant_subtile(
         draw_pill_left(painter, pos2(rect.left() + pad, badge_y), vram_label, MUTED_TEXT);
     }
 
+    let sub_wrap_w = if dl_info.is_some() {
+        (rect.width() - pad * 2.0 - 26.0).max(40.0)
+    } else {
+        (rect.width() - pad * 2.0).max(40.0)
+    };
     let galley = painter.layout(
         subtitle.to_string(),
         egui::FontId::proportional(10.0),
         sub_col,
-        (rect.width() - pad * 2.0).max(40.0),
+        sub_wrap_w,
     );
     painter.galley(pos2(rect.left() + pad, rect.top() + 50.0), galley, sub_col);
+
+    let bottom_text = if let Some(info) = dl_info {
+        match &info.status {
+            engine::ProfileDownloadStatus::Downloading => {
+                if info.speed_mb > 0.05 {
+                    format!("{:.0}% @ {:.1} MB/s", info.progress * 100.0, info.speed_mb)
+                } else {
+                    format!("{:.0}%", info.progress * 100.0)
+                }
+            }
+            engine::ProfileDownloadStatus::Paused => format!("Paused ({:.0}%)", info.progress * 100.0),
+            engine::ProfileDownloadStatus::Failed(_) => "Failed - click to retry".to_string(),
+        }
+    } else {
+        size_line.to_string()
+    };
+    let bottom_col = if let Some(info) = dl_info {
+        match info.status {
+            engine::ProfileDownloadStatus::Downloading => ACCENT_GLOW,
+            engine::ProfileDownloadStatus::Paused => AMBER,
+            engine::ProfileDownloadStatus::Failed(_) => RED,
+        }
+    } else if is_active || is_recommended || is_step_up {
+        DIM
+    } else {
+        MUTED_TEXT
+    };
 
     painter.text(
         pos2(rect.left() + pad, rect.bottom() - 10.0),
         egui::Align2::LEFT_CENTER,
-        size_line,
+        &bottom_text,
         egui::FontId::proportional(10.0),
-        if is_active || is_recommended || is_step_up { DIM } else { MUTED_TEXT },
+        bottom_col,
     );
+
+    if let Some(info) = dl_info {
+        let circle_center = pos2(rect.right() - 19.0, rect.top() + 38.0);
+        draw_circle_progress(painter, circle_center, 11.5, info.progress, &info.status);
+    }
 
     if deletable_bytes.is_some() {
         let del_bg = if del_hovered {
@@ -1178,9 +1382,97 @@ fn draw_variant_subtile(
         draw_trash_icon(painter, del_rect.center(), del_fg);
     }
 
+    let tile_clicked = resp.clicked() && !delete_clicked;
+    if let Some(info) = dl_info {
+        if !del_hovered {
+            let tip = match &info.status {
+                engine::ProfileDownloadStatus::Downloading => format!(
+                    "Downloading {} ({:.0}% — {} / {} @ {:.1} MB/s)\nClick to pause",
+                    info.current_file,
+                    info.progress * 100.0,
+                    engine::format_bytes(info.bytes_done),
+                    engine::format_bytes(info.bytes_total),
+                    info.speed_mb
+                ),
+                engine::ProfileDownloadStatus::Paused => format!(
+                    "Paused ({:.0}% — {} / {})\nClick to resume",
+                    info.progress * 100.0,
+                    engine::format_bytes(info.bytes_done),
+                    engine::format_bytes(info.bytes_total),
+                ),
+                engine::ProfileDownloadStatus::Failed(err) => {
+                    format!("Download failed: {err}\nClick to retry")
+                }
+            };
+            resp.on_hover_text(tip);
+        }
+    }
+
     SubtileResult {
-        tile_clicked: resp.clicked() && !delete_clicked,
+        tile_clicked,
         delete_clicked,
+    }
+}
+
+fn draw_circle_progress(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    progress: f32,
+    status: &engine::ProfileDownloadStatus,
+) {
+    let track_col = Color32::from_rgb(42, 48, 66);
+    painter.circle_filled(center, radius, Color32::from_rgb(18, 22, 32));
+    painter.circle_stroke(center, radius, Stroke::new(2.4, track_col));
+
+    let (ring_col, icon_col) = match status {
+        engine::ProfileDownloadStatus::Downloading => (ACCENT_GLOW, TEXT),
+        engine::ProfileDownloadStatus::Paused => (AMBER, AMBER),
+        engine::ProfileDownloadStatus::Failed(_) => (RED, RED),
+    };
+
+    let p = progress.clamp(0.0, 1.0);
+    if p > 0.005 {
+        let steps = ((p * 36.0).ceil() as usize).max(2);
+        let start_angle = -std::f32::consts::FRAC_PI_2;
+        let total_angle = p * std::f32::consts::TAU;
+        let pts: Vec<Pos2> = (0..=steps)
+            .map(|i| {
+                let a = start_angle + total_angle * (i as f32 / steps as f32);
+                pos2(center.x + radius * a.cos(), center.y + radius * a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(2.6, ring_col)));
+    }
+
+    match status {
+        engine::ProfileDownloadStatus::Downloading => {
+            // Two vertical pause bars in the middle of the circle
+            painter.line_segment(
+                [pos2(center.x - 2.3, center.y - 3.5), pos2(center.x - 2.3, center.y + 3.5)],
+                Stroke::new(2.0, icon_col),
+            );
+            painter.line_segment(
+                [pos2(center.x + 2.3, center.y - 3.5), pos2(center.x + 2.3, center.y + 3.5)],
+                Stroke::new(2.0, icon_col),
+            );
+        }
+        engine::ProfileDownloadStatus::Paused => {
+            // Play/resume triangle in the middle of the circle
+            let tri = vec![
+                pos2(center.x - 2.5, center.y - 4.0),
+                pos2(center.x + 4.0, center.y),
+                pos2(center.x - 2.5, center.y + 4.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(tri, icon_col, Stroke::NONE));
+        }
+        engine::ProfileDownloadStatus::Failed(_) => {
+            painter.line_segment(
+                [pos2(center.x, center.y - 4.0), pos2(center.x, center.y + 1.0)],
+                Stroke::new(2.0, icon_col),
+            );
+            painter.circle_filled(pos2(center.x, center.y + 3.5), 1.1, icon_col);
+        }
     }
 }
 
@@ -1363,28 +1655,73 @@ mod tests {
     fn test_recommended_video_profile_id() {
         assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(24)), "minimax_h3_24gb");
         assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(16)), "minimax_h3_16gb");
-        assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(12)), "minimax_h3_12gb");
+        assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(14)), "minimax_h3_12gb");
+        assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(12)), "minimax_h3_ud_q3_k_xl");
         assert_eq!(recommended_video_profile_id(VideoFamily::MiniMaxH3, Some(10)), "minimax_h3_10gb");
         assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(24)), "ltx_2.5_24gb");
         assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(16)), "ltx_2.5_16gb");
-        assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(12)), "ltx_2.5_12gb");
-        assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(8)), "ltx_2.5_10gb");
+        assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(13)), "ltx_2.5_12gb");
+        assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(12)), "ltx_2.5_10gb");
+        assert_eq!(recommended_video_profile_id(VideoFamily::LtxVideo, Some(8)), "ltx_2.5_q2_k_xl");
     }
 
     #[test]
     fn test_allowed_step_up_variants() {
-        // 12GB cards can pick Q5 variants without caveat
-        assert!(is_allowed_step_up_variant("minimax_h3_q5_k_m", Some(12)));
-        assert!(is_allowed_step_up_variant("minimax_h3_q5_k_s", Some(12)));
+        // 12GB cards can pick Q4_K_M and UD-Q4_K_XL / UD-Q5_K_XL without caveat; H3 Q5_K_M is grayed out
+        assert!(!is_allowed_step_up_variant("minimax_h3_q5_k_m", Some(12)));
+        assert!(is_allowed_step_up_variant("minimax_h3_12gb", Some(12)));
+        assert!(is_allowed_step_up_variant("ltx_2.5_12gb", Some(12)));
         assert!(is_allowed_step_up_variant("ltx_2.5_q5_k_xl", Some(12)));
-        assert!(is_allowed_step_up_variant("ltx_2.5_q5_k_m", Some(12)));
+        assert!(!is_allowed_step_up_variant("ltx_2.5_12gb", Some(13)));
         assert!(!is_allowed_step_up_variant("minimax_h3_16gb", Some(12)));
 
-        // 10GB cards can pick Q4 variants without caveat
+        // 10GB cards can pick UD-Q3_K_XL, Q4_K_M, and UD-Q4_K_XL without caveat
+        assert!(is_allowed_step_up_variant("minimax_h3_ud_q3_k_xl", Some(10)));
         assert!(is_allowed_step_up_variant("minimax_h3_12gb", Some(10)));
-        assert!(is_allowed_step_up_variant("minimax_h3_q4_k_s", Some(10)));
         assert!(is_allowed_step_up_variant("ltx_2.5_12gb", Some(10)));
-        assert!(is_allowed_step_up_variant("ltx_2.5_q4_k_m", Some(10)));
+        assert!(is_allowed_step_up_variant("ltx_2.5_10gb", Some(10)));
         assert!(!is_allowed_step_up_variant("minimax_h3_q5_k_m", Some(10)));
+    }
+
+    #[test]
+    fn test_profile_deletable_files_includes_parts_and_active_unique_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "imgstudio_picker_del_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(dir.join("diffusion_models"));
+        let _ = std::fs::create_dir_all(dir.join("vae"));
+
+        let all_vid = engine::Profile::all_video_profiles();
+        let active_img = engine::Profile::all().into_iter().next().unwrap();
+        let p1 = all_vid.iter().find(|p| p.id == "ltx_2.5_12gb").unwrap().clone();
+        let p2 = all_vid.iter().find(|p| p.id == "ltx_2.5_16gb").unwrap().clone();
+
+        // Create p1's unique diffusion model and a shared VAE
+        let p1_diff = p1.models.iter().find(|m| m.category == "diffusion_models").unwrap();
+        let p1_diff_path = engine::safe_model_path(&dir, &p1_diff.category, &p1_diff.filename);
+        std::fs::write(&p1_diff_path, b"diff1").unwrap();
+
+        let p2_diff = p2.models.iter().find(|m| m.category == "diffusion_models").unwrap();
+        let p2_diff_part = engine::part_path_for(&engine::safe_model_path(&dir, &p2_diff.category, &p2_diff.filename));
+        std::fs::write(&p2_diff_part, b"part2").unwrap();
+
+        let shared_vae = p1.models.iter().find(|m| m.category == "vae").unwrap();
+        let shared_vae_path = engine::safe_model_path(&dir, &shared_vae.category, &shared_vae.filename);
+        std::fs::write(&shared_vae_path, b"vae").unwrap();
+
+        // 1. Mid-download p2 should list its .part file and NOT delete shared_vae (used by active p1)
+        let del_p2 = profile_deletable_files(&p2, &active_img, &p1, &all_vid, &dir, true);
+        assert!(del_p2.iter().any(|(path, _, _)| path == &p2_diff_part));
+        assert!(!del_p2.iter().any(|(path, _, _)| path == &shared_vae_path));
+
+        // 2. Active p1 should be deletable (unique diffusion model)
+        let del_p1 = profile_deletable_files(&p1, &active_img, &p1, &all_vid, &dir, false);
+        assert!(del_p1.iter().any(|(path, _, _)| path == &p1_diff_path));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

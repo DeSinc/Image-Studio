@@ -1,6 +1,7 @@
 //! Finds, downloads (if needed), launches (hidden) and supervises ComfyUI.
 //! Runs on its own thread and never touches the UI thread; the UI only reads `Shared`.
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -67,6 +68,13 @@ pub fn format_bytes(b: u64) -> String {
 // ---------------------------------------------------------------- config
 fn default_true() -> bool { true }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PersistedProfileDownload {
+    pub profile_id: String,
+    #[serde(default)]
+    pub paused: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub comfy_dir: Option<PathBuf>,
@@ -85,6 +93,18 @@ pub struct Config {
     pub dl_video_model: bool,
     #[serde(default)]
     pub dl_r2v_model: bool,
+    #[serde(default)]
+    pub allow_multi_video_loras: bool,
+    #[serde(default)]
+    pub auto_switch_mode_on_input: bool,
+    #[serde(default)]
+    pub remember_last_mode: bool,
+    #[serde(default)]
+    pub last_studio_mode: Option<String>,
+    #[serde(default = "default_true")]
+    pub keep_last_project_loaded: bool,
+    #[serde(default)]
+    pub pending_profile_downloads: Vec<PersistedProfileDownload>,
 }
 
 impl Default for Config {
@@ -99,6 +119,12 @@ impl Default for Config {
             dl_image_model: true,
             dl_video_model: false,
             dl_r2v_model: false,
+            allow_multi_video_loras: false,
+            auto_switch_mode_on_input: false,
+            remember_last_mode: false,
+            last_studio_mode: None,
+            keep_last_project_loaded: true,
+            pending_profile_downloads: Vec::new(),
         }
     }
 }
@@ -316,15 +342,16 @@ impl Profile {
         }
 
         // 3. Auto-detect GPU VRAM and choose optimal default video quantization
-        // >= 18GB: INT8 ConvRot (listed as 22-24GB+); >= 15GB: Q6_K; >= 11GB: Q4_K_M;
-        // 9-10GB: Q3_K_M; < 9GB: LTX-2.5 UD-Q3_K_XL
+        // >= 18GB: INT8 ConvRot (listed as 22-24GB+); >= 15GB: Q6_K; >= 13GB: Q4_K_M;
+        // >= 11GB (12GB): UD-Q3_K_XL; 9-10GB: Q3_K_M; < 9GB: LTX-2.5 UD-Q2_K_XL
         let target_id = match detect_gpu_vram_gb() {
             Some(vram) if vram >= 18 => "minimax_h3_24gb",
             Some(vram) if vram >= 15 => "minimax_h3_16gb",
-            Some(vram) if vram >= 11 => "minimax_h3_12gb",
+            Some(vram) if vram >= 13 => "minimax_h3_12gb",
+            Some(vram) if vram >= 11 => "minimax_h3_ud_q3_k_xl",
             Some(vram) if vram >= 9 => "minimax_h3_10gb",
-            Some(_) => "ltx_2.5_10gb",
-            None => "minimax_h3_12gb",
+            Some(_) => "ltx_2.5_q2_k_xl",
+            None => "minimax_h3_ud_q3_k_xl",
         };
         if let Some(p) = profiles.iter().find(|p| p.id == target_id) {
             log(&format!("Video Profile: auto-selected {target_id} for detected GPU VRAM"));
@@ -419,11 +446,71 @@ impl Profile {
             .collect()
     }
 
-    /// Returns the first video profile whose files are all present on disk in `models_dir`.
+    /// Returns the best downloaded video profile whose files are all present on disk in `models_dir`.
     pub fn find_downloaded_video_profile(models_dir: &Path) -> Option<Profile> {
-        Self::all_video_profiles()
+        Self::find_best_downloaded_video_profile(models_dir, false, None)
+    }
+
+    /// Picks the highest-quality downloaded video profile in `models_dir`.
+    /// - If `preferred_id` is Some and that profile is downloaded (and matches `ltx_only`), returns it.
+    /// - Otherwise picks the highest `recommended_vram_gb` that fits detected GPU VRAM (or smallest if none fit).
+    pub fn find_best_downloaded_video_profile(
+        models_dir: &Path,
+        ltx_only: bool,
+        preferred_id: Option<&str>,
+    ) -> Option<Profile> {
+        let downloaded: Vec<Profile> = Self::all_video_profiles()
             .into_iter()
-            .find(|p| p.missing_in_dir(models_dir).is_empty())
+            .filter(|p| (!ltx_only || !p.is_minimax_h3()) && p.missing_in_dir(models_dir).is_empty())
+            .collect();
+        if downloaded.is_empty() {
+            return None;
+        }
+        if let Some(pref) = preferred_id {
+            if let Some(p) = downloaded.iter().find(|p| p.id == pref) {
+                return Some(p.clone());
+            }
+        }
+        Self::pick_best_from_downloaded(&downloaded, detect_gpu_vram_gb())
+    }
+
+    pub fn find_best_downloaded_h3_profile(models_dir: &Path) -> Option<Profile> {
+        let downloaded: Vec<Profile> = Self::all_video_profiles()
+            .into_iter()
+            .filter(|p| p.is_minimax_h3() && p.missing_in_dir(models_dir).is_empty())
+            .collect();
+        Self::pick_best_from_downloaded(&downloaded, detect_gpu_vram_gb())
+    }
+
+    pub fn pick_best_from_downloaded(downloaded: &[Profile], vram: Option<u32>) -> Option<Profile> {
+        if downloaded.is_empty() {
+            return None;
+        }
+        let modern: Vec<&Profile> = downloaded
+            .iter()
+            .filter(|p| p.is_minimax_h3() || p.is_ltx25())
+            .collect();
+        let pool: Vec<&Profile> = if modern.is_empty() {
+            downloaded.iter().collect()
+        } else {
+            modern
+        };
+        if let Some(gpu_vram) = vram {
+            if let Some(best_fit) = pool
+                .iter()
+                .filter(|p| p.recommended_vram_gb <= gpu_vram)
+                .max_by_key(|p| (p.recommended_vram_gb, (p.total_size_gb() * 1000.0) as u64))
+            {
+                return Some((*best_fit).clone());
+            }
+            return pool
+                .iter()
+                .min_by_key(|p| (p.recommended_vram_gb, (p.total_size_gb() * 1000.0) as u64))
+                .map(|p| (*p).clone());
+        }
+        pool.iter()
+            .max_by_key(|p| (p.recommended_vram_gb, (p.total_size_gb() * 1000.0) as u64))
+            .map(|p| (*p).clone())
     }
 
     pub fn target_download_models(sh: &Shared) -> Vec<ModelFile> {
@@ -520,6 +607,38 @@ pub struct ModelDownloadProgress {
     pub overall_progress: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileDownloadStatus {
+    Downloading,
+    Paused,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileDownloadInfo {
+    pub profile_name: String,
+    pub status: ProfileDownloadStatus,
+    pub progress: f32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_mb: f32,
+    pub current_file: String,
+}
+
+pub struct ProfileDownloadTask {
+    pub profile: Profile,
+    pub status: ProfileDownloadStatus,
+    pub progress: f32,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_mb: f32,
+    pub current_file: String,
+    pub pause_flag: Arc<AtomicBool>,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub running: Arc<AtomicBool>,
+}
+
 #[derive(Default, Clone)]
 pub struct Paths {
     pub comfy: Option<PathBuf>,
@@ -550,6 +669,10 @@ pub struct Shared {
     pub migration_status: Mutex<Option<String>>,
     pub active_profile: Mutex<Profile>,
     pub active_video_profile: Mutex<Profile>,
+    pub profile_downloads: Mutex<HashMap<String, ProfileDownloadTask>>,
+    pub lora_downloads: Mutex<HashMap<String, crate::lora::LoraDownloadStatus>>,
+    pub active_file_downloads: Mutex<HashSet<PathBuf>>,
+    pub restored_profile_downloads: AtomicBool,
 }
 
 impl Shared {
@@ -583,6 +706,10 @@ impl Shared {
             migration_status: Mutex::new(None),
             active_profile: Mutex::new(img_profile),
             active_video_profile: Mutex::new(vid_profile),
+            profile_downloads: Mutex::new(HashMap::new()),
+            lora_downloads: Mutex::new(HashMap::new()),
+            active_file_downloads: Mutex::new(HashSet::new()),
+            restored_profile_downloads: AtomicBool::new(false),
         })
     }
 }
@@ -863,6 +990,7 @@ pub fn install_or_repair_dependencies(
     }
 
     ensure_gguf_custom_node(comfy, Some(py));
+    ensure_viggle_remake_custom_node(comfy);
 
     // Verify both comfy_aimdo and torch are working
     let verify = Command::new(py)
@@ -897,49 +1025,154 @@ pub fn ensure_ltx25_gguf_sidecar(models_dir: &Path) {
     let sidecar_path = diff_dir.join("ltx-2.5-transformer-metadata.json");
     if sidecar_path.is_file() {
         if let Ok(existing) = std::fs::read_to_string(&sidecar_path) {
-            if existing.contains("\"applies_to\"") && existing.contains("\"transformer\"") {
+            if existing.contains("\"applies_to\"")
+                && existing.contains("\"rope_type\"")
+                && existing.contains("\"frequencies_precision\"")
+                && existing.contains("\"causal_temporal_positioning\"")
+                && existing.contains("\"use_middle_indices_grid\"")
+            {
                 return;
             }
         }
     }
-    let sidecar_json = serde_json::json!({
-        "applies_to": ["*ltx*2.5*.gguf", "*ltx25*.gguf"],
-        "config": {
-            "transformer": {
-                "num_layers": 48,
-                "num_attention_heads": 32,
-                "attention_head_dim": 128,
-                "cross_attention_adaln": true,
-                "apply_gated_attention": true,
-                "connector_apply_gated_attention": true,
-                "caption_proj_before_connector": true,
-                "caption_projection_first_linear": false,
-                "cross_attention_dim": 4096,
-                "caption_channels": 3840,
-                "connector_attention_head_dim": 128,
-                "connector_num_attention_heads": 32,
-                "connector_num_layers": 8,
-                "audio_num_attention_heads": 32,
-                "audio_attention_head_dim": 64,
-                "audio_cross_attention_dim": 2048,
-                "audio_connector_attention_head_dim": 64,
-                "audio_connector_num_attention_heads": 32,
-                "audio_connector_num_layers": 8,
-                "positional_embedding_theta": 10000.0,
-                "positional_embedding_max_pos": [20, 2048, 2048],
-                "audio_positional_embedding_max_pos": [20],
-                "timestep_scale_multiplier": 1000,
-                "av_ca_timestep_scale_multiplier": 1000
+    let sidecar_raw = r#"{
+  "applies_to": ["*ltx*2.5*.gguf", "*ltx25*.gguf"],
+  "config": {
+    "transformer": {
+      "_class_name": "AVTransformer3DModel",
+      "activation_fn": "gelu-approximate",
+      "attention_bias": true,
+      "attention_head_dim": 128,
+      "attention_type": "default",
+      "caption_channels": 3840,
+      "cross_attention_dim": 4096,
+      "double_self_attention": false,
+      "dropout": 0.0,
+      "in_channels": 128,
+      "norm_elementwise_affine": false,
+      "norm_eps": 1e-06,
+      "norm_num_groups": 32,
+      "num_attention_heads": 32,
+      "num_embeds_ada_norm": 1000,
+      "num_layers": 48,
+      "num_vector_embeds": null,
+      "only_cross_attention": false,
+      "cross_attention_norm": true,
+      "out_channels": 128,
+      "upcast_attention": false,
+      "use_linear_projection": false,
+      "qk_norm": "rms_norm",
+      "standardization_norm": "rms_norm",
+      "positional_embedding_type": "rope",
+      "positional_embedding_theta": 10000.0,
+      "positional_embedding_max_pos": [20, 2048, 2048],
+      "timestep_scale_multiplier": 1000,
+      "av_ca_timestep_scale_multiplier": 1000.0,
+      "causal_temporal_positioning": true,
+      "audio_num_attention_heads": 32,
+      "audio_attention_head_dim": 64,
+      "use_audio_video_cross_attention": true,
+      "ff_bias": false,
+      "audio_ff_bias": false,
+      "share_ff": false,
+      "audio_out_channels": 128,
+      "audio_cross_attention_dim": 2048,
+      "audio_positional_embedding_max_pos": [20],
+      "av_cross_ada_norm": true,
+      "use_embeddings_connector": true,
+      "connector_attention_head_dim": 128,
+      "connector_num_attention_heads": 32,
+      "connector_num_layers": 8,
+      "connector_positional_embedding_max_pos": [4096],
+      "connector_num_learnable_registers": 128,
+      "connector_norm_output": true,
+      "use_middle_indices_grid": true,
+      "apply_gated_attention": true,
+      "connector_apply_gated_attention": true,
+      "caption_projection_first_linear": false,
+      "caption_projection_second_linear": false,
+      "caption_proj_input_norm": false,
+      "connector_learnable_registers_std": 1,
+      "caption_proj_before_connector": true,
+      "audio_connector_attention_head_dim": 64,
+      "audio_connector_num_attention_heads": 32,
+      "audio_connector_num_layers": 8,
+      "cross_attention_adaln": true,
+      "rope_type": "split",
+      "frequencies_precision": "float64",
+      "text_encoder_norm_type": "PER_TOKEN_RMS",
+      "use_keyframes_abs_pos_embedding": true
+    }
+  }
+}"#;
+    if let Ok(sidecar_json) = serde_json::from_str::<serde_json::Value>(sidecar_raw) {
+        if let Ok(pretty) = serde_json::to_string_pretty(&sidecar_json) {
+            if let Err(e) = std::fs::write(&sidecar_path, pretty) {
+                log(&format!("gguf sidecar: failed writing {}: {e}", sidecar_path.display()));
+            } else {
+                log(&format!("gguf sidecar: wrote {}", sidecar_path.display()));
             }
         }
-    });
-    if let Ok(pretty) = serde_json::to_string_pretty(&sidecar_json) {
-        if let Err(e) = std::fs::write(&sidecar_path, pretty) {
-            log(&format!("gguf sidecar: failed writing {}: {e}", sidecar_path.display()));
+    }
+}
+
+/// Ensures `Viggle/Viggle-Remake` ComfyUI custom nodes (`RemakeConditioning`, `RemakeNoise`, `RemakeKeyframeUntil`)
+/// are installed inside `ComfyUI/custom_nodes/ComfyUI-Viggle-Remake` and patched for ComfyUI versions without `comfy.audio`.
+/// Returns `true` if files were newly installed or patched (requiring a ComfyUI restart if already running).
+pub fn ensure_viggle_remake_custom_node(comfy: &Path) -> bool {
+    let custom_nodes = comfy.join("custom_nodes");
+    let node_dir = custom_nodes.join("ComfyUI-Viggle-Remake");
+    let init_py = node_dir.join("__init__.py");
+    let nodes_py = node_dir.join("nodes.py");
+    let mut changed = false;
+
+    if !init_py.is_file() || !nodes_py.is_file() {
+        log("viggle_remake: installing ComfyUI-Viggle-Remake custom node");
+        if std::fs::create_dir_all(&node_dir).is_err() {
+            return false;
+        }
+        let client = build_dl_client();
+        let base = "https://huggingface.co/Viggle/Viggle-Remake/resolve/main/comfyui/ComfyUI-Viggle-Remake";
+        for (fname, dst) in [("__init__.py", &init_py), ("nodes.py", &nodes_py)] {
+            if dst.is_file() {
+                continue;
+            }
+            if let Ok(resp) = client.get(format!("{base}/{fname}")).send() {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes() {
+                        if std::fs::write(dst, &bytes).is_ok() {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if init_py.is_file() && nodes_py.is_file() {
+            log("viggle_remake: ComfyUI-Viggle-Remake installed successfully");
         } else {
-            log(&format!("gguf sidecar: wrote {}", sidecar_path.display()));
+            log("viggle_remake: WARNING - failed to install ComfyUI-Viggle-Remake");
         }
     }
+
+    if let Ok(txt) = std::fs::read_to_string(&nodes_py) {
+        if txt.contains("import comfy.audio") && !txt.contains("_comfy_audio") {
+            let patched = txt
+                .replace(
+                    "import comfy.audio",
+                    "try:\n    import comfy.audio as _comfy_audio\nexcept ImportError:\n    _comfy_audio = None",
+                )
+                .replace(
+                    "wav = comfy.audio.resample(wav, sr, AUDIO_SR) if sr != AUDIO_SR else wav",
+                    "if sr != AUDIO_SR:\n                if _comfy_audio is not None:\n                    wav = _comfy_audio.resample(wav, sr, AUDIO_SR)\n                else:\n                    try:\n                        import torchaudio\n                        wav = torchaudio.functional.resample(wav, sr, AUDIO_SR)\n                    except ImportError:\n                        new_len = max(1, round(wav.shape[-1] * AUDIO_SR / sr))\n                        wav = torch.nn.functional.interpolate(wav.unsqueeze(0), size=new_len, mode=\"linear\", align_corners=False).squeeze(0)",
+                );
+            if patched != txt && std::fs::write(&nodes_py, patched).is_ok() {
+                log("viggle_remake: patched nodes.py for ComfyUI without comfy.audio");
+                changed = true;
+            }
+        }
+    }
+
+    changed
 }
 
 /// Ensures `ChrisColeTech/ComfyUI-GGUF-Loader` and its Python dependencies
@@ -1495,6 +1728,9 @@ fn spawn(py: &Path, comfy: &Path, models: &Path) -> Result<Child, String> {
         "--preview-method",
         "auto",
         "--disable-smart-memory",
+        "--cache-none",
+        "--reserve-vram",
+        "1.5",
         "--vram-headroom",
         "1.0",
     ]);
@@ -2736,6 +2972,556 @@ pub fn toggle_r2v_download(sh: &Arc<Shared>, ctx: &eframe::egui::Context, enable
 }
 
 
+pub fn part_path_for(dest: &Path) -> PathBuf {
+    dest.with_extension(format!(
+        "{}.part",
+        dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+    ))
+}
+
+pub fn get_profile_download_info(sh: &Shared, profile_id: &str) -> Option<ProfileDownloadInfo> {
+    let map = sh.profile_downloads.lock().unwrap();
+    map.get(profile_id).map(|t| ProfileDownloadInfo {
+        profile_name: t.profile.name.clone(),
+        status: t.status.clone(),
+        progress: t.progress,
+        bytes_done: t.bytes_done,
+        bytes_total: t.bytes_total,
+        speed_mb: t.speed_mb,
+        current_file: t.current_file.clone(),
+    })
+}
+
+pub fn all_profile_download_infos(sh: &Shared) -> Vec<ProfileDownloadInfo> {
+    let map = sh.profile_downloads.lock().unwrap();
+    map.values()
+        .map(|t| ProfileDownloadInfo {
+            profile_name: t.profile.name.clone(),
+            status: t.status.clone(),
+            progress: t.progress,
+            bytes_done: t.bytes_done,
+            bytes_total: t.bytes_total,
+            speed_mb: t.speed_mb,
+            current_file: t.current_file.clone(),
+        })
+        .collect()
+}
+
+fn effective_models_dir(sh: &Shared) -> PathBuf {
+    sh.pending_models_dir
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| sh.paths.lock().unwrap().models.clone())
+}
+
+fn profile_download_metrics(profile: &Profile, models_dir: &Path) -> (u64, u64, u64, f32, String) {
+    let required: Vec<&ModelFile> = profile.models.iter().filter(|m| !m.optional).collect();
+    let mut missing_total_bytes: u64 = 0;
+    let mut part_bytes: u64 = 0;
+    let mut first_missing: Option<String> = None;
+
+    for m in required {
+        let dest = safe_model_path(models_dir, &m.category, &m.filename);
+        if !dest.exists() {
+            missing_total_bytes += m.size_bytes;
+            if first_missing.is_none() {
+                first_missing = Some(m.filename.clone());
+            }
+            let p = part_path_for(&dest);
+            let plen = std::fs::metadata(&p).map(|md| md.len()).unwrap_or(0);
+            part_bytes += plen.min(m.size_bytes);
+        }
+    }
+
+    let progress = if missing_total_bytes > 0 {
+        (part_bytes as f32 / missing_total_bytes as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (0, part_bytes, missing_total_bytes, progress, first_missing.unwrap_or_default())
+}
+
+fn persist_profile_download_state(sh: &Shared, profile_id: &str, paused: Option<bool>) {
+    let mut cfg = sh.cfg.lock().unwrap();
+    let changed = match paused {
+        Some(paused_val) => {
+            if let Some(entry) = cfg.pending_profile_downloads.iter_mut().find(|e| e.profile_id == profile_id) {
+                if entry.paused != paused_val {
+                    entry.paused = paused_val;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                cfg.pending_profile_downloads.push(PersistedProfileDownload {
+                    profile_id: profile_id.to_string(),
+                    paused: paused_val,
+                });
+                true
+            }
+        }
+        None => {
+            let before = cfg.pending_profile_downloads.len();
+            cfg.pending_profile_downloads.retain(|e| e.profile_id != profile_id);
+            cfg.pending_profile_downloads.len() != before
+        }
+    };
+    if changed {
+        #[cfg(not(test))]
+        cfg.save();
+    }
+}
+
+pub fn restore_profile_downloads_if_needed(sh: &Arc<Shared>, ctx: &eframe::egui::Context) {
+    let models_dir = effective_models_dir(sh);
+    if models_dir.as_os_str().is_empty() {
+        return;
+    }
+    if sh.restored_profile_downloads.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let pending = sh.cfg.lock().unwrap().pending_profile_downloads.clone();
+    if pending.is_empty() {
+        return;
+    }
+
+    let all_profiles = Profile::all_raw();
+    let mut any_ui_update = false;
+
+    for entry in pending {
+        let Some(profile) = all_profiles.iter().find(|p| p.id == entry.profile_id) else {
+            persist_profile_download_state(sh, &entry.profile_id, None);
+            continue;
+        };
+        if profile.missing_in_dir(&models_dir).is_empty() {
+            persist_profile_download_state(sh, &entry.profile_id, None);
+            continue;
+        }
+        if entry.paused {
+            let (_, bytes_done, bytes_total, progress, current_file) =
+                profile_download_metrics(profile, &models_dir);
+            let mut map = sh.profile_downloads.lock().unwrap();
+            map.entry(profile.id.clone()).or_insert_with(|| ProfileDownloadTask {
+                profile: profile.clone(),
+                status: ProfileDownloadStatus::Paused,
+                progress,
+                bytes_done,
+                bytes_total,
+                speed_mb: 0.0,
+                current_file,
+                pause_flag: Arc::new(AtomicBool::new(true)),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                stop_flag: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+            });
+            any_ui_update = true;
+        } else {
+            start_profile_download(sh, profile, ctx);
+        }
+    }
+
+    if any_ui_update {
+        ctx.request_repaint();
+    }
+}
+
+pub fn start_profile_download(sh: &Arc<Shared>, profile: &Profile, ctx: &eframe::egui::Context) {
+    let models_dir = effective_models_dir(sh);
+    if models_dir.as_os_str().is_empty() {
+        return;
+    }
+    if profile.missing_in_dir(&models_dir).is_empty() {
+        persist_profile_download_state(sh, &profile.id, None);
+        return;
+    }
+
+    let (_, bytes_done, total_bytes, init_prog, current_file) =
+        profile_download_metrics(profile, &models_dir);
+
+    let (pause_flag, cancel_flag, stop_flag, running) = {
+        let mut map = sh.profile_downloads.lock().unwrap();
+        if let Some(existing) = map.get_mut(&profile.id) {
+            if existing.running.load(Ordering::SeqCst) {
+                return;
+            }
+            existing.pause_flag.store(false, Ordering::SeqCst);
+            existing.cancel_flag.store(false, Ordering::SeqCst);
+            existing.stop_flag.store(false, Ordering::SeqCst);
+            existing.running.store(true, Ordering::SeqCst);
+            existing.status = ProfileDownloadStatus::Downloading;
+            existing.bytes_done = bytes_done;
+            existing.bytes_total = total_bytes;
+            existing.progress = init_prog;
+            existing.current_file = current_file;
+            (
+                existing.pause_flag.clone(),
+                existing.cancel_flag.clone(),
+                existing.stop_flag.clone(),
+                existing.running.clone(),
+            )
+        } else {
+            let pause_flag = Arc::new(AtomicBool::new(false));
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let running = Arc::new(AtomicBool::new(true));
+            map.insert(
+                profile.id.clone(),
+                ProfileDownloadTask {
+                    profile: profile.clone(),
+                    status: ProfileDownloadStatus::Downloading,
+                    progress: init_prog,
+                    bytes_done,
+                    bytes_total: total_bytes,
+                    speed_mb: 0.0,
+                    current_file,
+                    pause_flag: pause_flag.clone(),
+                    cancel_flag: cancel_flag.clone(),
+                    stop_flag: stop_flag.clone(),
+                    running: running.clone(),
+                },
+            );
+            (pause_flag, cancel_flag, stop_flag, running)
+        }
+    };
+
+    persist_profile_download_state(sh, &profile.id, Some(false));
+
+    let sh_c = sh.clone();
+    let prof_c = profile.clone();
+    let ctx_c = ctx.clone();
+    std::thread::spawn(move || {
+        run_profile_download_worker(
+            sh_c,
+            prof_c,
+            ctx_c,
+            pause_flag,
+            cancel_flag,
+            stop_flag,
+            running,
+        );
+    });
+    ctx.request_repaint();
+}
+
+pub fn toggle_profile_download_pause(sh: &Arc<Shared>, profile_id: &str, ctx: &eframe::egui::Context) {
+    enum Action {
+        None,
+        Pause,
+        Resume(Profile),
+    }
+
+    let action = {
+        let mut map = sh.profile_downloads.lock().unwrap();
+        if let Some(task) = map.get_mut(profile_id) {
+            match task.status {
+                ProfileDownloadStatus::Downloading => {
+                    task.pause_flag.store(true, Ordering::SeqCst);
+                    task.stop_flag.store(true, Ordering::SeqCst);
+                    task.status = ProfileDownloadStatus::Paused;
+                    task.speed_mb = 0.0;
+                    Action::Pause
+                }
+                ProfileDownloadStatus::Paused | ProfileDownloadStatus::Failed(_) => {
+                    Action::Resume(task.profile.clone())
+                }
+            }
+        } else {
+            Action::None
+        }
+    };
+
+    match action {
+        Action::Pause => {
+            persist_profile_download_state(sh, profile_id, Some(true));
+            ctx.request_repaint();
+        }
+        Action::Resume(profile) => {
+            // Wait briefly if previous worker is still winding down
+            for _ in 0..40 {
+                let is_running = sh
+                    .profile_downloads
+                    .lock()
+                    .unwrap()
+                    .get(profile_id)
+                    .map(|t| t.running.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                if !is_running {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            sh.download_paused.store(false, Ordering::SeqCst);
+            start_profile_download(sh, &profile, ctx);
+        }
+        Action::None => {}
+    }
+}
+
+pub fn cancel_profile_download(sh: &Arc<Shared>, profile_id: &str) {
+    let running_arc = {
+        let mut map = sh.profile_downloads.lock().unwrap();
+        if let Some(task) = map.get_mut(profile_id) {
+            task.cancel_flag.store(true, Ordering::SeqCst);
+            task.stop_flag.store(true, Ordering::SeqCst);
+            Some(task.running.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(running) = running_arc {
+        for _ in 0..80 {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    sh.profile_downloads.lock().unwrap().remove(profile_id);
+    persist_profile_download_state(sh, profile_id, None);
+}
+
+struct ActiveFileGuard(Arc<Shared>, PathBuf);
+impl Drop for ActiveFileGuard {
+    fn drop(&mut self) {
+        self.0.active_file_downloads.lock().unwrap().remove(&self.1);
+    }
+}
+
+struct RunningFlagGuard(Arc<AtomicBool>);
+impl Drop for RunningFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_profile_download_worker(
+    sh: Arc<Shared>,
+    profile: Profile,
+    ctx: eframe::egui::Context,
+    pause_flag: Arc<AtomicBool>,
+    cancel_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+) {
+    let _running_guard = RunningFlagGuard(running);
+
+    let models_dir = effective_models_dir(&sh);
+
+    if models_dir.as_os_str().is_empty() {
+        if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+            task.status = ProfileDownloadStatus::Failed("Models directory not configured".into());
+        }
+        ctx.request_repaint();
+        return;
+    }
+
+    if profile.is_ltx25() {
+        ensure_ltx25_gguf_sidecar(&models_dir);
+    }
+
+    let missing = profile.missing_in_dir(&models_dir);
+    if missing.is_empty() {
+        sh.profile_downloads.lock().unwrap().remove(&profile.id);
+        persist_profile_download_state(&sh, &profile.id, None);
+        ctx.request_repaint();
+        return;
+    }
+
+    let (mut completed_bytes, _, total_all_bytes, _, _) =
+        profile_download_metrics(&profile, &models_dir);
+    let dl_client = build_dl_client();
+
+    for m in &missing {
+        if cancel_flag.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) {
+            sh.profile_downloads.lock().unwrap().remove(&profile.id);
+            if cancel_flag.load(Ordering::SeqCst) {
+                persist_profile_download_state(&sh, &profile.id, None);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if pause_flag.load(Ordering::SeqCst) || sh.download_paused.load(Ordering::SeqCst) {
+            if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                task.status = ProfileDownloadStatus::Paused;
+                task.speed_mb = 0.0;
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        let dest = safe_model_path(&models_dir, &m.category, &m.filename);
+
+        // Coordinate shared files across parallel profile downloads
+        let _file_guard = loop {
+            if dest.exists() {
+                break None;
+            }
+            if cancel_flag.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) {
+                sh.profile_downloads.lock().unwrap().remove(&profile.id);
+                if cancel_flag.load(Ordering::SeqCst) {
+                    persist_profile_download_state(&sh, &profile.id, None);
+                }
+                ctx.request_repaint();
+                return;
+            }
+            if pause_flag.load(Ordering::SeqCst) || sh.download_paused.load(Ordering::SeqCst) {
+                if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                    task.status = ProfileDownloadStatus::Paused;
+                    task.speed_mb = 0.0;
+                }
+                ctx.request_repaint();
+                return;
+            }
+            let claimed = sh.active_file_downloads.lock().unwrap().insert(dest.clone());
+            if claimed {
+                break Some(ActiveFileGuard(sh.clone(), dest.clone()));
+            }
+            // Another worker is downloading this shared file; reflect its .part progress
+            let part_len = std::fs::metadata(part_path_for(&dest))
+                .map(|md| md.len())
+                .unwrap_or(0);
+            let done_total = completed_bytes + part_len.min(m.size_bytes);
+            let prog = if total_all_bytes > 0 {
+                (done_total as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                task.current_file = m.filename.clone();
+                task.bytes_done = done_total;
+                task.bytes_total = total_all_bytes;
+                task.progress = prog;
+            }
+            ctx.request_repaint();
+            std::thread::sleep(Duration::from_millis(250));
+        };
+
+        if dest.exists() {
+            completed_bytes += m.size_bytes;
+            let prog = if total_all_bytes > 0 {
+                (completed_bytes as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                task.bytes_done = completed_bytes;
+                task.bytes_total = total_all_bytes;
+                task.progress = prog;
+            }
+            continue;
+        }
+
+        log(&format!("profile_dl [{}]: downloading {} -> {}", profile.id, m.filename, dest.display()));
+
+        let hf_mirror_url = if m.hf_url.starts_with("https://huggingface.co/") {
+            m.hf_url.replace("https://huggingface.co/", "https://hf-mirror.com/")
+        } else {
+            String::new()
+        };
+        let mut candidates = Vec::new();
+        if !m.hf_url.is_empty() {
+            candidates.push((m.hf_url.clone(), "HuggingFace"));
+        }
+        if !m.modelscope_url.is_empty() {
+            candidates.push((m.modelscope_url.clone(), "ModelScope"));
+        }
+        if !hf_mirror_url.is_empty() {
+            candidates.push((hf_mirror_url, "hf-mirror"));
+        }
+
+        let total_candidates = candidates.len();
+        let mut download_result = Err("No download candidates".to_string());
+        for (c_idx, (url, source_name)) in candidates.into_iter().enumerate() {
+            if stop_flag.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) || sh.download_paused.load(Ordering::SeqCst) {
+                break;
+            }
+            let enable_watchdog = c_idx + 1 < total_candidates;
+            download_result = download_stream(
+                &dl_client,
+                &url,
+                &dest,
+                m.size_bytes,
+                |done, _total, speed| {
+                    let done_total = completed_bytes + done.min(m.size_bytes);
+                    let prog = if total_all_bytes > 0 {
+                        (done_total as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                        task.current_file = m.filename.clone();
+                        task.bytes_done = done_total;
+                        task.bytes_total = total_all_bytes;
+                        task.progress = prog;
+                        task.speed_mb = speed;
+                    }
+                },
+                stop_flag.as_ref(),
+                &ctx,
+                enable_watchdog,
+                Some(&sh),
+            );
+            if download_result.is_ok() || stop_flag.load(Ordering::SeqCst) || sh.download_paused.load(Ordering::SeqCst) {
+                if download_result.is_ok() {
+                    log(&format!("profile_dl [{}]: downloaded {} via {}", profile.id, m.filename, source_name));
+                }
+                break;
+            } else {
+                log(&format!("profile_dl [{}]: {} failed from {}: {:?}", profile.id, m.filename, source_name, download_result.as_ref().err()));
+            }
+        }
+
+        if cancel_flag.load(Ordering::SeqCst) || sh.cancel.load(Ordering::SeqCst) {
+            sh.profile_downloads.lock().unwrap().remove(&profile.id);
+            if cancel_flag.load(Ordering::SeqCst) {
+                persist_profile_download_state(&sh, &profile.id, None);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        if pause_flag.load(Ordering::SeqCst) || sh.download_paused.load(Ordering::SeqCst) {
+            let part_len = std::fs::metadata(part_path_for(&dest))
+                .map(|md| md.len())
+                .unwrap_or(0);
+            let done_total = completed_bytes + part_len.min(m.size_bytes);
+            let prog = if total_all_bytes > 0 {
+                (done_total as f32 / total_all_bytes as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                task.status = ProfileDownloadStatus::Paused;
+                task.bytes_done = done_total;
+                task.bytes_total = total_all_bytes;
+                task.progress = prog;
+                task.speed_mb = 0.0;
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        if let Err(e) = download_result {
+            if let Some(task) = sh.profile_downloads.lock().unwrap().get_mut(&profile.id) {
+                task.status = ProfileDownloadStatus::Failed(e);
+                task.speed_mb = 0.0;
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        completed_bytes += m.size_bytes;
+    }
+
+    sh.profile_downloads.lock().unwrap().remove(&profile.id);
+    persist_profile_download_state(&sh, &profile.id, None);
+    ctx.request_repaint();
+}
+
 pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
         let ping_client = reqwest::blocking::Client::builder().timeout(Duration::from_millis(3500)).build().unwrap();
@@ -2783,6 +3569,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 if child.is_none() {
                     *sh.paths.lock().unwrap() = Paths { comfy: comfy.clone(), python: pys.first().cloned(), models: models.clone() };
                 }
+                restore_profile_downloads_if_needed(&sh, &ctx);
                 *sh.models_found.lock().unwrap() = profile
                     .models
                     .iter()
@@ -2842,6 +3629,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                 let pys = find_pythons(&cfg, cd);
                 *sh.paths.lock().unwrap() = Paths { comfy: Some(cd.clone()), python: pys.first().cloned(), models: models.clone() };
             }
+            restore_profile_downloads_if_needed(&sh, &ctx);
 
             // 3. Start ticked model downloads in background (requires confirmation if on metered connection)
             let missing_models = Profile::missing_models(&sh);
@@ -2928,6 +3716,7 @@ pub fn start_supervisor(sh: Arc<Shared>, _profile: Profile, ctx: eframe::egui::C
                     }
 
                     ensure_gguf_custom_node(cd, Some(py));
+                    ensure_viggle_remake_custom_node(cd);
                     ensure_ltx25_gguf_sidecar(&models);
 
                     log(&format!("launching {} (attempt {attempt})", py.display()));
@@ -3325,9 +4114,12 @@ mod tests {
         assert!(vid.iter().all(|p| Profile::is_video_profile_id(&p.id)));
         for expected in [
             "minimax_h3_10gb",
+            "minimax_h3_ud_q3_k_xl",
             "minimax_h3_12gb",
+            "minimax_h3_q5_k_m",
             "minimax_h3_16gb",
             "minimax_h3_24gb",
+            "ltx_2.5_q2_k_xl",
             "ltx_2.5_10gb",
             "ltx_2.5_12gb",
             "ltx_2.5_16gb",
@@ -3389,6 +4181,9 @@ mod tests {
         assert!(parsed["applies_to"].is_array());
         assert_eq!(parsed["config"]["transformer"]["num_layers"], 48);
         assert_eq!(parsed["config"]["transformer"]["cross_attention_adaln"], true);
+        assert_eq!(parsed["config"]["transformer"]["rope_type"], "split");
+        assert_eq!(parsed["config"]["transformer"]["causal_temporal_positioning"], true);
+        assert_eq!(parsed["config"]["transformer"]["use_middle_indices_grid"], true);
 
         let loras_dir = root.join("loras");
         std::fs::create_dir_all(loras_dir.join("sub")).unwrap();
@@ -3401,5 +4196,101 @@ mod tests {
         assert_eq!(found, vec!["sub/style.safetensors", "turbo.safetensors"]);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_persists_pending_profile_downloads_and_defaults_safely() {
+        let legacy_json = r#"{"comfy_dir":null,"models_dir":null}"#;
+        let legacy: Config = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.pending_profile_downloads.is_empty());
+
+        let mut cfg = Config::default();
+        cfg.pending_profile_downloads.push(PersistedProfileDownload {
+            profile_id: "flux_schnell".into(),
+            paused: false,
+        });
+        cfg.pending_profile_downloads.push(PersistedProfileDownload {
+            profile_id: "minimax_h3_16gb".into(),
+            paused: true,
+        });
+        let raw = serde_json::to_string(&cfg).unwrap();
+        let roundtrip: Config = serde_json::from_str(&raw).unwrap();
+        assert_eq!(roundtrip.pending_profile_downloads, cfg.pending_profile_downloads);
+    }
+
+    #[test]
+    fn restore_profile_downloads_restores_paused_progress_and_prunes_invalid() {
+        let root = sandbox();
+        let profiles = Profile::all_raw();
+        let target = profiles
+            .iter()
+            .find(|p| p.models.iter().filter(|m| !m.optional).count() >= 2)
+            .expect("need a multi-file profile")
+            .clone();
+        let req: Vec<&ModelFile> = target.models.iter().filter(|m| !m.optional).collect();
+        let first = req[0];
+        let second = req[1];
+
+        let first_dest = safe_model_path(&root, &first.category, &first.filename);
+        std::fs::create_dir_all(first_dest.parent().unwrap()).unwrap();
+        std::fs::write(&first_dest, b"done").unwrap();
+
+        let second_dest = safe_model_path(&root, &second.category, &second.filename);
+        std::fs::create_dir_all(second_dest.parent().unwrap()).unwrap();
+        let partial_len = (second.size_bytes / 2).min(1024).max(1);
+        std::fs::write(part_path_for(&second_dest), vec![0u8; partial_len as usize]).unwrap();
+
+        let (already_done, bytes_done, bytes_total, prog, current_file) =
+            profile_download_metrics(&target, &root);
+        assert_eq!(already_done, 0);
+        assert_eq!(bytes_done, partial_len);
+        assert!(bytes_total >= bytes_done);
+        assert!(prog > 0.0 && prog < 1.0);
+        assert_eq!(current_file, second.filename);
+
+        let sh = Shared::new();
+        *sh.pending_models_dir.lock().unwrap() = Some(root.clone());
+        {
+            let mut cfg = sh.cfg.lock().unwrap();
+            cfg.pending_profile_downloads = vec![
+                PersistedProfileDownload {
+                    profile_id: target.id.clone(),
+                    paused: true,
+                },
+                PersistedProfileDownload {
+                    profile_id: "nonexistent_profile_id".into(),
+                    paused: false,
+                },
+            ];
+        }
+
+        let ctx = eframe::egui::Context::default();
+        restore_profile_downloads_if_needed(&sh, &ctx);
+
+        let info = get_profile_download_info(&sh, &target.id).expect("paused download restored");
+        assert_eq!(info.status, ProfileDownloadStatus::Paused);
+        assert_eq!(info.bytes_done, bytes_done);
+        assert_eq!(info.bytes_total, bytes_total);
+        assert!((info.progress - prog).abs() < 1e-6);
+        assert_eq!(info.current_file, second.filename);
+        assert!(get_profile_download_info(&sh, "nonexistent_profile_id").is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pick_best_from_downloaded_prefers_higher_quality_fitting_vram_over_q2() {
+        let vid = Profile::all_video_profiles();
+        let q2 = vid.iter().find(|p| p.id == "ltx_2.5_q2_k_xl").unwrap().clone();
+        let q3 = vid.iter().find(|p| p.id == "ltx_2.5_10gb").unwrap().clone();
+        let q6 = vid.iter().find(|p| p.id == "ltx_2.5_16gb").unwrap().clone();
+
+        let best_12gb = Profile::pick_best_from_downloaded(&[q2.clone(), q3.clone(), q6.clone()], Some(12))
+            .expect("should pick best fitting");
+        assert_eq!(best_12gb.id, "ltx_2.5_10gb");
+
+        let best_8gb = Profile::pick_best_from_downloaded(&[q2, q3], Some(8))
+            .expect("should pick q2 on 8gb");
+        assert_eq!(best_8gb.id, "ltx_2.5_q2_k_xl");
     }
 }

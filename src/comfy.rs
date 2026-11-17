@@ -45,8 +45,11 @@ pub struct VideoParams {
     pub last_frame: Option<Vec<u8>>,
     pub ref_images: Vec<Vec<u8>>,
     pub use_r2v: bool,
-    pub lora_name: Option<String>,
-    pub lora_strength: f32,
+    pub source_video_bytes: Option<Vec<u8>>,
+    pub source_video_frames: Option<u32>,
+    pub stall_prompt: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub stall_keep_waiting: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub loras: Vec<crate::lora::ActiveLora>,
     pub unet_name: String,
     pub ref2va_unet_name: String,
     pub clip_name: String,
@@ -79,8 +82,11 @@ impl Default for VideoParams {
             last_frame: None,
             ref_images: Vec::new(),
             use_r2v: false,
-            lora_name: None,
-            lora_strength: 1.0,
+            source_video_bytes: None,
+            source_video_frames: None,
+            stall_prompt: None,
+            stall_keep_waiting: None,
+            loras: Vec::new(),
             unet_name: "MiniMax-H3-FL2VA-Pruned-Q4_K_M.gguf".to_string(),
             ref2va_unet_name: "MiniMax-H3-Ref2VA-Pruned-Q4_K_M.gguf".to_string(),
             clip_name: "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors".to_string(),
@@ -109,6 +115,33 @@ pub struct Params {
     pub vae: String,
     pub sampler: String,
     pub scheduler: String,
+    pub loras: Vec<crate::lora::ActiveLora>,
+}
+
+fn apply_loras(
+    g: &mut Value,
+    base_model: Value,
+    loras: &[crate::lora::ActiveLora],
+    base_node_id: u32,
+) -> Value {
+    let mut model_out = base_model;
+    for (idx, lora) in loras
+        .iter()
+        .filter(|l| !l.filename.is_empty() && l.filename != "None")
+        .enumerate()
+    {
+        let nid = format!("{}", base_node_id + idx as u32);
+        g[&nid] = json!({
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": model_out,
+                "lora_name": lora.filename,
+                "strength_model": lora.strength
+            }
+        });
+        model_out = json!([nid, 0]);
+    }
+    model_out
 }
 
 fn upload(c: &Client, png: Vec<u8>, name: &str) -> Result<String, String> {
@@ -125,6 +158,30 @@ fn upload(c: &Client, png: Vec<u8>, name: &str) -> Result<String, String> {
     Ok(format!("{n} [temp]"))
 }
 
+fn upload_video(c: &Client, bytes: Vec<u8>, name: &str) -> Result<String, String> {
+    let part = multipart::Part::bytes(bytes)
+        .file_name(name.to_string())
+        .mime_str("video/mp4")
+        .map_err(|e| e.to_string())?;
+    let form = multipart::Form::new()
+        .part("image", part)
+        .text("type", "input")
+        .text("overwrite", "true");
+    let r = c
+        .post(format!("{}/upload/image", base_url()))
+        .multipart(form)
+        .send()
+        .map_err(|e| format!("video upload: {e}"))?;
+    let status = r.status();
+    if !status.is_success() {
+        let err_body = r.text().unwrap_or_default();
+        return Err(format!("video upload error ({status}): {err_body}"));
+    }
+    let v: Value = r.json().map_err(|e| format!("video upload reply: {e}"))?;
+    let n = v["name"].as_str().ok_or("video upload: no name in reply")?;
+    Ok(n.to_string())
+}
+
 fn workflow(p: &Params, names: &[String]) -> Value {
     let mut te = json!({
         "clip": ["2", 0], "vae": ["3", 0],
@@ -135,8 +192,9 @@ fn workflow(p: &Params, names: &[String]) -> Value {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": p.unet, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": p.clip, "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": p.vae}},
-        "4": {"class_type": "QwenImage21Cache", "inputs": {"model": ["1", 0], "device": "auto", "dtype": "default"}},
     });
+    let model_out = apply_loras(&mut g, json!(["1", 0]), &p.loras, 12);
+    g["4"] = json!({"class_type": "QwenImage21Cache", "inputs": {"model": model_out, "device": "auto", "dtype": "default"}});
     for (i, n) in names.iter().enumerate() {
         let id = format!("{}", 100 + i);
         g[&id] = json!({"class_type": "LoadImage", "inputs": {"image": n}});
@@ -160,6 +218,7 @@ fn workflow_minimax_h3(
     first_frame_name: Option<&str>,
     last_frame_name: Option<&str>,
     ref_image_names: &[String],
+    source_video_name: Option<&str>,
 ) -> Value {
     let w = ((p.width.max(256) + 15) / 32) * 32;
     let h = ((p.height.max(256) + 15) / 32) * 32;
@@ -194,22 +253,152 @@ fn workflow_minimax_h3(
         "103": { "class_type": "VAELoader", "inputs": { "vae_name": p.audio_vae_name } }
     });
 
-    let custom_lora = p.lora_name.as_deref().filter(|s| !s.is_empty() && *s != "None");
-    let model_out = if let Some(lora) = custom_lora {
-        g["105"] = json!({
-            "class_type": "LoraLoaderModelOnly",
+    let is_viggle_remake = source_video_name.is_some()
+        && p.loras
+            .iter()
+            .any(|l| l.filename.to_ascii_lowercase().contains("viggle_remake"));
+
+    let model_out = if is_viggle_remake {
+        let mut cur = json!(["100", 0]);
+        for (idx, l) in p.loras.iter().enumerate() {
+            let nid = format!("{}", 150 + idx);
+            let class_type = if l.filename.to_ascii_lowercase().contains("viggle_remake") {
+                "LoraLoaderBypassModelOnly"
+            } else {
+                "LoraLoaderModelOnly"
+            };
+            g[&nid] = json!({
+                "class_type": class_type,
+                "inputs": {
+                    "model": cur,
+                    "lora_name": l.filename,
+                    "strength_model": l.strength
+                }
+            });
+            cur = json!([nid, 0]);
+        }
+        g["160"] = json!({
+            "class_type": "RemakeKeyframeUntil",
             "inputs": {
-                "model": ["100", 0],
-                "lora_name": lora,
-                "strength_model": p.lora_strength
+                "model": cur,
+                "keyframe_until": 0.9
             }
         });
-        json!(["105", 0])
+        json!(["160", 0])
     } else {
-        json!(["100", 0])
+        apply_loras(&mut g, json!(["100", 0]), &p.loras, 150)
     };
 
-    if use_ref_graph {
+    let sampler_name = if p.sampler.is_empty() { "er_sde" } else { p.sampler.as_str() };
+    let scheduler_name = if p.scheduler.is_empty() { "sgm_uniform" } else { p.scheduler.as_str() };
+
+    if let Some(src_vid) = source_video_name {
+        g["204"] = json!({ "class_type": "LoadVideo", "inputs": { "file": src_vid } });
+        g["205"] = json!({ "class_type": "GetVideoComponents", "inputs": { "video": ["204", 0] } });
+
+        if is_viggle_remake {
+            let raw_f = p.source_video_frames.unwrap_or(124).clamp(90, 345);
+            let nf = ((raw_f - 5) / 17) * 17 + 5;
+            let short_edge = if w.min(h) <= 544 { 480 } else { 736 };
+            let ref1_name = ref_image_names
+                .first()
+                .map(|s| s.as_str())
+                .or(first_frame_name)
+                .unwrap_or("remake_ref1.png");
+            g["200"] = json!({ "class_type": "LoadImage", "inputs": { "image": ref1_name } });
+            let prompt_text = if p.prompt.trim().is_empty() {
+                "Edit <Video 1> matching <Picture 1>."
+            } else {
+                p.prompt.as_str()
+            };
+            let mut cond_inputs = json!({
+                "clip": ["101", 0],
+                "vae": ["102", 0],
+                "audio_vae": ["103", 0],
+                "source": ["205", 0],
+                "audio": ["205", 1],
+                "prompt": prompt_text,
+                "ref_1": ["200", 0],
+                "pins": if !ref_image_names.is_empty() { "0" } else { "" },
+                "frames": nf,
+                "short_edge": short_edge
+            });
+            for (idx, rname) in ref_image_names.iter().skip(1).take(3).enumerate() {
+                let nid = format!("{}", 210 + idx);
+                g[&nid] = json!({ "class_type": "LoadImage", "inputs": { "image": rname } });
+                cond_inputs[format!("ref_{}", idx + 2)] = json!([nid, 0]);
+            }
+            g["110"] = json!({ "class_type": "RemakeConditioning", "inputs": cond_inputs });
+            g["111"] = json!({ "class_type": "RemakeNoise", "inputs": { "positive": ["110", 0], "seed": p.seed } });
+            g["112"] = json!({ "class_type": "BasicGuider", "inputs": { "model": model_out, "conditioning": ["110", 0] } });
+            g["113"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": "euler" } });
+            g["114"] = json!({
+                "class_type": "ManualSigmas",
+                "inputs": { "sigmas": "1.0, 0.983607, 0.96, 0.923077, 0.857143, 0.705882, 0.0" }
+            });
+        } else {
+            let mp = ((w as f64 * h as f64) / 1_000_000.0).max(0.25);
+            g["206"] = json!({
+                "class_type": "ImageScaleToTotalPixels",
+                "inputs": {
+                    "image": ["205", 0],
+                    "upscale_method": "lanczos",
+                    "megapixels": mp,
+                    "resolution_steps": 32
+                }
+            });
+            let mut i2v_inputs = json!({
+                "clip": ["101", 0],
+                "vae": ["102", 0],
+                "prompt": p.prompt,
+                "width": w,
+                "height": h,
+                "length": frames as i64
+            });
+            if let Some(style_ref) = ref_image_names.first().map(|s| s.as_str()).or(first_frame_name) {
+                g["200"] = json!({ "class_type": "LoadImage", "inputs": { "image": style_ref } });
+                g["201"] = json!({
+                    "class_type": "ImageScaleToTotalPixels",
+                    "inputs": {
+                        "image": ["200", 0],
+                        "upscale_method": "lanczos",
+                        "megapixels": mp,
+                        "resolution_steps": 32
+                    }
+                });
+                i2v_inputs["first_frame"] = json!(["201", 0]);
+            }
+            g["108"] = json!({
+                "class_type": "EmptyMiniMaxH3LatentAV",
+                "inputs": { "width": w, "height": h, "length": frames as i64 }
+            });
+            g["109"] = json!({ "class_type": "MiniMaxH3ImageToVideo", "inputs": i2v_inputs });
+            g["110"] = json!({
+                "class_type": "MiniMaxH3AddGuide",
+                "inputs": {
+                    "positive": ["109", 0],
+                    "latent": ["108", 0],
+                    "vae": ["102", 0],
+                    "audio_vae": ["103", 0],
+                    "image": ["206", 0],
+                    "audio": ["205", 1],
+                    "frame_idx": 0
+                }
+            });
+            g["111"] = json!({ "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } });
+            g["112"] = json!({ "class_type": "BasicGuider", "inputs": { "model": model_out, "conditioning": ["110", 0] } });
+            g["113"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } });
+            g["114"] = json!({
+                "class_type": "BasicScheduler",
+                "inputs": {
+                    "model": model_out,
+                    "scheduler": scheduler_name,
+                    "steps": p.steps.max(1),
+                    "denoise": p.denoise.clamp(0.05, 1.0)
+                }
+            });
+        }
+    } else if use_ref_graph {
         let mut r2v_inputs = json!({
             "clip": ["101", 0],
             "vae": ["102", 0],
@@ -265,21 +454,25 @@ fn workflow_minimax_h3(
         g["110"] = json!({ "class_type": "MiniMaxH3ImageToVideo", "inputs": i2v_inputs });
     }
 
-    let sampler_name = if p.sampler.is_empty() { "er_sde" } else { p.sampler.as_str() };
-    let scheduler_name = if p.scheduler.is_empty() { "sgm_uniform" } else { p.scheduler.as_str() };
-
-    g["111"] = json!({ "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } });
-    g["112"] = json!({ "class_type": "BasicGuider", "inputs": { "model": model_out, "conditioning": ["110", 0] } });
-    g["113"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } });
-    g["114"] = json!({
-        "class_type": "BasicScheduler",
-        "inputs": {
-            "model": model_out,
-            "scheduler": scheduler_name,
-            "steps": p.steps.max(1),
-            "denoise": p.denoise.clamp(0.05, 1.0)
-        }
-    });
+    if source_video_name.is_none() {
+        g["111"] = json!({ "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } });
+        g["112"] = json!({ "class_type": "BasicGuider", "inputs": { "model": model_out, "conditioning": ["110", 0] } });
+        g["113"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } });
+        g["114"] = json!({
+            "class_type": "BasicScheduler",
+            "inputs": {
+                "model": model_out,
+                "scheduler": scheduler_name,
+                "steps": p.steps.max(1),
+                "denoise": p.denoise.clamp(0.05, 1.0)
+            }
+        });
+    }
+    let latent_ref = if source_video_name.is_some() && !is_viggle_remake {
+        json!(["108", 0])
+    } else {
+        json!(["110", 1])
+    };
     g["115"] = json!({
         "class_type": "SamplerCustomAdvanced",
         "inputs": {
@@ -287,7 +480,7 @@ fn workflow_minimax_h3(
             "guider": ["112", 0],
             "sampler": ["113", 0],
             "sigmas": ["114", 0],
-            "latent_image": ["110", 1]
+            "latent_image": latent_ref
         }
     });
     g["116"] = json!({ "class_type": "VAEDecode", "inputs": { "samples": ["115", 0], "vae": ["102", 0] } });
@@ -314,10 +507,15 @@ fn workflow_minimax_h3(
     g
 }
 
-fn workflow_ltx25(p: &VideoParams, image_name: Option<&str>) -> Value {
-    let w = ((p.width.max(128) + 31) / 64) * 64;
-    let h = ((p.height.max(128) + 31) / 64) * 64;
-    let frames = ((p.duration * p.fps) / 8).max(1) * 8 + 1;
+fn workflow_ltx25(p: &VideoParams, image_name: Option<&str>, video_name: Option<&str>) -> Value {
+    // Both 2-stage LTX-2.5 and IC-LoRA V2V (reference_downscale_factor=2 on /32 latents) require pixel dims divisible by 64.
+    let (w, h) = (
+        ((p.width.max(128) + 32) / 64) * 64,
+        ((p.height.max(128) + 32) / 64) * 64,
+    );
+    let frames = p
+        .source_video_frames
+        .unwrap_or_else(|| ((p.duration * p.fps) / 8).max(1) * 8 + 1);
 
     let unet_node = if p.unet_name.to_ascii_lowercase().ends_with(".gguf") {
         json!({ "class_type": "UnetLoaderGGUF", "inputs": { "unet_name": p.unet_name } })
@@ -331,200 +529,203 @@ fn workflow_ltx25(p: &VideoParams, image_name: Option<&str>) -> Value {
         json!({ "class_type": "CLIPLoader", "inputs": { "clip_name": p.clip_name, "type": "ltxv", "device": "default" } })
     };
 
-    let sampler_name = if p.sampler.is_empty() { "er_sde" } else { p.sampler.as_str() };
+    let sampler_name = if p.sampler.is_empty() || p.sampler == "er_sde" {
+        "euler_ancestral"
+    } else {
+        p.sampler.as_str()
+    };
 
     let mut g = json!({
         "236": unet_node,
         "237": clip_node,
         "248": { "class_type": "VAELoader", "inputs": { "vae_name": p.vae_name } },
-        "212": { "class_type": "VAELoader", "inputs": { "vae_name": p.audio_vae_name } },
-        "233": { "class_type": "LatentUpscaleModelLoader", "inputs": { "model_name": p.latent_upscale_model } },
 
         "277": { "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } },
-        "276": { "class_type": "RandomNoise", "inputs": { "noise_seed": 42 } },
         "291": { "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } },
-        "280": { "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } },
         "306": { "class_type": "ManualSigmas", "inputs": { "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0" } },
-        "281": { "class_type": "ManualSigmas", "inputs": { "sigmas": "0.85, 0.7250, 0.4219, 0.0" } },
 
         "240": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["237", 0], "text": p.prompt } },
         "247": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["237", 0], "text": p.negative } },
         "239": { "class_type": "LTXVConditioning", "inputs": { "positive": ["240", 0], "negative": ["247", 0], "frame_rate": p.fps as f32 } },
 
-        "295": { "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w / 2, "height": h / 2, "length": frames as i64, "batch_size": 1 } },
-        "305": { "class_type": "LTXVEmptyLatentAudio", "inputs": { "audio_vae": ["212", 0], "frames_number": frames as i64, "frame_rate": p.fps as i64, "batch_size": 1 } },
-
-        "318": { "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["296", 0], "audio_latent": ["305", 0] } },
-        "307": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["215", 0] } },
-
-        "287": { "class_type": "LTXVLatentUpsampler", "inputs": { "samples": ["307", 0], "upscale_model": ["233", 0], "vae": ["248", 0] } },
-        "278": { "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["288", 0], "audio_latent": ["307", 1] } },
-        "309": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["246", 0] } },
-
-        "315": { "class_type": "VAEDecodeTiled", "inputs": { "samples": ["309", 0], "vae": ["248", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16 } },
-        "297": { "class_type": "LTXVAudioVAEDecode", "inputs": { "samples": ["309", 1], "audio_vae": ["212", 0] } },
-        "310": { "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["297", 0], "fps": p.fps as f32 } },
         "75": { "class_type": "SaveVideo", "inputs": { "video": ["310", 0], "filename_prefix": "ImageStudio/video", "format": "auto", "codec": "auto" } }
     });
 
-    let custom_lora = p.lora_name.as_deref().filter(|s| !s.is_empty() && *s != "None");
-    let model_out = if let Some(lora) = custom_lora {
-        g["285"] = json!({
-            "class_type": "LoraLoaderModelOnly",
+    let model_out = apply_loras(&mut g, json!(["236", 0]), &p.loras, 350);
+
+    if let Some(vid_name) = video_name {
+        // IC-LoRA V2V mode runs single-stage video-only at full target resolution (skipping audio VAE/latent generation)
+        // and passes the source video's original audio stream straight through to CreateVideo.
+        g["295"] = json!({ "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w, "height": h, "length": frames as i64, "batch_size": 1 } });
+        g["400"] = json!({ "class_type": "LoadVideo", "inputs": { "file": vid_name } });
+        g["401"] = json!({ "class_type": "GetVideoComponents", "inputs": { "video": ["400", 0] } });
+        g["407"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["401", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+        }});
+        g["408"] = json!({
+            "class_type": "ImageFromBatch",
             "inputs": {
-                "model": ["236", 0],
-                "lora_name": lora,
-                "strength_model": p.lora_strength
+                "image": ["407", 0],
+                "batch_index": 0,
+                "length": frames as i64
             }
         });
-        json!(["285", 0])
+        g["402"] = json!({ "class_type": "GetICLoRAParameters", "inputs": { "iclora_model": model_out.clone() } });
+        g["403"] = json!({
+            "class_type": "LTXVAddGuide",
+            "inputs": {
+                "positive": ["239", 0],
+                "negative": ["239", 1],
+                "vae": ["248", 0],
+                "latent": ["295", 0],
+                "image": ["408", 0],
+                "frame_idx": 0,
+                "strength": 1.0,
+                "iclora_parameters": ["402", 0]
+            }
+        });
+        g["241"] = json!({
+            "class_type": "LTXVDualCFGGuider",
+            "inputs": {
+                "model": model_out,
+                "positive": ["403", 0],
+                "negative": ["403", 1],
+                "video_cfg": p.cfg.max(0.5),
+                "audio_cfg": p.cfg.max(0.5)
+            }
+        });
+        g["215"] = json!({
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["277", 0],
+                "guider": ["241", 0],
+                "sampler": ["291", 0],
+                "sigmas": ["306", 0],
+                "latent_image": ["403", 2]
+            }
+        });
+        g["404"] = json!({
+            "class_type": "LTXVCropGuides",
+            "inputs": {
+                "positive": ["403", 0],
+                "negative": ["403", 1],
+                "latent": ["215", 0]
+            }
+        });
+        g["315"] = json!({ "class_type": "VAEDecodeTiled", "inputs": { "samples": ["404", 2], "vae": ["248", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8 } });
+        g["310"] = json!({ "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["401", 1], "fps": p.fps as f32 } });
     } else {
-        json!(["236", 0])
-    };
+        // Standard 2-stage T2V / I2V pipeline (with optional standard style/camera LoRAs applied to both stages).
+        g["212"] = json!({ "class_type": "VAELoader", "inputs": { "vae_name": p.audio_vae_name } });
+        g["305"] = json!({ "class_type": "LTXVEmptyLatentAudio", "inputs": { "audio_vae": ["212", 0], "frames_number": frames as i64, "frame_rate": p.fps as i64, "batch_size": 1 } });
+        g["233"] = json!({ "class_type": "LatentUpscaleModelLoader", "inputs": { "model_name": p.latent_upscale_model } });
+        g["276"] = json!({ "class_type": "RandomNoise", "inputs": { "noise_seed": 42 } });
+        g["280"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } });
+        g["281"] = json!({ "class_type": "ManualSigmas", "inputs": { "sigmas": "0.85, 0.7250, 0.4219, 0.0" } });
+        g["295"] = json!({ "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w / 2, "height": h / 2, "length": frames as i64, "batch_size": 1 } });
 
-    g["241"] = json!({
-        "class_type": "CFGGuider",
-        "inputs": {
-            "model": model_out,
-            "positive": ["239", 0],
-            "negative": ["239", 1],
-            "cfg": p.cfg.max(0.5)
-        }
-    });
-    g["215"] = json!({
-        "class_type": "SamplerCustomAdvanced",
-        "inputs": {
-            "noise": ["277", 0],
-            "guider": ["241", 0],
-            "sampler": ["291", 0],
-            "sigmas": ["306", 0],
-            "latent_image": ["318", 0]
-        }
-    });
-    g["246"] = json!({
-        "class_type": "SamplerCustomAdvanced",
-        "inputs": {
-            "noise": ["276", 0],
-            "guider": ["241", 0],
-            "sampler": ["280", 0],
-            "sigmas": ["281", 0],
-            "latent_image": ["278", 0]
-        }
-    });
+        g["318"] = json!({ "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["296", 0], "audio_latent": ["305", 0] } });
+        g["241"] = json!({
+            "class_type": "LTXVDualCFGGuider",
+            "inputs": {
+                "model": model_out,
+                "positive": ["239", 0],
+                "negative": ["239", 1],
+                "video_cfg": p.cfg.max(0.5),
+                "audio_cfg": p.cfg.max(0.5)
+            }
+        });
+        g["215"] = json!({
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["277", 0],
+                "guider": ["241", 0],
+                "sampler": ["291", 0],
+                "sigmas": ["306", 0],
+                "latent_image": ["318", 0]
+            }
+        });
+        g["307"] = json!({ "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["215", 0] } });
+        g["287"] = json!({ "class_type": "LTXVLatentUpsampler", "inputs": { "samples": ["307", 0], "upscale_model": ["233", 0], "vae": ["248", 0] } });
+        g["278"] = json!({ "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["288", 0], "audio_latent": ["307", 1] } });
+        g["246"] = json!({
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["276", 0],
+                "guider": ["241", 0],
+                "sampler": ["280", 0],
+                "sigmas": ["281", 0],
+                "latent_image": ["278", 0]
+            }
+        });
+        g["309"] = json!({ "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["246", 0] } });
+        g["315"] = json!({ "class_type": "VAEDecodeTiled", "inputs": { "samples": ["309", 0], "vae": ["248", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16 } });
+        g["297"] = json!({ "class_type": "LTXVAudioVAEDecode", "inputs": { "samples": ["309", 1], "audio_vae": ["212", 0] } });
+        g["310"] = json!({ "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["297", 0], "fps": p.fps as f32 } });
 
-    if let Some(img_name) = image_name {
-        g["269"] = json!({ "class_type": "LoadImage", "inputs": { "image": img_name } });
-        g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
-        }});
-        g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["290", 0], "img_compression": 18 } });
-        g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["295", 0], "bypass": false, "strength": 0.7 } });
-        g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["287", 0], "bypass": false, "strength": 1.0 } });
-    } else {
-        g["269"] = json!({ "class_type": "EmptyImage", "inputs": { "width": 512, "height": 512, "batch_size": 1, "color": 0 } });
-        g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
-        }});
-        g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["290", 0], "img_compression": 18 } });
-        g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["295", 0], "bypass": true, "strength": 0.7 } });
-        g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["287", 0], "bypass": true, "strength": 1.0 } });
+        if let Some(img_name) = image_name {
+            g["269"] = json!({ "class_type": "LoadImage", "inputs": { "image": img_name } });
+            g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+            }});
+            g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["290", 0], "img_compression": 18 } });
+            g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["295", 0], "bypass": false, "strength": 0.7 } });
+            g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["287", 0], "bypass": false, "strength": 1.0 } });
+        } else {
+            g["269"] = json!({ "class_type": "EmptyImage", "inputs": { "width": 512, "height": 512, "batch_size": 1, "color": 0 } });
+            g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+            }});
+            g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["290", 0], "img_compression": 18 } });
+            g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["295", 0], "bypass": true, "strength": 0.7 } });
+            g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["248", 0], "image": ["289", 0], "latent": ["287", 0], "bypass": true, "strength": 1.0 } });
+        }
     }
 
     g
 }
 
-fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
-    let w = ((p.width.max(128) + 31) / 64) * 64;
-    let h = ((p.height.max(128) + 31) / 64) * 64;
-    let sampler_name = if p.sampler.is_empty() { "euler" } else { p.sampler.as_str() };
+fn workflow_video(p: &VideoParams, image_name: Option<&str>, video_name: Option<&str>) -> Value {
+    // Both 2-stage LTX and IC-LoRA V2V (reference_downscale_factor=2 on /32 latents) require pixel dims divisible by 64.
+    let (w, h) = (
+        ((p.width.max(128) + 32) / 64) * 64,
+        ((p.height.max(128) + 32) / 64) * 64,
+    );
+    let frames = p
+        .source_video_frames
+        .unwrap_or_else(|| ((p.duration * p.fps) / 8).max(1) * 8 + 1);
+    let sampler_name = if video_name.is_some() && (p.sampler.is_empty() || p.sampler == "er_sde") {
+        "euler_ancestral"
+    } else if p.sampler.is_empty() {
+        "euler"
+    } else {
+        p.sampler.as_str()
+    };
     let mut g = json!({
         "316": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": p.ckpt_name } },
         "317": { "class_type": "LTXAVTextEncoderLoader", "inputs": { "text_encoder": p.text_encoder, "ckpt_name": p.ckpt_name, "device": "default" } },
-        "279": { "class_type": "LTXVAudioVAELoader", "inputs": { "ckpt_name": p.ckpt_name } },
         "285": { "class_type": "LoraLoaderModelOnly", "inputs": { "model": ["316", 0], "lora_name": p.distilled_lora, "strength_model": 0.5 } },
 
         "277": { "class_type": "RandomNoise", "inputs": { "noise_seed": p.seed } },
-        "276": { "class_type": "RandomNoise", "inputs": { "noise_seed": 42 } },
         "291": { "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } },
-        "280": { "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } },
         "306": { "class_type": "ManualSigmas", "inputs": { "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0" } },
-        "281": { "class_type": "ManualSigmas", "inputs": { "sigmas": "0.85, 0.7250, 0.4219, 0.0" } },
 
         "313": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": p.negative } },
         "304": { "class_type": "LTXVConditioning", "inputs": { "positive": ["303", 0], "negative": ["313", 0], "frame_rate": p.fps as f32 } },
-        "314": { "class_type": "CFGGuider", "inputs": { "model": ["285", 0], "positive": ["304", 0], "negative": ["304", 1], "cfg": 1.0 } },
-
-        "295": { "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w / 2, "height": h / 2, "length": (p.duration * p.fps + 1) as i64, "batch_size": 1 } },
-        "305": { "class_type": "LTXVEmptyLatentAudio", "inputs": { "audio_vae": ["279", 0], "frames_number": (p.duration * p.fps + 1) as i64, "frame_rate": p.fps as i64, "batch_size": 1 } },
-
-        "318": { "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["296", 0], "audio_latent": ["305", 0] } },
-        "283": { "class_type": "SamplerCustomAdvanced", "inputs": { "noise": ["277", 0], "guider": ["314", 0], "sampler": ["291", 0], "sigmas": ["306", 0], "latent_image": ["318", 0] } },
-        "307": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["283", 0] } },
-
-        "311": { "class_type": "LatentUpscaleModelLoader", "inputs": { "model_name": p.latent_upscale_model } },
-        "287": { "class_type": "LTXVLatentUpsampler", "inputs": { "samples": ["307", 0], "upscale_model": ["311", 0], "vae": ["316", 2] } },
-        "284": { "class_type": "LTXVCropGuides", "inputs": { "positive": ["304", 0], "negative": ["304", 1], "latent": ["307", 0] } },
-        "282": { "class_type": "CFGGuider", "inputs": { "model": ["285", 0], "positive": ["284", 0], "negative": ["284", 1], "cfg": 1.0 } },
-        "278": { "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["288", 0], "audio_latent": ["307", 1] } },
-        "308": { "class_type": "SamplerCustomAdvanced", "inputs": { "noise": ["276", 0], "guider": ["282", 0], "sampler": ["280", 0], "sigmas": ["281", 0], "latent_image": ["278", 0] } },
-        "309": { "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["308", 0] } },
-
-        "315": { "class_type": "VAEDecodeTiled", "inputs": { "samples": ["309", 0], "vae": ["316", 2], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8 } },
-        "297": { "class_type": "LTXVAudioVAEDecode", "inputs": { "samples": ["309", 1], "audio_vae": ["279", 0] } },
-        "310": { "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["297", 0], "fps": p.fps as f32 } },
         "75": { "class_type": "SaveVideo", "inputs": { "video": ["310", 0], "filename_prefix": "ImageStudio/video", "format": "auto", "codec": "auto" } }
     });
 
-    let custom_lora = p.lora_name.as_deref().filter(|s| !s.is_empty() && *s != "None");
-    let model_out = if let Some(lora) = custom_lora {
-        g["286"] = json!({
-            "class_type": "LoraLoaderModelOnly",
-            "inputs": {
-                "model": ["285", 0],
-                "lora_name": lora,
-                "strength_model": p.lora_strength
-            }
-        });
-        g["314"]["inputs"]["model"] = json!(["286", 0]);
-        g["282"]["inputs"]["model"] = json!(["286", 0]);
-        json!(["286", 0])
+    let model_out = apply_loras(&mut g, json!(["285", 0]), &p.loras, 350);
+
+    if p.prompt_enhance {
+        g["324"] = json!({ "class_type": "LoraLoader", "inputs": { "model": model_out.clone(), "clip": ["317", 0], "lora_name": p.gemma_lora, "strength_model": 1.0, "strength_clip": 1.0 } });
+        g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": ["325", 0] } });
     } else {
-        json!(["285", 0])
-    };
+        g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": p.prompt } });
+    }
 
-    if let Some(img_name) = image_name {
-        g["269"] = json!({ "class_type": "LoadImage", "inputs": { "image": img_name } });
-        g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
-        }});
-        g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
-        }});
-        g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["330", 0], "img_compression": 18 } });
-
-        g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["295", 0], "bypass": false, "strength": 0.7 } });
-        g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["287", 0], "bypass": false, "strength": 1.0 } });
-
-        if p.prompt_enhance {
-            g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
-                "clip": ["324", 1], "image": ["330", 0], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
-                "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
-            }});
-        }
-    } else {
-        g["269"] = json!({ "class_type": "EmptyImage", "inputs": { "width": 512, "height": 512, "batch_size": 1, "color": 0 } });
-        g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
-        }});
-        g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
-        }});
-        g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["330", 0], "img_compression": 18 } });
-
-        g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["295", 0], "bypass": true, "strength": 0.7 } });
-        g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["287", 0], "bypass": true, "strength": 1.0 } });
-
+    if let Some(vid_name) = video_name {
+        // IC-LoRA V2V mode runs single-stage at full target resolution with no LTXVImgToVideoInplace overwrite.
         if p.prompt_enhance {
             g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
                 "clip": ["324", 1], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
@@ -532,13 +733,107 @@ fn workflow_video(p: &VideoParams, image_name: Option<&str>) -> Value {
                 "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
             }});
         }
-    }
-
-    if p.prompt_enhance {
-        g["324"] = json!({ "class_type": "LoraLoader", "inputs": { "model": model_out, "clip": ["317", 0], "lora_name": p.gemma_lora, "strength_model": 1.0, "strength_clip": 1.0 } });
-        g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": ["325", 0] } });
+        g["295"] = json!({ "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w, "height": h, "length": frames as i64, "batch_size": 1 } });
+        g["400"] = json!({ "class_type": "LoadVideo", "inputs": { "file": vid_name } });
+        g["401"] = json!({ "class_type": "GetVideoComponents", "inputs": { "video": ["400", 0] } });
+        g["407"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["401", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+        }});
+        g["408"] = json!({
+            "class_type": "ImageFromBatch",
+            "inputs": {
+                "image": ["407", 0],
+                "batch_index": 0,
+                "length": frames as i64
+            }
+        });
+        g["402"] = json!({ "class_type": "GetICLoRAParameters", "inputs": { "iclora_model": model_out.clone() } });
+        g["403"] = json!({
+            "class_type": "LTXVAddGuide",
+            "inputs": {
+                "positive": ["304", 0],
+                "negative": ["304", 1],
+                "vae": ["316", 2],
+                "latent": ["295", 0],
+                "image": ["408", 0],
+                "frame_idx": 0,
+                "strength": 1.0,
+                "iclora_parameters": ["402", 0]
+            }
+        });
+        g["314"] = json!({ "class_type": "CFGGuider", "inputs": { "model": model_out, "positive": ["403", 0], "negative": ["403", 1], "cfg": 1.0 } });
+        g["283"] = json!({ "class_type": "SamplerCustomAdvanced", "inputs": { "noise": ["277", 0], "guider": ["314", 0], "sampler": ["291", 0], "sigmas": ["306", 0], "latent_image": ["403", 2] } });
+        g["284"] = json!({ "class_type": "LTXVCropGuides", "inputs": { "positive": ["403", 0], "negative": ["403", 1], "latent": ["283", 0] } });
+        g["315"] = json!({ "class_type": "VAEDecodeTiled", "inputs": { "samples": ["284", 2], "vae": ["316", 2], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8 } });
+        g["310"] = json!({ "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["401", 1], "fps": p.fps as f32 } });
     } else {
-        g["303"] = json!({ "class_type": "CLIPTextEncode", "inputs": { "clip": ["317", 0], "text": p.prompt } });
+        g["279"] = json!({ "class_type": "LTXVAudioVAELoader", "inputs": { "ckpt_name": p.ckpt_name } });
+        g["305"] = json!({ "class_type": "LTXVEmptyLatentAudio", "inputs": { "audio_vae": ["279", 0], "frames_number": frames as i64, "frame_rate": p.fps as i64, "batch_size": 1 } });
+        let active_model = if model_out != json!(["285", 0]) {
+            model_out.clone()
+        } else {
+            json!(["285", 0])
+        };
+        g["276"] = json!({ "class_type": "RandomNoise", "inputs": { "noise_seed": 42 } });
+        g["280"] = json!({ "class_type": "KSamplerSelect", "inputs": { "sampler_name": sampler_name } });
+        g["281"] = json!({ "class_type": "ManualSigmas", "inputs": { "sigmas": "0.85, 0.7250, 0.4219, 0.0" } });
+        g["314"] = json!({ "class_type": "CFGGuider", "inputs": { "model": active_model.clone(), "positive": ["304", 0], "negative": ["304", 1], "cfg": 1.0 } });
+        g["295"] = json!({ "class_type": "EmptyLTXVLatentVideo", "inputs": { "width": w / 2, "height": h / 2, "length": frames as i64, "batch_size": 1 } });
+        g["318"] = json!({ "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["296", 0], "audio_latent": ["305", 0] } });
+        g["283"] = json!({ "class_type": "SamplerCustomAdvanced", "inputs": { "noise": ["277", 0], "guider": ["314", 0], "sampler": ["291", 0], "sigmas": ["306", 0], "latent_image": ["318", 0] } });
+        g["307"] = json!({ "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["283", 0] } });
+        g["311"] = json!({ "class_type": "LatentUpscaleModelLoader", "inputs": { "model_name": p.latent_upscale_model } });
+        g["287"] = json!({ "class_type": "LTXVLatentUpsampler", "inputs": { "samples": ["307", 0], "upscale_model": ["311", 0], "vae": ["316", 2] } });
+        g["284"] = json!({ "class_type": "LTXVCropGuides", "inputs": { "positive": ["304", 0], "negative": ["304", 1], "latent": ["307", 0] } });
+        g["282"] = json!({ "class_type": "CFGGuider", "inputs": { "model": active_model, "positive": ["284", 0], "negative": ["284", 1], "cfg": 1.0 } });
+        g["278"] = json!({ "class_type": "LTXVConcatAVLatent", "inputs": { "video_latent": ["288", 0], "audio_latent": ["307", 1] } });
+        g["308"] = json!({ "class_type": "SamplerCustomAdvanced", "inputs": { "noise": ["276", 0], "guider": ["282", 0], "sampler": ["280", 0], "sigmas": ["281", 0], "latent_image": ["278", 0] } });
+        g["309"] = json!({ "class_type": "LTXVSeparateAVLatent", "inputs": { "av_latent": ["308", 0] } });
+        g["315"] = json!({ "class_type": "VAEDecodeTiled", "inputs": { "samples": ["309", 0], "vae": ["316", 2], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8 } });
+        g["297"] = json!({ "class_type": "LTXVAudioVAEDecode", "inputs": { "samples": ["309", 1], "audio_vae": ["279", 0] } });
+        g["310"] = json!({ "class_type": "CreateVideo", "inputs": { "images": ["315", 0], "audio": ["297", 0], "fps": p.fps as f32 } });
+
+        if let Some(img_name) = image_name {
+            g["269"] = json!({ "class_type": "LoadImage", "inputs": { "image": img_name } });
+            g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+            }});
+            g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
+            }});
+            g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["330", 0], "img_compression": 18 } });
+
+            g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["295", 0], "bypass": false, "strength": 0.7 } });
+            g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["287", 0], "bypass": false, "strength": 1.0 } });
+
+            if p.prompt_enhance {
+                g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
+                    "clip": ["324", 1], "image": ["330", 0], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
+                    "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+                    "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
+                }});
+            }
+        } else {
+            g["269"] = json!({ "class_type": "EmptyImage", "inputs": { "width": 512, "height": 512, "batch_size": 1, "color": 0 } });
+            g["290"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0], "resize_type": "scale dimensions", "resize_type.width": w, "resize_type.height": h, "resize_type.crop": "center", "scale_method": "lanczos"
+            }});
+            g["330"] = json!({ "class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["290", 0], "resize_type": "scale longer dimension", "resize_type.longer_size": 512, "scale_method": "lanczos"
+            }});
+            g["289"] = json!({ "class_type": "LTXVPreprocess", "inputs": { "image": ["330", 0], "img_compression": 18 } });
+
+            g["296"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["295", 0], "bypass": true, "strength": 0.7 } });
+            g["288"] = json!({ "class_type": "LTXVImgToVideoInplace", "inputs": { "vae": ["316", 2], "image": ["289", 0], "latent": ["287", 0], "bypass": true, "strength": 1.0 } });
+
+            if p.prompt_enhance {
+                g["325"] = json!({ "class_type": "TextGenerateLTX2Prompt", "inputs": {
+                    "clip": ["324", 1], "prompt": p.prompt, "max_length": 384, "sampling_mode": "on",
+                    "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+                    "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": (p.seed % 1000000) as i64, "sampling_mode.presence_penalty": 0, "thinking": false, "use_default_template": false
+                }});
+            }
+        }
     }
 
     g
@@ -932,6 +1227,7 @@ pub fn run(
                     .and_then(|r| r.bytes())
                     .map_err(|e| format!("fetch result: {e}"))?;
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Ok(GenResult {
                     png: bytes.to_vec(),
                     output_filename: out_fn,
@@ -941,6 +1237,7 @@ pub fn run(
             }
             if st["completed"] == true {
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Err("Finished but produced no image".into());
             }
         }
@@ -953,6 +1250,7 @@ pub fn run(
             missing_queue_ticks += 1;
             if missing_queue_ticks >= 4 {
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Err("Generation stopped: job left queue without producing image output".into());
             }
         } else {
@@ -967,6 +1265,7 @@ pub fn run(
 
         if secs > 1800 {
             ws_stop.store(true, Ordering::SeqCst);
+            free_engine_memory(&c);
             return Err("Timed out".into());
         }
     }
@@ -985,12 +1284,18 @@ pub fn run_video(
     let tracker = Arc::new(WsTracker::default());
     let spec = match p.arch {
         VideoArch::MiniMaxH3 => WorkflowProgressSpec::SingleStage { sampler_node: "115" },
+        VideoArch::Ltx25 if p.source_video_bytes.is_some() => {
+            WorkflowProgressSpec::SingleStage { sampler_node: "215" }
+        }
         VideoArch::Ltx25 => WorkflowProgressSpec::TwoStage {
             stage1_node: "215",
             stage2_node: "246",
             stage1_steps: 8,
             stage2_steps: 3,
         },
+        VideoArch::Ltx23 if p.source_video_bytes.is_some() => {
+            WorkflowProgressSpec::SingleStage { sampler_node: "283" }
+        }
         VideoArch::Ltx23 => WorkflowProgressSpec::TwoStage {
             stage1_node: "283",
             stage2_node: "308",
@@ -1005,7 +1310,14 @@ pub fn run_video(
     let mut image_name = None;
     let mut last_frame_name = None;
     let mut ref_names = Vec::new();
+    let mut video_name = None;
     let mut temp_files = vec![];
+    if let Some(ref vid_bytes) = p.source_video_bytes {
+        status("Uploading source video for IC-LoRA editing...".into());
+        let filename = format!("studio_src_{tag}.mp4");
+        let uploaded = upload_video(&c, vid_bytes.clone(), &filename)?;
+        video_name = Some(uploaded);
+    }
     if let Some(png) = img {
         status("Uploading initial frame...".into());
         let filename = format!("studio_vid_{tag}.png");
@@ -1013,7 +1325,7 @@ pub fn run_video(
         image_name = Some(uploaded);
         temp_files.push(filename);
     }
-    if !p.use_r2v {
+    if !p.use_r2v && p.source_video_bytes.is_none() {
         if let Some(ref lf) = p.last_frame {
             status("Uploading end frame...".into());
             let filename = format!("studio_vid_last_{tag}.png");
@@ -1040,9 +1352,10 @@ pub fn run_video(
             image_name.as_deref(),
             last_frame_name.as_deref(),
             &ref_names,
+            video_name.as_deref(),
         ),
-        VideoArch::Ltx25 => workflow_ltx25(p, image_name.as_deref()),
-        VideoArch::Ltx23 => workflow_video(p, image_name.as_deref()),
+        VideoArch::Ltx25 => workflow_ltx25(p, image_name.as_deref(), video_name.as_deref()),
+        VideoArch::Ltx23 => workflow_video(p, image_name.as_deref(), video_name.as_deref()),
     };
     let body = json!({ "prompt": prompt_graph, "client_id": "image-studio" });
     let r = c.post(format!("{}/prompt", base_url())).json(&body).send().map_err(|e| format!("queue: {e}"))?;
@@ -1076,11 +1389,26 @@ pub fn run_video(
         std::thread::sleep(Duration::from_millis(500));
         let secs = t0.elapsed().as_secs();
 
-        // Stall Watchdog: detect genuine hangs per stage and automatically abort & clear queue
+        // Stall Watchdog: prompt user at 180s on slow sampler steps; auto-cancel only after 20m (1200s)
+        if let Some(ref keep) = p.stall_keep_waiting {
+            if keep.swap(false, Ordering::SeqCst) {
+                *tracker.last_activity.lock().unwrap() = Some(Instant::now());
+                if let Some(ref sp) = p.stall_prompt {
+                    sp.store(false, Ordering::SeqCst);
+                }
+            }
+        }
         let active_node = tracker.executing_node.lock().unwrap().clone();
         let node_has_progress = tracker.node_has_progress.load(Ordering::SeqCst);
         let last_act = tracker.last_activity.lock().unwrap().unwrap_or(t0);
         let inactive_secs = last_act.elapsed().as_secs();
+        let is_sampler = matches!(
+            active_node.as_deref(),
+            Some("115" | "283" | "308" | "215" | "246")
+        );
+        if let Some(ref sp) = p.stall_prompt {
+            sp.store(is_sampler && inactive_secs >= 180, Ordering::SeqCst);
+        }
         let max_inactive = video_stage_timeout_secs(active_node.as_deref(), node_has_progress);
         if inactive_secs > max_inactive {
             let _ = c.post(format!("{}/interrupt", base_url())).send();
@@ -1146,6 +1474,7 @@ pub fn run_video(
                     .and_then(|r| r.bytes())
                     .map_err(|e| format!("fetch video result: {e}"))?;
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Ok(VideoGenResult {
                     mp4: bytes.to_vec(),
                     output_filename: out_fn,
@@ -1156,6 +1485,7 @@ pub fn run_video(
 
             if st["completed"] == true {
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Err("Finished but produced no video output".into());
             }
         }
@@ -1169,6 +1499,7 @@ pub fn run_video(
             // If the prompt is gone from the queue for 2s without producing output, it failed/aborted
             if missing_queue_ticks >= 4 {
                 ws_stop.store(true, Ordering::SeqCst);
+                free_engine_memory(&c);
                 return Err("Generation stopped: engine completed job without producing video output".into());
             }
         } else {
@@ -1196,12 +1527,13 @@ pub fn run_video(
                 format!("Initializing latents & noise schedules... {secs}s")
             }
             Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288")
-            | Some("200") | Some("201") | Some("202") | Some("203") | Some("204") | Some("205") => {
+            | Some("200") | Some("201") | Some("202") | Some("203") | Some("204") | Some("205")
+            | Some("400") | Some("401") | Some("407") | Some("402") | Some("403") => {
                 format!("Processing input frames & references... {secs}s")
             }
             Some("115") => format!("Generating MiniMax H3 audio+video diffusion... {secs}s"),
             Some("283") | Some("215") => format!("Generating video (Stage 1 diffusion)... {secs}s"),
-            Some("307") => format!("Splitting AV latents... {secs}s"),
+            Some("307") | Some("404") => format!("Splitting AV latents... {secs}s"),
             Some("287") => format!("Upscaling video latents (2x spatial)... {secs}s"),
             Some("308") | Some("246") => format!("Refining video details (Stage 2 diffusion)... {secs}s"),
             Some("309") => format!("Extracting refined video & audio latents... {secs}s"),
@@ -1222,9 +1554,17 @@ pub fn run_video(
 
         if secs > 1800 {
             ws_stop.store(true, Ordering::SeqCst);
+            free_engine_memory(&c);
             return Err("Timed out (video generation took > 30m)".into());
         }
     }
+}
+
+fn free_engine_memory(c: &Client) {
+    let _ = c
+        .post(format!("{}/free", base_url()))
+        .json(&serde_json::json!({"unload_models": true, "free_memory": true}))
+        .send();
 }
 
 fn prepare_clean_slate(c: &Client, status: &dyn Fn(String)) {
@@ -1274,11 +1614,8 @@ fn video_stage_timeout_secs(active_node: Option<&str>, node_has_progress: bool) 
         Some("269") | Some("290") | Some("330") | Some("289") | Some("296") | Some("288")
         | Some("200") | Some("201") | Some("202") | Some("203") | Some("204") | Some("205") => 60, // Reference frame processing
         Some("115") | Some("283") | Some("308") | Some("215") | Some("246") => {
-            if node_has_progress {
-                180 // Active diffusion steps (each step updates last_activity)
-            } else {
-                300 // Cold start / text-encoder->DiT swap / weight staging + step 1
-            }
+            let _ = node_has_progress;
+            1200 // Allow up to 20 minutes for slow/swapped steps (UI prompts user at 3 minutes)
         }
         Some("287") => 180, // Spatial 2x upscaling
         Some("315") | Some("297") | Some("116") | Some("117") => 180, // VAE decoding
@@ -1317,13 +1654,13 @@ mod tests {
 
     #[test]
     fn sampler_cold_start_gets_extended_timeout() {
-        assert_eq!(video_stage_timeout_secs(Some("283"), false), 300);
-        assert_eq!(video_stage_timeout_secs(Some("283"), true), 180);
-        assert_eq!(video_stage_timeout_secs(Some("308"), false), 300);
-        assert_eq!(video_stage_timeout_secs(Some("308"), true), 180);
-        assert_eq!(video_stage_timeout_secs(Some("115"), false), 300);
-        assert_eq!(video_stage_timeout_secs(Some("115"), true), 180);
-        assert_eq!(video_stage_timeout_secs(Some("215"), false), 300);
+        assert_eq!(video_stage_timeout_secs(Some("283"), false), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("283"), true), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("308"), false), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("308"), true), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("115"), false), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("115"), true), 1200);
+        assert_eq!(video_stage_timeout_secs(Some("215"), false), 1200);
     }
 
     #[test]
@@ -1338,15 +1675,17 @@ mod tests {
     fn workflow_minimax_h3_builds_t2v_i2v_continuation_and_r2v() {
         let mut p = VideoParams::default();
         p.prompt = "a glowing neon city".into();
-        p.lora_name = Some("minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors".into());
-        p.lora_strength = 0.85;
+        p.loras = vec![crate::lora::ActiveLora {
+            filename: "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors".into(),
+            strength: 0.85,
+        }];
 
         // 1. T2V + Turbo LoRA
-        let t2v = workflow_minimax_h3(&p, None, None, &[]);
+        let t2v = workflow_minimax_h3(&p, None, None, &[], None);
         assert_eq!(t2v["100"]["class_type"], "UnetLoaderGGUF");
         assert_eq!(t2v["101"]["class_type"], "CLIPLoader");
         assert_eq!(t2v["101"]["inputs"]["type"], "minimax");
-        assert_eq!(t2v["105"]["class_type"], "LoraLoaderModelOnly");
+        assert_eq!(t2v["150"]["class_type"], "LoraLoaderModelOnly");
         assert_eq!(t2v["110"]["class_type"], "MiniMaxH3ImageToVideo");
         assert_eq!(t2v["110"]["inputs"]["length"], 124);
         assert_eq!(t2v["113"]["inputs"]["sampler_name"], "er_sde");
@@ -1354,16 +1693,16 @@ mod tests {
         assert_eq!(t2v["75"]["class_type"], "SaveVideo");
 
         // 2. I2V + End Frame Continuation
-        p.lora_name = None;
-        let cont = workflow_minimax_h3(&p, Some("first.png [temp]"), Some("last.png [temp]"), &[]);
-        assert!(cont.get("105").is_none());
+        p.loras.clear();
+        let cont = workflow_minimax_h3(&p, Some("first.png [temp]"), Some("last.png [temp]"), &[], None);
+        assert!(cont.get("150").is_none());
         assert_eq!(cont["110"]["inputs"]["first_frame"], json!(["201", 0]));
         assert_eq!(cont["110"]["inputs"]["last_frame"], json!(["203", 0]));
 
         // 3. R2V with Ref2VA weights & reference images
         p.use_r2v = true;
         let refs = vec!["ref0.png [temp]".to_string(), "ref1.png [temp]".to_string()];
-        let r2v = workflow_minimax_h3(&p, None, None, &refs);
+        let r2v = workflow_minimax_h3(&p, None, None, &refs, None);
         assert_eq!(r2v["100"]["inputs"]["unet_name"], "MiniMax-H3-Ref2VA-Pruned-Q4_K_M.gguf");
         assert_eq!(r2v["110"]["class_type"], "MiniMaxH3ReferenceToVideo");
         assert_eq!(r2v["110"]["inputs"]["ref_images.ref_image_0"], json!(["200", 0]));
@@ -1380,13 +1719,71 @@ mod tests {
         p.audio_vae_name = "ltx-2.5-audio-vae-bf16.safetensors".into();
         p.latent_upscale_model = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors".into();
 
-        let g = workflow_ltx25(&p, Some("start.png [temp]"));
+        p.width = 768;
+        p.height = 512;
+
+        let g = workflow_ltx25(&p, Some("start.png [temp]"), None);
         assert_eq!(g["236"]["class_type"], "UnetLoaderGGUF");
         assert_eq!(g["237"]["class_type"], "CLIPLoader");
         assert_eq!(g["237"]["inputs"]["type"], "ltxv");
         assert_eq!(g["296"]["inputs"]["bypass"], false);
-        assert_eq!(g["291"]["inputs"]["sampler_name"], "er_sde");
+        assert_eq!(g["291"]["inputs"]["sampler_name"], "euler_ancestral");
+        assert_eq!(g["241"]["class_type"], "LTXVDualCFGGuider");
         assert_eq!(g["75"]["class_type"], "SaveVideo");
+
+        let g25_v2v = workflow_ltx25(&p, None, Some("input_clip.mp4"));
+        assert_eq!(g25_v2v["400"]["class_type"], "LoadVideo");
+        assert_eq!(g25_v2v["401"]["class_type"], "GetVideoComponents");
+        assert_eq!(g25_v2v["402"]["class_type"], "GetICLoRAParameters");
+        assert!(g25_v2v["402"]["inputs"]["iclora_model"].is_array());
+        assert_eq!(g25_v2v["295"]["inputs"]["width"], 768);
+        assert_eq!(g25_v2v["295"]["inputs"]["height"], 512);
+        assert_eq!(g25_v2v["407"]["inputs"]["resize_type.width"], 768);
+        assert_eq!(g25_v2v["407"]["inputs"]["resize_type.height"], 512);
+        assert!(g25_v2v.get("406").is_none());
+        assert!(g25_v2v.get("287").is_none());
+        assert!(g25_v2v.get("246").is_none());
+        assert!(g25_v2v.get("212").is_none());
+        assert!(g25_v2v.get("305").is_none());
+        assert!(g25_v2v.get("318").is_none());
+        assert!(g25_v2v.get("307").is_none());
+        assert!(g25_v2v.get("297").is_none());
+        assert_eq!(g25_v2v["403"]["class_type"], "LTXVAddGuide");
+        assert_eq!(g25_v2v["404"]["class_type"], "LTXVCropGuides");
+        assert_eq!(g25_v2v["404"]["inputs"]["latent"], json!(["215", 0]));
+        assert_eq!(g25_v2v["215"]["inputs"]["latent_image"], json!(["403", 2]));
+        assert_eq!(g25_v2v["315"]["inputs"]["samples"], json!(["404", 2]));
+        assert_eq!(g25_v2v["241"]["class_type"], "LTXVDualCFGGuider");
+        assert_eq!(g25_v2v["310"]["inputs"]["audio"], json!(["401", 1]));
+
+        let g23_v2v = workflow_video(&p, None, Some("input_clip.mp4"));
+        assert_eq!(g23_v2v["400"]["class_type"], "LoadVideo");
+        assert_eq!(g23_v2v["295"]["inputs"]["width"], 768);
+        assert_eq!(g23_v2v["295"]["inputs"]["height"], 512);
+        assert!(g23_v2v.get("406").is_none());
+        assert!(g23_v2v.get("287").is_none());
+        assert!(g23_v2v.get("308").is_none());
+        assert!(g23_v2v.get("279").is_none());
+        assert!(g23_v2v.get("305").is_none());
+        assert!(g23_v2v.get("318").is_none());
+        assert!(g23_v2v.get("307").is_none());
+        assert!(g23_v2v.get("297").is_none());
+        assert_eq!(g23_v2v["403"]["class_type"], "LTXVAddGuide");
+        assert_eq!(g23_v2v["284"]["class_type"], "LTXVCropGuides");
+        assert_eq!(g23_v2v["284"]["inputs"]["latent"], json!(["283", 0]));
+        assert_eq!(g23_v2v["283"]["inputs"]["latent_image"], json!(["403", 2]));
+        assert_eq!(g23_v2v["315"]["inputs"]["samples"], json!(["284", 2]));
+        assert_eq!(g23_v2v["310"]["inputs"]["audio"], json!(["401", 1]));
+
+        // Odd-32 multiple (672x512 -> 21x16 latent) must snap to /64 so IC-LoRA reference_downscale_factor=2 succeeds
+        p.width = 672;
+        p.height = 512;
+        let g25_odd = workflow_ltx25(&p, None, Some("input_clip.mp4"));
+        assert_eq!(g25_odd["295"]["inputs"]["width"].as_u64().unwrap() % 64, 0);
+        assert_eq!(g25_odd["295"]["inputs"]["height"].as_u64().unwrap() % 64, 0);
+        let g23_odd = workflow_video(&p, None, Some("input_clip.mp4"));
+        assert_eq!(g23_odd["295"]["inputs"]["width"].as_u64().unwrap() % 64, 0);
+        assert_eq!(g23_odd["295"]["inputs"]["height"].as_u64().unwrap() % 64, 0);
     }
 
     #[test]

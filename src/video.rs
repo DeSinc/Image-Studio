@@ -235,7 +235,17 @@ pub struct TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::remove_file(&self.path).is_err() && self.path.exists() {
+            let path = self.path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..8 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                        break;
+                    }
+                }
+            });
+        }
     }
 }
 

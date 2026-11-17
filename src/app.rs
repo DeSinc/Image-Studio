@@ -15,11 +15,44 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-pub fn estimate_video_vram_gb(w: u32, h: u32, duration: u32, fps: u32) -> f32 {
+pub fn estimate_video_vram_gb_with_lora(w: u32, h: u32, duration: u32, fps: u32, lora_vram_gb: f32) -> f32 {
     let frames = (duration * fps) as f32;
     let mp = (w * h) as f32 / 1_000_000.0;
     let load_factor = mp * (frames / 24.0);
-    9.5 + load_factor * 0.55
+    9.5 + load_factor * 0.55 + lora_vram_gb.max(0.0)
+}
+
+const ABS_MIN_RES: u32 = 256;
+const ABS_MAX_RES: u32 = 4096;
+
+/// Returns `(min_scale, max_scale)` relative to `(base_w, base_h)` so the shorter side
+/// reaches `min_dim` at the left end of the slider and the longer side reaches `max_dim` at the right end.
+fn absolute_scale_range(base_w: u32, base_h: u32, min_dim: u32, max_dim: u32) -> (f32, f32) {
+    let w = base_w.max(1) as f32;
+    let h = base_h.max(1) as f32;
+    let k_min = min_dim as f32 / w.min(h);
+    let k_max = max_dim as f32 / w.max(h);
+    if k_min <= k_max {
+        (k_min, k_max)
+    } else {
+        (k_max, k_max)
+    }
+}
+
+/// Scales `(base_w, base_h)` by `scale`, rounding each axis to the nearest `step` and clamping to `min_dim..=max_dim`.
+fn scale_dimensions_stepped(
+    base_w: u32,
+    base_h: u32,
+    scale: f32,
+    step: u32,
+    min_dim: u32,
+    max_dim: u32,
+) -> (u32, u32) {
+    let step = step.max(1);
+    let step_f = step as f32;
+    let w = (((base_w.max(1) as f32 * scale) / step_f).round() as u32 * step).clamp(min_dim, max_dim);
+    let h = (((base_h.max(1) as f32 * scale) / step_f).round() as u32 * step).clamp(min_dim, max_dim);
+    (w, h)
 }
 
 pub fn build_timestamp_display() -> String {
@@ -53,6 +86,12 @@ const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 pub enum StudioMode {
     Image,
     Video,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VideoWorkMode {
+    Edit,
+    Generate,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -131,6 +170,11 @@ pub struct HistoryNode {
     pub output_subfolder: String,
     pub temp_files: Vec<String>,
     pub mp4_bytes: Option<Vec<u8>>,
+    pub source_video_path: Option<PathBuf>,
+    pub video_last_sec: Option<f64>,
+    pub video_trim_start: Option<f64>,
+    pub video_trim_end: Option<f64>,
+    pub video_work_mode: Option<VideoWorkMode>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -243,6 +287,18 @@ const RESOLUTIONS: [(u32, &str); 4] = [
     (1536, "1536px"),
 ];
 
+const LEFT_HISTORY_DEFAULT_H: f32 = 300.0;
+const LEFT_HISTORY_MIN_H: f32 = 220.0;
+const LEFT_LORA_MIN_H: f32 = 120.0;
+const LEFT_SPLIT_BAR_H: f32 = 10.0;
+
+struct PendingHistoryDelete {
+    node_id: usize,
+    label: String,
+    file_desc: String,
+    error: Option<String>,
+}
+
 pub struct App {
     sh: Arc<Shared>,
     profile: Profile,
@@ -255,6 +311,7 @@ pub struct App {
     generating_prompt: String,
     history_dock: HistoryDock,
     show_history_window: bool,
+    left_history_h: f32,
     refs: Vec<Item>,
     prompt: String,
     focus_prompt: bool,
@@ -285,6 +342,9 @@ pub struct App {
     split: f32,
     canvas_zoom: f32,
     canvas_pan: Vec2,
+    video_pan_drag_active: bool,
+    last_effective_video_profile_id: String,
+    last_ltx_video_profile_id: Option<String>,
     show_setup: bool,
     pub model_picker: crate::model_picker::ModelPickerState,
     loading: usize,
@@ -292,6 +352,8 @@ pub struct App {
     last_ctrl_v_down: bool,
     pub updater: Arc<std::sync::Mutex<crate::updater::UpdaterState>>,
     pub mode: StudioMode,
+    pub video_work_mode: VideoWorkMode,
+    edit_lora_needs_video_until: Option<Instant>,
     pub video_orientation: VideoOrientation,
     pub video_scale: f32,
     pub video_base_w: u32,
@@ -306,17 +368,26 @@ pub struct App {
     pub video_steps: u32,
     pub video_sampler: String,
     pub video_scheduler: String,
-    pub video_lora: String,
-    pub video_lora_strength: f32,
+    pub video_loras: Vec<crate::lora::ActiveLora>,
+    pub video_prompt_tags: Vec<crate::lora::PromptTag>,
+    pub image_loras: Vec<crate::lora::ActiveLora>,
+    pub image_prompt_tags: Vec<crate::lora::PromptTag>,
     pub lora_browser: crate::lora::LoraBrowserState,
     pub video_r2v_mode: bool,
     pub show_video_dl_modal: bool,
+    pending_history_delete: Option<PendingHistoryDelete>,
     pub download_pane: crate::download_ui::DownloadPaneState,
+    pub refs_drop_rect: Option<Rect>,
+    pub canvas_drop_rect: Option<Rect>,
     pub last_progress_time: Option<Instant>,
     pub last_progress_val: u32,
     pub step_duration_ema: f32,
     pub is_swapping_detected: bool,
     pub generation_retries: u32,
+    pub stall_prompt: Arc<AtomicBool>,
+    pub stall_keep_waiting: Arc<AtomicBool>,
+    /// Cached `(mp4_bytes, snapped_frames)` for IC-LoRA edit retries if `video_player` was cleared.
+    pub last_edit_video_source: Option<(Vec<u8>, u32)>,
     // Video player trim, compression & history state (ported from ztrim)
     pub trim_history: TrimHistory,
     pub render_mgr: RenderManager,
@@ -438,6 +509,34 @@ fn rand_u64() -> u64 {
     x
 }
 
+fn draw_generating_overlay(
+    p: &egui::Painter,
+    image_rect: Rect,
+    progress: Option<(u32, u32)>,
+    is_swapping_detected: bool,
+    step_duration_ema: f32,
+) {
+    p.rect_stroke(image_rect, 0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Outside);
+
+    let badge_text = if is_swapping_detected {
+        if let Some((v, max)) = progress {
+            format!("[!] VRAM SWAPPING SLOWDOWN ({}/{} • {:.1}s/step)", v, max, step_duration_ema)
+        } else {
+            "[!] VRAM SWAPPING SLOWDOWN".to_string()
+        }
+    } else if let Some((v, max)) = progress {
+        format!("GENERATING (Step {}/{})", v, max)
+    } else {
+        "GENERATING...".to_string()
+    };
+    let g = p.layout_no_wrap(badge_text, egui::FontId::proportional(11.0), Color32::WHITE);
+    let badge_pos = image_rect.left_top() + vec2(10.0, 10.0);
+    let r = egui::Align2::LEFT_TOP.anchor_size(badge_pos, g.size()).expand2(vec2(8.0, 4.0));
+    p.rect_filled(r, 4, Color32::from_black_alpha(190));
+    p.rect_stroke(r, 4, Stroke::new(1.0, if is_swapping_detected { AMBER } else { ACCENT }), StrokeKind::Inside);
+    p.galley(r.shrink2(vec2(8.0, 4.0)).min, g, Color32::WHITE);
+}
+
 fn fit(src: Vec2, max: Vec2) -> Vec2 {
     if src.x <= 0.0 || src.y <= 0.0 || max.x <= 0.0 || max.y <= 0.0 {
         return vec2(1.0, 1.0);
@@ -519,6 +618,21 @@ pub fn draw_pause_icon(p: &egui::Painter, center: Pos2, color: Color32) {
     let rect_right = Rect::from_min_max(center + vec2(gap, -h), center + vec2(gap + w, h));
     p.rect_filled(rect_left, 1.0, color);
     p.rect_filled(rect_right, 1.0, color);
+}
+
+pub fn draw_trash_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.25, color);
+    // Lid + handle
+    p.line_segment([center + vec2(-4.5, -3.5), center + vec2(4.5, -3.5)], stroke);
+    p.line_segment([center + vec2(-2.0, -5.2), center + vec2(2.0, -5.2)], stroke);
+    p.line_segment([center + vec2(-2.0, -5.2), center + vec2(-2.0, -3.5)], stroke);
+    p.line_segment([center + vec2(2.0, -5.2), center + vec2(2.0, -3.5)], stroke);
+    // Bin body
+    let body = Rect::from_min_max(center + vec2(-3.5, -2.5), center + vec2(3.5, 5.0));
+    p.rect_stroke(body, 1.2, stroke, StrokeKind::Inside);
+    // Vertical ribs
+    p.line_segment([center + vec2(-1.2, -1.0), center + vec2(-1.2, 3.5)], Stroke::new(1.0, color));
+    p.line_segment([center + vec2(1.2, -1.0), center + vec2(1.2, 3.5)], Stroke::new(1.0, color));
 }
 
 impl App {
@@ -609,7 +723,17 @@ impl App {
         let mut lora_browser = crate::lora::LoraBrowserState::default();
         lora_browser.items = crate::lora::scan_local_loras(&sh);
 
-        App {
+        let (initial_mode, keep_last_project) = {
+            let cfg = sh.cfg.lock().unwrap();
+            let m = if cfg.remember_last_mode && cfg.last_studio_mode.as_deref() == Some("video") {
+                StudioMode::Video
+            } else {
+                StudioMode::Image
+            };
+            (m, cfg.keep_last_project_loaded)
+        };
+
+        let mut app = App {
             sh,
             tx,
             rx,
@@ -620,6 +744,7 @@ impl App {
             generating_prompt: String::new(),
             history_dock: HistoryDock::Left,
             show_history_window: true,
+            left_history_h: LEFT_HISTORY_DEFAULT_H,
             refs: vec![],
             prompt: String::new(),
             focus_prompt: false,
@@ -651,13 +776,22 @@ impl App {
             split: 0.5,
             canvas_zoom: 1.0,
             canvas_pan: vec2(0.0, 0.0),
+            video_pan_drag_active: false,
+            last_effective_video_profile_id: initial_vid_prof.id.clone(),
+            last_ltx_video_profile_id: if !initial_vid_prof.is_minimax_h3() {
+                Some(initial_vid_prof.id.clone())
+            } else {
+                None
+            },
             show_setup: false,
             model_picker: crate::model_picker::ModelPickerState::new(&initial_vid_prof),
             loading: 0,
             queue: Vec::new(),
             last_ctrl_v_down: false,
             updater,
-            mode: StudioMode::Image,
+            mode: initial_mode,
+            video_work_mode: VideoWorkMode::Edit,
+            edit_lora_needs_video_until: None,
             video_orientation: VideoOrientation::Landscape,
             video_scale: 1.0,
             video_base_w: 1280,
@@ -672,17 +806,25 @@ impl App {
             video_steps: initial_vsteps,
             video_sampler: initial_vsampler,
             video_scheduler: initial_vscheduler,
-            video_lora: "None".to_string(),
-            video_lora_strength: 1.0,
+            video_loras: Vec::new(),
+            video_prompt_tags: Vec::new(),
+            image_loras: Vec::new(),
+            image_prompt_tags: Vec::new(),
             lora_browser,
             video_r2v_mode: false,
             show_video_dl_modal: false,
+            pending_history_delete: None,
             download_pane: crate::download_ui::DownloadPaneState::default(),
+            refs_drop_rect: None,
+            canvas_drop_rect: None,
             last_progress_time: None,
             last_progress_val: 0,
             step_duration_ema: 0.0,
             is_swapping_detected: false,
             generation_retries: 0,
+            stall_prompt: Arc::new(AtomicBool::new(false)),
+            stall_keep_waiting: Arc::new(AtomicBool::new(false)),
+            last_edit_video_source: None,
             trim_history,
             render_mgr,
             video_presets,
@@ -708,67 +850,319 @@ impl App {
             end_trim_error_flash_start: None,
             has_seen_trim_hint: false,
             persist_trim_history: true,
+        };
+        if keep_last_project {
+            app.restore_last_project(&ctx);
+        }
+        app
+    }
+
+    fn remove_history_node(&mut self, node_id: usize) {
+        if let Some(pos) = self.nodes.iter().position(|n| n.id == node_id) {
+            let node = self.nodes.remove(pos);
+            if self.active_node_id == Some(node_id) {
+                let next_id = node
+                    .parent_id
+                    .filter(|pid| self.nodes.iter().any(|n| n.id == *pid))
+                    .or_else(|| self.nodes.last().map(|n| n.id));
+                if let Some(nid) = next_id {
+                    self.select_node(nid);
+                } else {
+                    self.active_node_id = None;
+                    self.video_player = None;
+                    self.compare_mode = false;
+                }
+            }
         }
     }
 
-    fn delete_history_node(&mut self, node_id: usize) {
-        if let Some(pos) = self.nodes.iter().position(|n| n.id == node_id) {
-            let node = self.nodes.remove(pos);
-
-            let comfy_dir = self.sh.paths.lock().unwrap().comfy.clone();
-            let mut search_dirs = Vec::new();
-            if let Some(ref cp) = comfy_dir {
-                search_dirs.push(cp.clone());
-                if let Some(parent) = cp.parent() {
-                    search_dirs.push(parent.to_path_buf());
-                }
+    fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
+        if !path.exists() {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::UI::Shell::{
+                FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+                SHFILEOPSTRUCTW, SHFileOperationW,
+            };
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(path))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            };
+            let mut wide: Vec<u16> = abs.as_os_str().encode_wide().collect();
+            wide.push(0);
+            wide.push(0);
+            let mut op = SHFILEOPSTRUCTW {
+                hwnd: std::ptr::null_mut(),
+                wFunc: FO_DELETE,
+                pFrom: wide.as_ptr(),
+                pTo: std::ptr::null(),
+                fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+                fAnyOperationsAborted: 0,
+                hNameMappings: std::ptr::null_mut(),
+                lpszProgressTitle: std::ptr::null(),
+            };
+            let res = unsafe { SHFileOperationW(&mut op) };
+            if res == 0 && op.fAnyOperationsAborted == 0 {
+                return Ok(());
             }
-            search_dirs.push(engine::data_dir());
-            search_dirs.push(std::env::temp_dir());
+            return Err(format!("Failed to move {} to Recycle Bin (code {res})", abs.display()));
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(path).map_err(|e| format!("Failed to remove {}: {e}", path.display()))
+        }
+    }
 
-            // Delete output image files generated by ComfyUI
-            if !node.output_filename.is_empty() {
-                for dir in &search_dirs {
-                    let candidates = [
-                        dir.join("output").join(&node.output_subfolder).join(&node.output_filename),
-                        dir.join("output").join(&node.output_filename),
-                        dir.join(&node.output_subfolder).join(&node.output_filename),
-                        dir.join(&node.output_filename),
-                    ];
-                    for c in candidates {
-                        if c.is_file() {
-                            let _ = std::fs::remove_file(&c);
-                            engine::log(&format!("Deleted output file: {}", c.display()));
-                        }
-                    }
+    fn cleanup_unused_temp_videos(keep_path: Option<&std::path::Path>) {
+        let tmp_dir = std::env::temp_dir();
+        let pid_prefix = format!("image_studio_vid_{}_", std::process::id());
+        if let Ok(entries) = std::fs::read_dir(&tmp_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if keep_path.is_some_and(|k| k == path.as_path()) {
+                    continue;
                 }
-            }
-
-            // Delete temp input images uploaded to ComfyUI
-            for tf in &node.temp_files {
-                for dir in &search_dirs {
-                    let candidates = [
-                        dir.join("temp").join(tf),
-                        dir.join("input").join(tf),
-                        dir.join(tf),
-                    ];
-                    for c in candidates {
-                        if c.is_file() {
-                            let _ = std::fs::remove_file(&c);
-                            engine::log(&format!("Deleted temp file: {}", c.display()));
-                        }
-                    }
+                let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if fname.starts_with(&pid_prefix) || fname.starts_with("imgstudio_trim_") {
+                    let _ = std::fs::remove_file(&path);
                 }
-            }
-
-            // If the deleted node was currently active, switch to parent or last remaining node
-            if self.active_node_id == Some(node_id) {
-                self.active_node_id = node.parent_id
-                    .filter(|pid| self.nodes.iter().any(|n| n.id == *pid))
-                    .or_else(|| self.nodes.last().map(|n| n.id));
-                self.update_dimensions_from_active_node();
             }
         }
+    }
+
+    fn request_delete_history_node(&mut self, node_id: usize) {
+        let Some(node) = self.find_node(node_id) else {
+            return;
+        };
+        let file_desc = if let Some(ref p) = node.source_video_path {
+            p.display().to_string()
+        } else if !node.output_filename.is_empty() {
+            node.output_filename.clone()
+        } else {
+            node.label.clone()
+        };
+        self.pending_history_delete = Some(PendingHistoryDelete {
+            node_id,
+            label: node.label.clone(),
+            file_desc,
+            error: None,
+        });
+    }
+
+    fn history_delete_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(ref mut del) = self.pending_history_delete else {
+            return;
+        };
+        let mut do_delete = false;
+        let mut cancel = false;
+
+        egui::Window::new("Move File to Recycle Bin?")
+            .id(egui::Id::new("history_delete_confirm_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(24, 28, 39))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(44, 50, 68)))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(370.0);
+                ui.label(RichText::new(&del.label).size(13.0).strong().color(TEXT));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&del.file_desc)
+                        .size(11.0)
+                        .color(DIM),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("This will remove the item from history, send its file(s) on disk to the Recycle Bin, and clear cached copies in Temp and last_project_assets.")
+                        .size(11.5)
+                        .color(Color32::from_rgb(175, 182, 198)),
+                );
+                if let Some(ref err) = del.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(err).size(11.0).color(RED));
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("Move to Recycle Bin").strong().color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(175, 42, 42));
+                        if ui.add(btn).clicked() {
+                            do_delete = true;
+                        }
+                    });
+                });
+            });
+
+        if do_delete {
+            let id = del.node_id;
+            match self.delete_history_node(id) {
+                Ok(()) => {
+                    self.pending_history_delete = None;
+                }
+                Err(e) => {
+                    if let Some(ref mut d) = self.pending_history_delete {
+                        d.error = Some(e);
+                    }
+                }
+            }
+        } else if cancel {
+            self.pending_history_delete = None;
+        }
+    }
+
+    fn delete_history_node(&mut self, node_id: usize) -> Result<(), String> {
+        let Some(pos) = self.nodes.iter().position(|n| n.id == node_id) else {
+            return Ok(());
+        };
+
+        let was_active = self.active_node_id == Some(node_id);
+        let node = &self.nodes[pos];
+
+        // Drop active VideoPlayer before deleting so file handles & ffmpeg workers are released.
+        let player_matches_node = self.video_player.as_ref().is_some_and(|vp| {
+            was_active
+                || node.source_video_path.as_ref() == Some(&vp.file_path)
+                || (!node.output_filename.is_empty() && vp.filename == node.output_filename)
+        });
+        let dropped_temp_path = if player_matches_node {
+            let p = self.video_player.as_ref().map(|vp| vp.file_path.clone());
+            self.video_player = None;
+            p
+        } else {
+            None
+        };
+
+        let node = self.nodes.remove(pos);
+        let tmp_dir = std::env::temp_dir();
+        let assets_dir = Self::last_project_assets_dir();
+
+        // Recycle or remove the user/source video path if present.
+        if let Some(ref src_path) = node.source_video_path {
+            if src_path.is_file() {
+                if src_path.starts_with(&tmp_dir) || src_path.starts_with(&assets_dir) {
+                    let _ = std::fs::remove_file(src_path);
+                } else {
+                    Self::move_to_recycle_bin(src_path)?;
+                    engine::log(&format!("Moved source file to Recycle Bin: {}", src_path.display()));
+                }
+            }
+        }
+
+        let comfy_dir = self.sh.paths.lock().unwrap().comfy.clone();
+        let mut recycle_dirs = Vec::new();
+        if let Some(ref cp) = comfy_dir {
+            recycle_dirs.push(cp.clone());
+            if let Some(parent) = cp.parent() {
+                recycle_dirs.push(parent.to_path_buf());
+            }
+        }
+        recycle_dirs.push(engine::data_dir());
+
+        // Move output files generated by ComfyUI to the Recycle Bin.
+        if !node.output_filename.is_empty() {
+            for dir in &recycle_dirs {
+                let candidates = [
+                    dir.join("output").join(&node.output_subfolder).join(&node.output_filename),
+                    dir.join("output").join(&node.output_filename),
+                    dir.join(&node.output_subfolder).join(&node.output_filename),
+                    dir.join(&node.output_filename),
+                ];
+                for c in candidates {
+                    if c.is_file() {
+                        Self::move_to_recycle_bin(&c)?;
+                        engine::log(&format!("Moved output file to Recycle Bin: {}", c.display()));
+                    }
+                }
+            }
+            // Remove any copy in AppData\Local\Temp directly.
+            for c in [
+                tmp_dir.join(&node.output_subfolder).join(&node.output_filename),
+                tmp_dir.join(&node.output_filename),
+            ] {
+                if c.is_file() {
+                    let _ = std::fs::remove_file(&c);
+                    engine::log(&format!("Removed temp output file: {}", c.display()));
+                }
+            }
+        }
+
+        // Remove internal temp input images uploaded to ComfyUI.
+        let mut temp_search_dirs = recycle_dirs;
+        temp_search_dirs.push(tmp_dir.clone());
+        for tf in &node.temp_files {
+            for dir in &temp_search_dirs {
+                let candidates = [
+                    dir.join("temp").join(tf),
+                    dir.join("input").join(tf),
+                    dir.join(tf),
+                ];
+                for c in candidates {
+                    if c.is_file() {
+                        let _ = std::fs::remove_file(&c);
+                        engine::log(&format!("Deleted temp file: {}", c.display()));
+                    }
+                }
+            }
+        }
+
+        // Remove any temp player file that belonged to this node and clean up unused session temp videos.
+        if let Some(ref tp) = dropped_temp_path {
+            if tp.starts_with(&tmp_dir) && tp.is_file() {
+                let _ = std::fs::remove_file(tp);
+            }
+        }
+        Self::cleanup_unused_temp_videos(self.video_player.as_ref().map(|p| p.file_path.as_path()));
+
+        // Remove cached copies in last_project_assets and refresh last_project.json if present.
+        for ext in ["png", "mp4"] {
+            let asset_path = assets_dir.join(format!("node_{}.{ext}", node_id));
+            if asset_path.is_file() {
+                let _ = std::fs::remove_file(&asset_path);
+                engine::log(&format!("Deleted last_project_assets file: {}", asset_path.display()));
+            }
+        }
+        if Self::last_project_json_path().is_file() {
+            if self.nodes.is_empty() && self.refs.is_empty() {
+                Self::clear_last_project();
+            } else {
+                self.save_last_project();
+            }
+        }
+
+        // If the deleted node was currently active, switch to parent or last remaining node.
+        if was_active {
+            let next_id = node
+                .parent_id
+                .filter(|pid| self.nodes.iter().any(|n| n.id == *pid))
+                .or_else(|| self.nodes.last().map(|n| n.id));
+            if let Some(nid) = next_id {
+                self.select_node(nid);
+            } else {
+                self.active_node_id = None;
+                self.video_player = None;
+                self.compare_mode = false;
+            }
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ History helpers
@@ -811,38 +1205,110 @@ impl App {
             }
         }
 
+        // Save current video player position, trim markers, and work mode before switching nodes.
+        if !self.generating {
+            if let Some(prev_id) = self.active_node_id {
+                if prev_id != id {
+                    if let Some(ref player) = self.video_player {
+                        let cur_sec = player.current_sec;
+                        let trim_s = player.trim_start_sec;
+                        let trim_e = player.trim_end_sec;
+                        let wm = self.video_work_mode;
+                        if let Some(prev_node) = self.nodes.iter_mut().find(|n| n.id == prev_id) {
+                            if prev_node.mp4_bytes.is_some() || prev_node.source_video_path.is_some() {
+                                prev_node.video_last_sec = Some(cur_sec);
+                                prev_node.video_trim_start = trim_s;
+                                prev_node.video_trim_end = trim_e;
+                                prev_node.video_work_mode = Some(wm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.active_node_id = Some(id);
         self.compare_mode = false;
         if !self.generating {
             let node_info = self.find_node(id).map(|n| (
                 n.prompt.clone(),
                 n.mp4_bytes.clone(),
+                n.source_video_path.clone(),
                 n.output_filename.clone(),
                 n.output_subfolder.clone(),
+                n.video_last_sec,
+                n.video_trim_start,
+                n.video_trim_end,
+                n.video_work_mode,
             ));
-            if let Some((prompt, mp4_bytes, out_fn, out_sub)) = node_info {
+            if let Some((
+                prompt,
+                mp4_bytes,
+                source_video_path,
+                out_fn,
+                out_sub,
+                last_sec,
+                trim_s,
+                trim_e,
+                saved_work_mode,
+            )) = node_info
+            {
                 if !prompt.is_empty() {
-                    self.prompt = prompt;
+                    self.prompt = crate::lora::strip_prompt_tags(self.active_prompt_tags(), &prompt);
                     self.focus_prompt = true;
                 }
 
+                let has_disk_video = source_video_path.as_ref().is_some_and(|p| p.is_file());
+                let is_video_node = mp4_bytes.is_some() || has_disk_video;
+
                 // If selecting a video history node, load it in the video player
-                if let Some(mp4) = mp4_bytes {
+                if is_video_node {
                     let already_loaded = self.video_player.as_ref()
-                        .map(|p| p.filename == out_fn && !out_fn.is_empty())
+                        .map(|p| {
+                            (has_disk_video && source_video_path.as_ref() == Some(&p.file_path))
+                                || (p.filename == out_fn && !out_fn.is_empty())
+                        })
                         .unwrap_or(false);
                     if !already_loaded {
                         let norm = self.current_audio_normalise();
-                        if let Ok(player) = crate::video::VideoPlayer::from_mp4_bytes(
-                            mp4,
-                            out_fn,
-                            out_sub,
-                            norm,
-                        ) {
+                        let loaded_player = if let Some(ref src_path) = source_video_path.filter(|p| p.is_file()) {
+                            crate::video::VideoPlayer::load_from_file(src_path, norm).map(|mut p| {
+                                p.filename = out_fn.clone();
+                                p.subfolder = out_sub.clone();
+                                if p.mp4_bytes.is_none() {
+                                    p.mp4_bytes = mp4_bytes.clone();
+                                }
+                                p
+                            })
+                        } else if let Some(mp4) = mp4_bytes {
+                            crate::video::VideoPlayer::from_mp4_bytes(mp4, out_fn, out_sub, norm)
+                        } else {
+                            Err("No video source available".into())
+                        };
+                        if let Ok(mut player) = loaded_player {
+                            player.trim_start_sec = trim_s;
+                            player.trim_end_sec = trim_e;
+                            if let Some(sec) = last_sec {
+                                if sec > 0.001 {
+                                    player.seek_to_time(sec);
+                                }
+                            }
                             self.video_player = Some(player);
+                            self.canvas_zoom = 1.0;
+                            self.canvas_pan = vec2(0.0, 0.0);
+                            self.video_pan_drag_active = false;
                             self.trim_undo_stack.clear();
                             self.trim_redo_stack.clear();
                         }
+                    } else if let Some(ref mut player) = self.video_player {
+                        player.trim_start_sec = trim_s;
+                        player.trim_end_sec = trim_e;
+                        if let Some(sec) = last_sec {
+                            player.seek_to_time(sec);
+                        }
+                    }
+                    if let Some(wm) = saved_work_mode {
+                        self.set_video_work_mode(wm);
                     }
                 } else {
                     // Selecting an image history node restores image canvas view
@@ -920,7 +1386,10 @@ impl App {
     }
 
     fn update_dimensions_from_active_node(&mut self) {
-        if let Some((n_w, n_h)) = self.active_node().map(|n| (n.width, n.height)) {
+        if let Some((n_w, n_h, is_video_node)) = self
+            .active_node()
+            .map(|n| (n.width, n.height, n.mp4_bytes.is_some() || n.source_video_path.is_some()))
+        {
             match self.size_preset {
                 SizePreset::Original => {
                     self.custom_w = n_w;
@@ -947,6 +1416,9 @@ impl App {
                     // Retain user's custom aspect ratio and dimensions
                 }
             }
+            if self.mode == StudioMode::Video || is_video_node {
+                self.set_video_resolution_from_source(n_w, n_h);
+            }
         }
     }
 
@@ -961,6 +1433,9 @@ impl App {
             self.custom_h = p.target_h;
 
             if let Some((n_w, n_h)) = self.active_node().map(|n| (n.width, n.height)) {
+                self.ref_w = n_w;
+                self.ref_h = n_h;
+                let (k_min, k_max) = absolute_scale_range(n_w, n_h, ABS_MIN_RES, ABS_MAX_RES);
                 match p.size_preset {
                     SizePreset::Original => {
                         self.custom_w = n_w;
@@ -970,16 +1445,16 @@ impl App {
                     SizePreset::P720 => {
                         self.custom_w = 720;
                         self.custom_h = (((720.0 * n_h as f32 / n_w as f32) / 16.0).round() as u32 * 16).clamp(64, 4096);
-                        self.scale = (720.0 / n_w as f32).clamp(0.1, 2.0);
+                        self.scale = (720.0 / n_w.max(1) as f32).clamp(k_min, k_max);
                     }
                     SizePreset::P1024 => {
                         self.custom_w = 1024;
                         self.custom_h = (((1024.0 * n_h as f32 / n_w as f32) / 16.0).round() as u32 * 16).clamp(64, 4096);
-                        self.scale = (1024.0 / n_w as f32).clamp(0.1, 2.0);
+                        self.scale = (1024.0 / n_w.max(1) as f32).clamp(k_min, k_max);
                     }
                     SizePreset::Custom => {
                         if n_w > 0 {
-                            self.scale = (p.target_w as f32 / n_w as f32).clamp(0.1, 2.0);
+                            self.scale = (p.target_w as f32 / n_w as f32).clamp(k_min, k_max);
                         }
                     }
                 }
@@ -1077,10 +1552,29 @@ impl App {
 
     fn update_scale_dimensions(&mut self) {
         self.size_preset = SizePreset::Custom;
-        if self.ref_w == 0 { self.ref_w = self.custom_w.max(64); }
-        if self.ref_h == 0 { self.ref_h = self.custom_h.max(64); }
-        self.custom_w = (((self.ref_w as f32 * self.scale) / 16.0).round() as u32 * 16).clamp(64, 4096);
-        self.custom_h = (((self.ref_h as f32 * self.scale) / 16.0).round() as u32 * 16).clamp(64, 4096);
+        if self.ref_w == 0 { self.ref_w = self.custom_w.max(ABS_MIN_RES); }
+        if self.ref_h == 0 { self.ref_h = self.custom_h.max(ABS_MIN_RES); }
+        let (w, h) = scale_dimensions_stepped(self.ref_w, self.ref_h, self.scale, 16, ABS_MIN_RES, ABS_MAX_RES);
+        self.custom_w = w;
+        self.custom_h = h;
+    }
+
+    fn set_video_resolution_from_source(&mut self, src_w: u32, src_h: u32) {
+        if src_w == 0 || src_h == 0 {
+            return;
+        }
+        let vw = (((src_w as f32) / 32.0).round() as u32 * 32).clamp(256, 4096);
+        let vh = (((src_h as f32) / 32.0).round() as u32 * 32).clamp(256, 4096);
+        self.video_orientation = if vh > vw {
+            VideoOrientation::Portrait
+        } else {
+            VideoOrientation::Landscape
+        };
+        self.video_base_w = vw;
+        self.video_base_h = vh;
+        self.video_width = vw;
+        self.video_height = vh;
+        self.video_scale = 1.0;
     }
 
     fn load_video_file(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -1128,13 +1622,27 @@ impl App {
                         output_subfolder: String::new(),
                         temp_files: Vec::new(),
                         mp4_bytes,
+                        source_video_path: Some(path.clone()),
+                        video_last_sec: None,
+                        video_trim_start: None,
+                        video_trim_end: None,
+                        video_work_mode: Some(VideoWorkMode::Edit),
                     };
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
                 }
 
-                self.mode = StudioMode::Video;
+                let src_w = player.original_width;
+                let src_h = player.original_height;
+                let auto_switch = self.sh.cfg.lock().unwrap().auto_switch_mode_on_input;
+                if auto_switch {
+                    self.mode = StudioMode::Video;
+                }
                 self.video_player = Some(player);
+                if self.mode == StudioMode::Video {
+                    self.set_video_work_mode(VideoWorkMode::Edit);
+                }
+                self.set_video_resolution_from_source(src_w, src_h);
                 self.trim_undo_stack.clear();
                 self.trim_redo_stack.clear();
                 self.error = None;
@@ -1229,28 +1737,121 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Returns the active video profile if all its files are downloaded, or falls back
-    /// to any other completely downloaded video profile (e.g. LTX-Video 2.5 or 2.3)
-    /// so generation isn't blocked while a newly selected default is downloading.
+    /// Returns the active video profile for the current state:
+    /// - When a source video is loaded or an LTX-only / IC-LoRA is active, uses an LTX profile
+    ///   (preferring the active profile if LTX, then the last used LTX profile, then the best downloaded LTX).
+    /// - Otherwise uses the user's selected `active_video_profile` if downloaded (never falling back),
+    ///   or falls back to the best downloaded profile if the selected one is still downloading.
     pub fn effective_video_profile(&self) -> Option<engine::Profile> {
         let dir = self.active_video_models_dir();
         if dir.as_os_str().is_empty() {
             return None;
         }
         let vprof = self.sh.active_video_profile.lock().unwrap().clone();
+        let needs_h3 = crate::lora::has_active_h3_lora(&self.video_loras, &self.lora_browser.items);
+        if needs_h3 {
+            if vprof.is_minimax_h3() && vprof.missing_in_dir(&dir).is_empty() {
+                return Some(vprof);
+            }
+            return engine::Profile::find_best_downloaded_h3_profile(&dir);
+        }
+
+        let needs_ltx = crate::lora::has_active_ltx_lora(&self.video_loras, &self.lora_browser.items);
+
+        if needs_ltx {
+            if !vprof.is_minimax_h3() && vprof.missing_in_dir(&dir).is_empty() {
+                return Some(vprof);
+            }
+            return engine::Profile::find_best_downloaded_video_profile(
+                &dir,
+                true,
+                self.last_ltx_video_profile_id.as_deref(),
+            );
+        }
+
         if vprof.missing_in_dir(&dir).is_empty() {
             return Some(vprof);
         }
-        engine::Profile::find_downloaded_video_profile(&dir)
+
+        let same_family: Vec<engine::Profile> = engine::Profile::all_video_profiles()
+            .into_iter()
+            .filter(|p| p.is_minimax_h3() == vprof.is_minimax_h3() && p.missing_in_dir(&dir).is_empty())
+            .collect();
+        if !same_family.is_empty() {
+            if let Some(best) = engine::Profile::pick_best_from_downloaded(&same_family, engine::detect_gpu_vram_gb()) {
+                return Some(best);
+            }
+        }
+        engine::Profile::find_best_downloaded_video_profile(
+            &dir,
+            false,
+            self.last_ltx_video_profile_id.as_deref(),
+        )
     }
 
     pub fn has_video_models(&self) -> bool {
         self.effective_video_profile().is_some()
     }
 
+    pub fn is_edit_video_mode(&self) -> bool {
+        self.mode == StudioMode::Video
+            && self.video_player.is_some()
+            && self.video_work_mode == VideoWorkMode::Edit
+    }
+
+    pub fn set_video_work_mode(&mut self, mode: VideoWorkMode) {
+        if self.video_work_mode != mode {
+            self.video_work_mode = mode;
+            self.video_loras.clear();
+            self.video_prompt_tags.clear();
+            self.sync_effective_video_profile();
+        }
+    }
+
+    pub fn active_video_lora_vram_gb(&self) -> f32 {
+        let base: f32 = self.video_loras
+            .iter()
+            .map(|active| {
+                let size_bytes = self
+                    .lora_browser
+                    .items
+                    .iter()
+                    .find(|it| it.filename == active.filename)
+                    .map(|it| it.size_bytes)
+                    .unwrap_or(0);
+                crate::lora::estimate_lora_vram_gb(&active.filename, size_bytes)
+            })
+            .sum();
+        if self.is_edit_video_mode() {
+            // IC-LoRA doubles Stage 1 sequence length (target + guide tokens); scale overhead with frame/pixel load.
+            let frames = (self.video_duration * self.video_fps) as f32;
+            let mp = (self.video_width * self.video_height) as f32 / 1_000_000.0;
+            let load_factor = mp * (frames / 24.0);
+            base + (0.35 + load_factor * 0.25).clamp(0.4, 1.8)
+        } else {
+            base
+        }
+    }
+
+    pub fn active_prompt_tags(&self) -> &[crate::lora::PromptTag] {
+        if self.mode == StudioMode::Video {
+            &self.video_prompt_tags
+        } else {
+            &self.image_prompt_tags
+        }
+    }
+
+    pub fn has_prompt_content(&self) -> bool {
+        !self.prompt.trim().is_empty() || !self.active_prompt_tags().is_empty()
+    }
+
+    pub fn composed_prompt(&self) -> String {
+        crate::lora::compose_prompt_with_tags(self.active_prompt_tags(), &self.prompt)
+    }
+
     fn start_generation(&mut self, ctx: &egui::Context) {
         self.generation_retries = 0;
-        let p = self.prompt.trim().to_string();
+        let p = self.composed_prompt();
         self.prompt.clear();
         if self.mode == StudioMode::Video {
             self.start_video_generation_with_prompt(ctx, p);
@@ -1258,6 +1859,70 @@ impl App {
             self.start_generation_with_prompt(ctx, p);
         }
     }
+
+fn extract_trimmed_mp4_bytes(
+    vp: &crate::video::VideoPlayer,
+    trim_start: f64,
+    trim_end: f64,
+    target_fps: u32,
+    max_frames: u32,
+) -> Option<Vec<u8>> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = std::env::temp_dir();
+    let mut temp_in: Option<PathBuf> = None;
+    let in_path = if vp.file_path.is_file() {
+        vp.file_path.clone()
+    } else if let Some(ref raw) = vp.mp4_bytes {
+        let p = tmp_dir.join(format!("imgstudio_trim_in_{stamp}.mp4"));
+        std::fs::write(&p, raw).ok()?;
+        temp_in = Some(p.clone());
+        p
+    } else {
+        return None;
+    };
+    let out_path = tmp_dir.join(format!("imgstudio_trim_out_{stamp}.mp4"));
+
+    let fps_str = target_fps.max(1).to_string();
+    let max_frames_str = max_frames.max(1).to_string();
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-ss",
+        &format!("{trim_start:.3}"),
+        "-to",
+        &format!("{trim_end:.3}"),
+        "-i",
+        in_path.to_str()?,
+        "-r",
+        &fps_str,
+        "-frames:v",
+        &max_frames_str,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "16",
+        "-c:a",
+        "aac",
+        out_path.to_str()?,
+    ]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let ok = cmd.output().ok().map(|o| o.status.success()).unwrap_or(false);
+    if let Some(p) = temp_in {
+        let _ = std::fs::remove_file(p);
+    }
+    let bytes = if ok { std::fs::read(&out_path).ok() } else { None };
+    let _ = std::fs::remove_file(&out_path);
+    bytes
+}
 
     fn start_video_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
         let active_vprof = self.sh.active_video_profile.lock().unwrap().clone();
@@ -1278,22 +1943,55 @@ impl App {
             if is_fallback { "LTX-Video 2.3 (fallback)" } else { "LTX-Video 2.3" }
         };
 
+        let is_edit_mode = self.is_edit_video_mode();
+        let is_viggle_remake = is_edit_mode
+            && self
+                .video_loras
+                .iter()
+                .any(|l| l.filename.to_ascii_lowercase().contains("viggle_remake"));
+
+        if is_viggle_remake {
+            if let Some(comfy_dir) = self.sh.paths.lock().unwrap().comfy.clone() {
+                if engine::ensure_viggle_remake_custom_node(&comfy_dir) {
+                    self.sh.restart.store(true, Ordering::SeqCst);
+                    self.prompt = crate::lora::strip_prompt_tags(self.active_prompt_tags(), &prompt);
+                    self.status = "Updated Viggle Remake custom node — restarting ComfyUI, please click Edit Video again in a moment.".to_string();
+                    return;
+                }
+            }
+        }
+
         // If a video is currently loaded in the player, automatically extract the frame
         // the user has scrubbed to as the start frame for the next shot!
-        let (base_png_opt, scrubbed_frame_ci) = if let Some(ref player) = self.video_player {
-            if let Some(ref cur_img) = player.current_image {
-                let cur_img = cur_img.clone();
-                let [f_w, f_h] = cur_img.size;
-                let mut png_bytes = Vec::new();
-                if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
-                    let _ = image::DynamicImage::ImageRgba8(rgba)
-                        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
-                }
-                if !png_bytes.is_empty() {
-                    (Some(png_bytes), Some(cur_img))
+        // In H3 V2V edit mode, also extract the current frame as fallback ref_1 if no refs are attached.
+        let extract_player_frame = |player: &crate::video::VideoPlayer| -> Option<(Vec<u8>, ColorImage)> {
+            let cur_img = player.current_image.as_ref()?.clone();
+            let [f_w, f_h] = cur_img.size;
+            let mut png_bytes = Vec::new();
+            if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
+                let _ = image::DynamicImage::ImageRgba8(rgba)
+                    .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+            }
+            if !png_bytes.is_empty() {
+                Some((png_bytes, cur_img))
+            } else {
+                None
+            }
+        };
+
+        let (base_png_opt, scrubbed_frame_ci) = if is_edit_mode {
+            if arch == comfy::VideoArch::MiniMaxH3 && self.refs.is_empty() {
+                if let Some((png, _)) = self.video_player.as_ref().and_then(extract_player_frame) {
+                    (Some(png), None)
                 } else {
-                    (self.active_node().map(|n| n.png.clone()), None)
+                    (None, None)
                 }
+            } else {
+                (None, None)
+            }
+        } else if let Some(ref player) = self.video_player {
+            if let Some((png, ci)) = extract_player_frame(player) {
+                (Some(png), Some(ci))
             } else {
                 (self.active_node().map(|n| n.png.clone()), None)
             }
@@ -1301,29 +1999,75 @@ impl App {
             (self.active_node().map(|n| n.png.clone()), None)
         };
 
-        let use_r2v = arch == comfy::VideoArch::MiniMaxH3 && self.video_r2v_mode && !self.refs.is_empty();
+        let use_r2v = !is_edit_mode && arch == comfy::VideoArch::MiniMaxH3 && self.video_r2v_mode && !self.refs.is_empty();
         if use_r2v {
             let models_dir = self.active_video_models_dir();
             if !vprof.has_r2v_model(&models_dir) {
-                self.prompt = prompt;
+                self.prompt = crate::lora::strip_prompt_tags(self.active_prompt_tags(), &prompt);
                 self.status = "Reference-to-Video requires the Ref2VA model. Download it in the top-left References panel.".to_string();
                 return;
             }
         }
-        let ref_images = if use_r2v {
+        let ref_images = if use_r2v || (is_edit_mode && arch == comfy::VideoArch::MiniMaxH3) {
             self.refs.iter().map(|r| r.png.clone()).collect()
         } else {
             Vec::new()
         };
-        let last_frame = if arch == comfy::VideoArch::MiniMaxH3 && !use_r2v && base_png_opt.is_some() && !self.refs.is_empty() {
+        let last_frame = if !is_edit_mode && arch == comfy::VideoArch::MiniMaxH3 && !use_r2v && base_png_opt.is_some() && !self.refs.is_empty() {
             Some(self.refs[0].png.clone())
         } else {
             None
         };
         let is_t2v = base_png_opt.is_none() && !use_r2v;
 
+        let (source_video_bytes, source_video_frames) = if is_edit_mode {
+            if let Some(ref vp) = self.video_player {
+                let trim_s = vp.trim_start();
+                let trim_e = vp.trim_end();
+                let trim_dur = (trim_e - trim_s).max(0.2);
+                let target_fps = if arch == comfy::VideoArch::MiniMaxH3 { 24 } else { self.video_fps };
+                let raw_frames = (trim_dur * target_fps as f64).round() as u32;
+                let snapped_frames = if is_viggle_remake {
+                    let clamped = raw_frames.clamp(90, 345);
+                    ((clamped - 5) / 17) * 17 + 5
+                } else if arch == comfy::VideoArch::MiniMaxH3 {
+                    let rem = (5 - (raw_frames.max(5) % 17) as i32).rem_euclid(17) as u32;
+                    raw_frames.max(5) + rem
+                } else {
+                    ((raw_frames.saturating_sub(1)) / 8).max(1) * 8 + 1
+                };
+                let is_trimmed = vp.trim_start_sec.is_some() || vp.trim_end_sec.is_some();
+                let fps_mismatch = (vp.original_fps - target_fps as f32).abs() > 0.5;
+                let bytes = if is_trimmed || fps_mismatch || is_viggle_remake {
+                    Self::extract_trimmed_mp4_bytes(vp, trim_s, trim_e, target_fps, snapped_frames)
+                        .or_else(|| vp.mp4_bytes.clone())
+                        .or_else(|| std::fs::read(&vp.file_path).ok())
+                } else {
+                    vp.mp4_bytes
+                        .clone()
+                        .or_else(|| std::fs::read(&vp.file_path).ok())
+                };
+                let Some(b) = bytes else {
+                    self.error = Some("Load or drop a source video to edit with this IC-LoRA.".into());
+                    return;
+                };
+                self.last_edit_video_source = Some((b.clone(), snapped_frames));
+                (Some(b), Some(snapped_frames))
+            } else if let Some((ref cached_bytes, cached_frames)) = self.last_edit_video_source {
+                (Some(cached_bytes.clone()), Some(cached_frames))
+            } else {
+                self.error = Some("Load or drop a source video to edit with this IC-LoRA.".into());
+                return;
+            }
+        } else {
+            self.last_edit_video_source = None;
+            (None, None)
+        };
+
         self.generating = true;
-        self.status = if use_r2v {
+        self.status = if is_edit_mode {
+            format!("Editing video with IC-LoRA ({model_label})...")
+        } else if use_r2v {
             format!("Generating Reference-to-Video with {} ref(s) ({model_label})...", ref_images.len())
         } else if last_frame.is_some() {
             format!("Generating First+Last frame continuation ({model_label})...")
@@ -1337,8 +2081,20 @@ impl App {
         self.generating_prompt = prompt.trim().to_string();
 
         if let Some(pid) = self.active_node_id {
+            let cur_sec = self.video_player.as_ref().map(|p| p.current_sec);
+            let cur_trim_s = self.video_player.as_ref().and_then(|p| p.trim_start_sec);
+            let cur_trim_e = self.video_player.as_ref().and_then(|p| p.trim_end_sec);
+            let cur_wm = self.video_work_mode;
             if let Some(parent) = self.nodes.iter_mut().find(|n| n.id == pid) {
                 parent.prompt = self.generating_prompt.clone();
+                if let Some(sec) = cur_sec {
+                    if parent.mp4_bytes.is_some() || parent.source_video_path.is_some() {
+                        parent.video_last_sec = Some(sec);
+                        parent.video_trim_start = cur_trim_s;
+                        parent.video_trim_end = cur_trim_e;
+                        parent.video_work_mode = Some(cur_wm);
+                    }
+                }
             }
         }
 
@@ -1354,16 +2110,25 @@ impl App {
 
         self.generating_dims = Some((self.video_width, self.video_height));
 
-        let lora_name = if self.video_lora != "None" && !self.video_lora.is_empty() {
-            Some(self.video_lora.clone())
+        let has_day_to_night = self
+            .video_loras
+            .iter()
+            .any(|l| l.filename.to_ascii_lowercase().contains("day-to-night") || l.filename.to_ascii_lowercase().contains("day_to_night"));
+        let negative = if has_day_to_night && !self.video_negative.to_ascii_lowercase().contains("daytime") {
+            let neg_prefix = "daytime, bright sunlight, blue sky, overexposed, ";
+            if self.video_negative.trim().is_empty() {
+                format!("{neg_prefix}worst quality, inconsistent motion, blurry, jittery, distorted")
+            } else {
+                format!("{neg_prefix}{}", self.video_negative.trim())
+            }
         } else {
-            None
+            self.video_negative.clone()
         };
 
         let vparams = comfy::VideoParams {
             arch,
             prompt: self.generating_prompt.clone(),
-            negative: self.video_negative.clone(),
+            negative,
             width: self.video_width,
             height: self.video_height,
             duration: self.video_duration,
@@ -1378,8 +2143,11 @@ impl App {
             last_frame,
             ref_images,
             use_r2v,
-            lora_name,
-            lora_strength: self.video_lora_strength,
+            source_video_bytes,
+            source_video_frames,
+            stall_prompt: Some(self.stall_prompt.clone()),
+            stall_keep_waiting: Some(self.stall_keep_waiting.clone()),
+            loras: self.video_loras.clone(),
             unet_name: vprof.fl2va_unet_name(),
             ref2va_unet_name: vprof.ref2va_unet_name(),
             clip_name: vprof.clip_name(),
@@ -1398,11 +2166,15 @@ impl App {
         } else {
             self.preview_tex = None;
         }
-        self.video_player = None;
+        if let Some(ref mut player) = self.video_player {
+            player.pause();
+        }
         self.last_progress_time = None;
         self.last_progress_val = 0;
         self.step_duration_ema = 0.0;
         self.is_swapping_detected = false;
+        self.stall_prompt.store(false, Ordering::SeqCst);
+        self.stall_keep_waiting.store(false, Ordering::SeqCst);
 
         let tx_p = tx.clone();
         let ctx_p = ctx.clone();
@@ -1463,7 +2235,31 @@ impl App {
     }
 
     fn start_generation_with_prompt(&mut self, ctx: &egui::Context, prompt: String) {
-        let base_png_opt = self.active_node().map(|n| n.png.clone());
+        let base_png_opt = if let Some(ref player) = self.video_player {
+            player
+                .current_image
+                .as_ref()
+                .and_then(|cur_img| {
+                    let [f_w, f_h] = cur_img.size;
+                    let mut png_bytes = Vec::new();
+                    if let Some(rgba) = image::RgbaImage::from_raw(
+                        f_w as u32,
+                        f_h as u32,
+                        cur_img.as_raw().to_vec(),
+                    ) {
+                        let _ = image::DynamicImage::ImageRgba8(rgba)
+                            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
+                    }
+                    if !png_bytes.is_empty() {
+                        Some(png_bytes)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| self.active_node().map(|n| n.png.clone()))
+        } else {
+            self.active_node().map(|n| n.png.clone())
+        };
         let is_t2i = base_png_opt.is_none();
 
         self.generating = true;
@@ -1474,8 +2270,20 @@ impl App {
 
         // Save the prompt on the parent node that created this generation
         if let Some(pid) = self.active_node_id {
+            let cur_sec = self.video_player.as_ref().map(|p| p.current_sec);
+            let cur_trim_s = self.video_player.as_ref().and_then(|p| p.trim_start_sec);
+            let cur_trim_e = self.video_player.as_ref().and_then(|p| p.trim_end_sec);
+            let cur_wm = self.video_work_mode;
             if let Some(parent) = self.nodes.iter_mut().find(|n| n.id == pid) {
                 parent.prompt = self.generating_prompt.clone();
+                if let Some(sec) = cur_sec {
+                    if parent.mp4_bytes.is_some() || parent.source_video_path.is_some() {
+                        parent.video_last_sec = Some(sec);
+                        parent.video_trim_start = cur_trim_s;
+                        parent.video_trim_end = cur_trim_e;
+                        parent.video_work_mode = Some(cur_wm);
+                    }
+                }
             }
         }
 
@@ -1533,6 +2341,7 @@ impl App {
             },
             sampler: self.profile.sampler.clone(),
             scheduler: self.profile.scheduler.clone(),
+            loras: self.image_loras.clone(),
         };
 
         self.progress = None;
@@ -1542,6 +2351,8 @@ impl App {
         self.last_progress_val = 0;
         self.step_duration_ema = 0.0;
         self.is_swapping_detected = false;
+        self.stall_prompt.store(false, Ordering::SeqCst);
+        self.stall_keep_waiting.store(false, Ordering::SeqCst);
         let tx_p = tx.clone();
         let ctx_p = ctx.clone();
         let prog_cb = Arc::new(move |value: u32, max: u32| {
@@ -1625,6 +2436,9 @@ impl App {
                     let tex = ctx.load_texture(&name, img, egui::TextureOptions::LINEAR);
                     match target {
                         Target::Base => {
+                            if self.sh.cfg.lock().unwrap().auto_switch_mode_on_input {
+                                self.mode = StudioMode::Image;
+                            }
                             let id = self.next_node_id;
                             self.next_node_id += 1;
                             let label = if name.is_empty() || name == "clipboard" {
@@ -1646,6 +2460,11 @@ impl App {
                                 output_subfolder: String::new(),
                                 temp_files: Vec::new(),
                                 mp4_bytes: None,
+                                source_video_path: None,
+                                video_last_sec: None,
+                                video_trim_start: None,
+                                video_trim_end: None,
+                                video_work_mode: None,
                             };
                             self.nodes.push(node);
                             self.ref_w = width;
@@ -1654,6 +2473,9 @@ impl App {
                             self.custom_h = height;
                             self.scale = 1.0;
                             self.size_preset = SizePreset::Original;
+                            if self.mode == StudioMode::Video {
+                                self.set_video_resolution_from_source(width, height);
+                            }
                             self.select_node(id);
                             self.canvas_zoom = 1.0;
                             self.canvas_pan = vec2(0.0, 0.0);
@@ -1689,8 +2511,9 @@ impl App {
                                 self.step_duration_ema = self.step_duration_ema * 0.7 + per_step * 0.3;
                             }
                             if self.mode == StudioMode::Video {
+                                let lora_vram = self.active_video_lora_vram_gb();
                                 let vram_exceeded = if let Some(gpu_vram) = engine::detect_gpu_vram_gb() {
-                                    estimate_video_vram_gb(self.video_width, self.video_height, self.video_duration, self.video_fps) > gpu_vram as f32
+                                    estimate_video_vram_gb_with_lora(self.video_width, self.video_height, self.video_duration, self.video_fps, lora_vram) > gpu_vram as f32
                                 } else {
                                     false
                                 };
@@ -1726,6 +2549,8 @@ impl App {
                     self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
+        self.stall_prompt.store(false, Ordering::SeqCst);
+        self.stall_keep_waiting.store(false, Ordering::SeqCst);
                     let [out_w, out_h] = img.size;
                     let id = self.next_node_id;
                     self.next_node_id += 1;
@@ -1766,9 +2591,15 @@ impl App {
                         output_subfolder,
                         temp_files,
                         mp4_bytes: None,
+                        source_video_path: None,
+                        video_last_sec: None,
+                        video_trim_start: None,
+                        video_trim_end: None,
+                        video_work_mode: None,
                     };
                     self.nodes.push(node);
                     self.active_node_id = Some(id);
+                    self.video_player = None;
                     self.compare_mode = false;
                     self.generation_retries = 0;
 
@@ -1800,10 +2631,40 @@ impl App {
                     self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
+        self.stall_prompt.store(false, Ordering::SeqCst);
+        self.stall_keep_waiting.store(false, Ordering::SeqCst);
                     self.generation_retries = 0;
 
                     let norm = self.current_audio_normalise();
-                    match crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone(), norm) {
+                    let disk_video_path = (!output_filename.is_empty()).then(|| {
+                        let comfy_dir = self.sh.paths.lock().unwrap().comfy.clone();
+                        let mut dirs = Vec::new();
+                        if let Some(ref cp) = comfy_dir {
+                            dirs.push(cp.clone());
+                            if let Some(parent) = cp.parent() {
+                                dirs.push(parent.to_path_buf());
+                            }
+                        }
+                        dirs.into_iter().find_map(|dir| {
+                            [
+                                dir.join("output").join(&output_subfolder).join(&output_filename),
+                                dir.join("output").join(&output_filename),
+                            ]
+                            .into_iter()
+                            .find(|c| c.is_file())
+                        })
+                    }).flatten();
+                    let player_res = if let Some(ref disk_path) = disk_video_path {
+                        crate::video::VideoPlayer::load_from_file(disk_path, norm).map(|mut p| {
+                            p.filename = output_filename.clone();
+                            p.subfolder = output_subfolder.clone();
+                            p.mp4_bytes = Some(mp4_bytes);
+                            p
+                        })
+                    } else {
+                        crate::video::VideoPlayer::from_mp4_bytes(mp4_bytes, output_filename.clone(), output_subfolder.clone(), norm)
+                    };
+                    match player_res {
                         Ok(player) => {
                             if let Some(first) = player.current_image.as_ref() {
                                 let id = self.next_node_id;
@@ -1847,11 +2708,19 @@ impl App {
                                     output_subfolder,
                                     temp_files,
                                     mp4_bytes: player.mp4_bytes.clone(),
+                                    source_video_path: disk_video_path.clone(),
+                                    video_last_sec: None,
+                                    video_trim_start: None,
+                                    video_trim_end: None,
+                                    video_work_mode: Some(self.video_work_mode),
                                 };
                                 self.nodes.push(node);
                                 self.active_node_id = Some(id);
                             }
                             self.video_player = Some(player);
+                            self.canvas_zoom = 1.0;
+                            self.canvas_pan = vec2(0.0, 0.0);
+                            self.video_pan_drag_active = false;
                             self.trim_undo_stack.clear();
                             self.trim_redo_stack.clear();
                         }
@@ -1876,11 +2745,13 @@ impl App {
                     self.total_gen_progress = None;
                     self.preview_tex = None;
                     self.is_swapping_detected = false;
+        self.stall_prompt.store(false, Ordering::SeqCst);
+        self.stall_keep_waiting.store(false, Ordering::SeqCst);
                     self.queue.clear();
                     if e == "Cancelled" {
                         self.status = "Cancelled".into();
                         self.generation_retries = 0;
-                    } else if (e.contains("stalled") || e.contains("stopped") || e.contains("without producing")) && self.generation_retries < 1 {
+                    } else if (e.contains("stopped") || e.contains("without producing")) && self.generation_retries < 1 {
                         self.generation_retries += 1;
                         self.status = "Engine stalled; automatically retrying generation (1/1)...".into();
                         let retry_prompt = if !self.generating_prompt.trim().is_empty() {
@@ -1900,7 +2771,7 @@ impl App {
                         self.error = Some(e);
                     }
                     if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
-                        self.prompt = self.generating_prompt.clone();
+                        self.prompt = crate::lora::strip_prompt_tags(self.active_prompt_tags(), &self.generating_prompt);
                     }
                 }
             }
@@ -2380,19 +3251,34 @@ fn is_win_ctrl_v() -> bool {
 
     fn handle_input(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        let mut need_base = self.active_node().is_none();
-        for p in dropped {
-            let is_vid = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"))
-                .unwrap_or(false);
-            if is_vid {
-                self.load_video_file(ctx, p);
-            } else {
-                let t = if need_base { Target::Base } else { Target::Ref };
-                need_base = false;
-                self.load(ctx, t, Src::Path(p));
+        if !dropped.is_empty() {
+            let drop_pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()));
+            let dropped_in_refs = drop_pos.is_some_and(|pos| {
+                self.refs_drop_rect
+                    .is_some_and(|r| r.expand(6.0).contains(pos))
+            });
+            let dropped_in_canvas = drop_pos.is_some_and(|pos| {
+                self.canvas_drop_rect.is_some_and(|r| r.contains(pos))
+            });
+            let mut need_base = self.active_node().is_none();
+            for p in dropped {
+                let is_vid = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"))
+                    .unwrap_or(false);
+                if is_vid {
+                    self.load_video_file(ctx, p);
+                } else if dropped_in_refs {
+                    self.load(ctx, Target::Ref, Src::Path(p));
+                } else if dropped_in_canvas {
+                    self.load(ctx, Target::Base, Src::Path(p));
+                    need_base = false;
+                } else {
+                    let t = if need_base { Target::Base } else { Target::Ref };
+                    need_base = false;
+                    self.load(ctx, t, Src::Path(p));
+                }
             }
         }
         let win_down = Self::is_win_ctrl_v();
@@ -2471,8 +3357,8 @@ fn is_win_ctrl_v() -> bool {
         if self.generating {
             return Err("Generating...");
         }
-        if self.prompt.trim().is_empty() {
-            return Err("Type a prompt to generate or edit");
+        if !self.has_prompt_content() && !self.is_edit_video_mode() {
+            return Err("Type a prompt or pick an Edit LoRA");
         }
         let st = self.sh.state.lock().unwrap().clone();
         if !matches!(st, EngState::Ready { .. }) {
@@ -2480,6 +3366,11 @@ fn is_win_ctrl_v() -> bool {
         }
         self.can_queue()?;
         if self.mode == StudioMode::Video {
+            if crate::lora::has_active_h3_lora(&self.video_loras, &self.lora_browser.items)
+                && self.effective_video_profile().is_none()
+            {
+                return Err("MiniMax H3 model required for Viggle Remake / Style Transfer");
+            }
             if !self.has_video_models() {
                 return Err("Downloading video models - prompt will be queued");
             }
@@ -2685,6 +3576,8 @@ fn is_win_ctrl_v() -> bool {
     }
 
     fn render_refs_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_h: Option<f32>, subtitle: &str, compact: bool) {
+        let mut remove = None;
+        let refs_resp = ui.vertical(|ui| {
         ui.horizontal(|ui| {
             heading(ui, "REFERENCES");
             ui.label(RichText::new(format!("{}/{}", self.refs.len(), MAX_REFS)).color(DIM).size(11.0));
@@ -2692,7 +3585,6 @@ fn is_win_ctrl_v() -> bool {
         ui.label(RichText::new(subtitle).color(DIM).size(if compact { 10.5 } else { 11.0 }));
         ui.add_space(if compact { 2.0 } else { 3.0 });
 
-        let mut remove = None;
         let thumb_sz = if compact { 44.0 } else { 50.0 };
         let mut area = egui::ScrollArea::vertical().id_salt("refs_scroll");
         if let Some(h) = max_h {
@@ -2738,6 +3630,8 @@ fn is_win_ctrl_v() -> bool {
                 self.pick_images(ctx, Target::Ref, true);
             }
         });
+        });
+        self.refs_drop_rect = Some(refs_resp.response.rect);
 
         if let Some(i) = remove {
             self.refs.remove(i);
@@ -2747,25 +3641,30 @@ fn is_win_ctrl_v() -> bool {
     // Left Panel: Compact Reference Strip (+ Docked History / Video Trim History)
     fn refs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.mode == StudioMode::Video {
-            let vprof = self.sh.active_video_profile.lock().unwrap().clone();
+            let vprof = self
+                .effective_video_profile()
+                .unwrap_or_else(|| self.sh.active_video_profile.lock().unwrap().clone());
             let is_h3 = vprof.is_minimax_h3();
+            let is_h3_v2v_edit = is_h3 && self.is_edit_video_mode();
             let models_dir = self.active_video_models_dir();
             let has_r2v = !is_h3 || (!models_dir.as_os_str().is_empty() && vprof.has_r2v_model(&models_dir));
             let avail_h = ui.available_height();
             let refs_max_h = (avail_h * 0.30).clamp(90.0, 200.0);
-            let sub = if is_h3 {
+            let sub = if is_h3_v2v_edit {
+                "Optional keyframe/style refs (<Picture 1>..) — works with base H3 (no Ref2VA needed)"
+            } else if is_h3 {
                 "R2V refs (<Picture 1>..) or End Frame"
             } else {
                 "Reference images (switch to MiniMax H3 for R2V)"
             };
             self.render_refs_list(ui, ctx, Some(refs_max_h), sub, true);
-            if is_h3 && !self.refs.is_empty() {
+            if is_h3 && !is_h3_v2v_edit && !self.refs.is_empty() {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.video_r2v_mode, false, "End Frame");
                     ui.selectable_value(&mut self.video_r2v_mode, true, "R2V Multi-Ref");
                 });
             }
-            if is_h3 && !has_r2v {
+            if is_h3 && !is_h3_v2v_edit && !has_r2v {
                 if let Some(r2v_file) = vprof.r2v_model_file() {
                     let r2v_gb = r2v_file.size_bytes as f64 / 1_000_000_000.0;
                     let r2v_dl = self.sh.dl_r2v_model.load(Ordering::SeqCst);
@@ -2823,28 +3722,104 @@ fn is_win_ctrl_v() -> bool {
                 }
             }
             ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-            self.render_trim_history_ui(ui, ctx);
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            self.render_history_ui(ui);
+            self.render_left_lora_history_split(ui, ctx, true);
             return;
         }
+        if !self.lora_browser.remote_fetched && !self.lora_browser.remote_fetching {
+            crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ctx);
+        }
+        let avail_h = ui.available_height();
         if self.history_dock == HistoryDock::Left {
-            let avail_h = ui.available_height();
-            let refs_max_h = (avail_h * 0.40).clamp(110.0, 240.0);
+            let refs_max_h = (avail_h * 0.28).clamp(90.0, 180.0);
             self.render_refs_list(ui, ctx, Some(refs_max_h), "Drag extra images for reference", true);
 
             ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            self.render_history_ui(ui);
+            self.render_left_lora_history_split(ui, ctx, false);
         } else {
-            self.render_refs_list(ui, ctx, None, "Drag extra images here for reference", false);
+            let refs_max_h = (avail_h * 0.36).clamp(100.0, 240.0);
+            self.render_refs_list(ui, ctx, Some(refs_max_h), "Drag extra images here for reference", true);
+
+            let lora_max_h = (ui.available_height() - 48.0).max(160.0);
+            ui.add_space(4.0);
+            self.render_image_lora_card(ui, ctx, Some(lora_max_h));
         }
+    }
+
+    /// Renders the squishy middle LoRA (and optional Video Trim History) pane, a draggable
+    /// horizontal resizing bar, and the bottom History pane locked at `self.left_history_h`.
+    fn render_left_lora_history_split(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, is_video: bool) {
+        let rem_h = ui.available_height();
+        let usable_h = (rem_h - LEFT_SPLIT_BAR_H).max(0.0);
+        let min_hist_h = LEFT_HISTORY_MIN_H.min((usable_h - LEFT_LORA_MIN_H).max(0.0));
+        let max_hist_h = (usable_h - LEFT_LORA_MIN_H).max(min_hist_h);
+        let hist_box_h = self.left_history_h.clamp(min_hist_h, max_hist_h);
+        let middle_box_h = (usable_h - hist_box_h).max(0.0);
+
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), middle_box_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_height(middle_box_h);
+                egui::ScrollArea::vertical()
+                    .id_salt(if is_video { "left_video_mid_scroll" } else { "left_image_mid_scroll" })
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if is_video {
+                            let has_trim = self.video_player.is_some();
+                            let trim_reserve = if has_trim { 110.0 } else { 0.0 };
+                            let lora_overhead = 52.0 + self.video_loras.len() as f32 * 48.0 + trim_reserve;
+                            let lora_max_h = (middle_box_h - lora_overhead).max(64.0);
+                            self.render_video_lora_card(ui, ctx, Some(lora_max_h));
+                            if has_trim {
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                self.render_trim_history_ui(ui, ctx);
+                            }
+                        } else {
+                            let lora_overhead = 48.0 + self.image_loras.len() as f32 * 48.0;
+                            let lora_max_h = (middle_box_h - lora_overhead).max(64.0);
+                            self.render_image_lora_card(ui, ctx, Some(lora_max_h));
+                        }
+                    });
+            },
+        );
+
+        let (bar_rect, bar_resp) = ui.allocate_exact_size(
+            vec2(ui.available_width(), LEFT_SPLIT_BAR_H),
+            Sense::drag(),
+        );
+        if bar_resp.hovered() || bar_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        if bar_resp.dragged() {
+            let dy = bar_resp.drag_delta().y;
+            let drag_max = max_hist_h.max(LEFT_HISTORY_MIN_H);
+            self.left_history_h = (hist_box_h - dy).clamp(LEFT_HISTORY_MIN_H, drag_max);
+        }
+        if ui.is_rect_visible(bar_rect) {
+            let p = ui.painter();
+            let active = bar_resp.hovered() || bar_resp.dragged();
+            let line_col = if active { ACCENT_GLOW } else { LINE };
+            let grip_col = if active { ACCENT_GLOW } else { DIM };
+            let y = bar_rect.center().y;
+            p.line_segment(
+                [pos2(bar_rect.left(), y), pos2(bar_rect.right(), y)],
+                Stroke::new(1.0, line_col),
+            );
+            let pill = Rect::from_center_size(bar_rect.center(), vec2(34.0, 3.0));
+            p.rect_filled(pill, 1.5, grip_col);
+        }
+        bar_resp.on_hover_text("Drag to resize LoRA and History panes");
+
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), hist_box_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_height(hist_box_h);
+                self.render_history_ui(ui);
+            },
+        );
     }
 
     fn render_orientation_button(
@@ -2895,13 +3870,258 @@ fn is_win_ctrl_v() -> bool {
         resp
     }
 
+    fn render_image_lora_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_scroll_h: Option<f32>) {
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                heading(ui, "IMAGE LORA");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Refresh").on_hover_text("Rescan models/loras and ComfyUI LoRA browser thumbnails").clicked() {
+                        self.lora_browser.items = crate::lora::scan_local_loras(&self.sh);
+                        self.lora_browser.thumbs.clear();
+                        self.lora_browser.loading_thumbs.clear();
+                        self.lora_browser.remote_fetched = false;
+                        crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ctx);
+                    }
+                });
+            });
+            crate::lora::render_lora_carousel_filtered(
+                ui,
+                ctx,
+                &self.sh,
+                &mut self.lora_browser,
+                &mut self.image_loras,
+                &mut self.image_prompt_tags,
+                crate::lora::LoraModelFamily::QwenImage21,
+                None,
+                None,
+                max_scroll_h,
+            );
+        });
+    }
+
+    fn render_video_lora_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, max_scroll_h: Option<f32>) {
+        let vprof = self
+            .effective_video_profile()
+            .unwrap_or_else(|| self.sh.active_video_profile.lock().unwrap().clone());
+        let lora_family = crate::lora::LoraModelFamily::from_video_profile(&vprof);
+
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let is_edit = self.video_work_mode == VideoWorkMode::Edit;
+                heading(ui, if is_edit { "EDIT EFFECTS" } else { "GENERATE LORAS" });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Refresh").on_hover_text("Rescan models/loras and ComfyUI LoRA browser thumbnails").clicked() {
+                        self.lora_browser.items = crate::lora::scan_local_loras(&self.sh);
+                        self.lora_browser.thumbs.clear();
+                        self.lora_browser.loading_thumbs.clear();
+                        self.lora_browser.remote_fetched = false;
+                        crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ctx);
+                    }
+                    if ui
+                        .selectable_label(!is_edit, "Generate")
+                        .on_hover_text("Generate a new video from text or current frame (prefers MiniMax H3)")
+                        .clicked()
+                        && is_edit
+                    {
+                        self.set_video_work_mode(VideoWorkMode::Generate);
+                    }
+                    if ui
+                        .selectable_label(is_edit, "Edit")
+                        .on_hover_text("Edit loaded video with H3 (Viggle Remake / Style Transfer) or LTX IC-LoRAs")
+                        .clicked()
+                        && !is_edit
+                    {
+                        self.set_video_work_mode(VideoWorkMode::Edit);
+                    }
+                });
+            });
+            let (carousel_family, ic_filter) = if self.video_work_mode == VideoWorkMode::Edit {
+                (crate::lora::LoraModelFamily::VideoEditAll, Some(true))
+            } else {
+                (lora_family, Some(false))
+            };
+            let allow_multi = self.sh.cfg.lock().unwrap().allow_multi_video_loras;
+            let lora_vram = self.active_video_lora_vram_gb();
+            let current_est_vram_gb = estimate_video_vram_gb_with_lora(
+                self.video_width,
+                self.video_height,
+                self.video_duration,
+                self.video_fps,
+                lora_vram,
+            );
+            let multi_policy = crate::lora::MultiLoraPolicy {
+                allow_multi,
+                current_est_vram_gb,
+                gpu_vram_gb: engine::detect_gpu_vram_gb(),
+            };
+            let edit_loras_disabled = self.video_work_mode == VideoWorkMode::Edit && self.video_player.is_none();
+            let carousel_resp = ui.add_enabled_ui(!edit_loras_disabled, |ui| {
+                crate::lora::render_lora_carousel_with_policy(
+                    ui,
+                    ctx,
+                    &self.sh,
+                    &mut self.lora_browser,
+                    &mut self.video_loras,
+                    &mut self.video_prompt_tags,
+                    carousel_family,
+                    Some((vprof.default_steps, &mut self.video_steps)),
+                    ic_filter,
+                    max_scroll_h,
+                    Some(multi_policy),
+                );
+            });
+            if edit_loras_disabled {
+                carousel_resp
+                    .response
+                    .on_disabled_hover_text("Video editing only — load or drop a video clip to use Edit LoRAs");
+            }
+
+            if self.video_player.is_none()
+                && crate::lora::remove_ic_loras(
+                    &mut self.video_loras,
+                    &mut self.video_prompt_tags,
+                    &self.lora_browser.items,
+                )
+            {
+                self.edit_lora_needs_video_until =
+                    Some(Instant::now() + std::time::Duration::from_secs_f32(2.0));
+                ctx.request_repaint();
+            }
+
+            let now = Instant::now();
+            let flash_rem = self
+                .edit_lora_needs_video_until
+                .and_then(|until| until.checked_duration_since(now));
+            if flash_rem.is_none() {
+                self.edit_lora_needs_video_until = None;
+            } else {
+                ctx.request_repaint();
+            }
+
+            if self.video_work_mode == VideoWorkMode::Edit
+                && crate::lora::has_active_h3_lora(&self.video_loras, &self.lora_browser.items)
+            {
+                let vdir = self.active_video_models_dir();
+                let h3_ready = !vdir.as_os_str().is_empty()
+                    && engine::Profile::find_best_downloaded_h3_profile(&vdir).is_some();
+                if !h3_ready {
+                    ui.add_space(6.0);
+                    let mut download_rec_h3 = false;
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(56, 36, 18))
+                        .stroke(Stroke::new(1.0, AMBER))
+                        .corner_radius(5.0)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("MiniMax H3 model required for Viggle Remake / Style Transfer.")
+                                        .size(10.5)
+                                        .strong()
+                                        .color(AMBER),
+                                );
+                                if ui.small_button("Download Recommended H3").clicked() {
+                                    download_rec_h3 = true;
+                                }
+                            });
+                        });
+                    if download_rec_h3 {
+                        let rec_id = crate::model_picker::recommended_video_profile_id(
+                            crate::model_picker::VideoFamily::MiniMaxH3,
+                            engine::detect_gpu_vram_gb(),
+                        );
+                        if let Some(rec_prof) = engine::Profile::all_video_profiles()
+                            .into_iter()
+                            .find(|p| p.id == rec_id)
+                        {
+                            {
+                                let mut c = self.sh.cfg.lock().unwrap();
+                                c.dl_video_model = true;
+                                c.save();
+                            }
+                            self.sh.dl_video_model.store(true, Ordering::SeqCst);
+                            self.apply_video_profile(&rec_prof, ctx);
+                            self.download_pane.is_expanded = true;
+                            self.download_pane.user_opened = true;
+                        }
+                    }
+                }
+            }
+
+            if self.video_work_mode == VideoWorkMode::Edit || self.is_edit_video_mode() || flash_rem.is_some() {
+                ui.add_space(6.0);
+                let has_vid = self.video_player.is_some();
+                let is_flashing = !has_vid
+                    && flash_rem.is_some_and(|d| ((d.as_millis() / 220) % 2) == 0);
+                let border_col = if has_vid {
+                    DISCORD_GREEN
+                } else if is_flashing {
+                    Color32::from_rgb(248, 113, 113)
+                } else {
+                    AMBER
+                };
+                let fill_col = if is_flashing {
+                    Color32::from_rgb(68, 28, 34)
+                } else {
+                    Color32::from_rgb(24, 29, 42)
+                };
+                let mut pick_vid = false;
+                egui::Frame::NONE
+                    .fill(fill_col)
+                    .stroke(Stroke::new(if is_flashing { 1.8 } else { 1.0 }, border_col.linear_multiply(0.85)))
+                    .corner_radius(5.0)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("VIDEO EDIT MODE (IC-LoRA)")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(border_col),
+                            );
+                            if let Some(ref vp) = self.video_player {
+                                ui.label(
+                                    RichText::new(format!("Source: {}", vp.filename))
+                                        .size(10.5)
+                                        .color(TEXT),
+                                );
+                            } else {
+                                let msg = if flash_rem.is_some() {
+                                    "Choose or drop a video first!"
+                                } else {
+                                    "Load a video to edit"
+                                };
+                                ui.label(
+                                    RichText::new(msg)
+                                        .size(10.5)
+                                        .strong()
+                                        .color(border_col),
+                                );
+                                if ui.small_button("Load Video...").clicked() {
+                                    pick_vid = true;
+                                }
+                            }
+                        });
+                    });
+                if pick_vid {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Video", &["mp4", "mov", "mkv", "webm", "avi"])
+                        .pick_file()
+                    {
+                        self.load_video_file(ctx, path);
+                    }
+                }
+            }
+        });
+    }
+
     fn render_video_settings(&mut self, ui: &mut egui::Ui) {
         let active_vprof = self.sh.active_video_profile.lock().unwrap().clone();
         let vprof = self.effective_video_profile().unwrap_or_else(|| active_vprof.clone());
         let is_fallback = vprof.id != active_vprof.id;
         let is_h3 = vprof.is_minimax_h3();
         let is_ltx25 = vprof.is_ltx25();
-        let lora_family = crate::lora::VideoModelFamily::from_profile(&vprof);
+        let _lora_family = crate::lora::LoraModelFamily::from_video_profile(&vprof);
 
         if !self.lora_browser.remote_fetched && !self.lora_browser.remote_fetching {
             crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ui.ctx());
@@ -2919,13 +4139,16 @@ fn is_win_ctrl_v() -> bool {
                 });
                 ui.label(RichText::new(&vprof.name).size(11.5).strong().color(TEXT));
                 if is_fallback {
+                    let vdir = self.active_video_models_dir();
+                    let msg = if !vdir.as_os_str().is_empty() && active_vprof.missing_in_dir(&vdir).is_empty() {
+                        format!("Using {} for video edit / LTX LoRA (active: {}).", vprof.name, active_vprof.name)
+                    } else {
+                        format!("Using {} while {} downloads in background.", vprof.name, active_vprof.name)
+                    };
                     ui.label(
-                        RichText::new(format!(
-                            "Using {} while {} downloads in background.",
-                            vprof.name, active_vprof.name
-                        ))
-                        .size(10.5)
-                        .color(AMBER),
+                        RichText::new(msg)
+                            .size(10.5)
+                            .color(AMBER),
                     );
                 }
                 if let Some(gpu_vram) = engine::detect_gpu_vram_gb() {
@@ -3069,13 +4292,21 @@ fn is_win_ctrl_v() -> bool {
                         ui.label(RichText::new(format!("{:.2}x ({:.0}%)", self.video_scale, self.video_scale * 100.0)).size(11.5).strong());
                     });
                 });
-                let slider = egui::Slider::new(&mut self.video_scale, 0.25..=2.0)
-                    .step_by(0.05)
+                let (v_min, v_max) = absolute_scale_range(self.video_base_w, self.video_base_h, ABS_MIN_RES, ABS_MAX_RES);
+                let slider = egui::Slider::new(&mut self.video_scale, v_min..=v_max)
                     .show_value(false);
                 let s_resp = ui.add(slider);
                 if s_resp.changed() {
-                    self.video_width = (((self.video_base_w as f32 * self.video_scale) / 32.0).round() as u32 * 32).clamp(256, 4096);
-                    self.video_height = (((self.video_base_h as f32 * self.video_scale) / 32.0).round() as u32 * 32).clamp(256, 4096);
+                    let (vw, vh) = scale_dimensions_stepped(
+                        self.video_base_w,
+                        self.video_base_h,
+                        self.video_scale,
+                        32,
+                        ABS_MIN_RES,
+                        ABS_MAX_RES,
+                    );
+                    self.video_width = vw;
+                    self.video_height = vh;
                 }
 
                 ui.add_space(4.0);
@@ -3083,11 +4314,11 @@ fn is_win_ctrl_v() -> bool {
                 // 4. Custom dimensions & live display
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Custom:").size(11.0).color(DIM));
-                    let w_resp = ui.add(egui::DragValue::new(&mut self.video_width).speed(32).range(256..=4096).prefix("W: "));
-                    let h_resp = ui.add(egui::DragValue::new(&mut self.video_height).speed(32).range(256..=4096).prefix("H: "));
+                    let w_resp = ui.add(egui::DragValue::new(&mut self.video_width).speed(32).range(ABS_MIN_RES..=ABS_MAX_RES).prefix("W: "));
+                    let h_resp = ui.add(egui::DragValue::new(&mut self.video_height).speed(32).range(ABS_MIN_RES..=ABS_MAX_RES).prefix("H: "));
                     if w_resp.changed() || h_resp.changed() {
-                        self.video_width = (self.video_width / 32) * 32;
-                        self.video_height = (self.video_height / 32) * 32;
+                        self.video_width = ((self.video_width as f32 / 32.0).round() as u32 * 32).clamp(ABS_MIN_RES, ABS_MAX_RES);
+                        self.video_height = ((self.video_height as f32 / 32.0).round() as u32 * 32).clamp(ABS_MIN_RES, ABS_MAX_RES);
                         self.video_base_w = self.video_width;
                         self.video_base_h = self.video_height;
                         self.video_scale = 1.0;
@@ -3102,7 +4333,13 @@ fn is_win_ctrl_v() -> bool {
 
                 // 5. Dynamic VRAM estimate and excessive swap warning card
                 let vram_detected = engine::detect_gpu_vram_gb();
-                let est_vram = estimate_video_vram_gb(self.video_width, self.video_height, self.video_duration, self.video_fps);
+                let lora_vram = self.active_video_lora_vram_gb();
+                let est_vram = estimate_video_vram_gb_with_lora(self.video_width, self.video_height, self.video_duration, self.video_fps, lora_vram);
+                let lora_note = if lora_vram > 0.0 {
+                    format!(", +{lora_vram:.1} GB LoRA")
+                } else {
+                    String::new()
+                };
 
                 if let Some(gpu_vram) = vram_detected {
                     if est_vram > gpu_vram as f32 {
@@ -3113,12 +4350,13 @@ fn is_win_ctrl_v() -> bool {
                             .corner_radius(6)
                             .inner_margin(egui::Margin::same(8))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("[!] High VRAM Load Warning").strong().color(AMBER));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(RichText::new(format!("Est: {:.1} GB / {} GB VRAM", est_vram, gpu_vram)).size(10.5).color(AMBER));
-                                    });
-                                });
+                                ui.label(RichText::new("[!] High VRAM Load Warning").strong().color(AMBER));
+                                ui.label(
+                                    RichText::new(format!("Est: {:.1} GB / {} GB VRAM{}", est_vram, gpu_vram, lora_note))
+                                        .size(10.5)
+                                        .color(AMBER),
+                                );
+                                ui.add_space(2.0);
                                 ui.label(
                                     RichText::new("This resolution & duration combination exceeds your GPU's dedicated VRAM. Windows will use shared system RAM paging, causing generation steps to slow down by 10x-100x or appear stalled.\n\nTip: Reduce duration, lower the Resolution Scale slider, or choose 480p / 360p for fast generation.")
                                         .size(10.5)
@@ -3127,31 +4365,34 @@ fn is_win_ctrl_v() -> bool {
                             });
                     } else if est_vram > (gpu_vram as f32 - 1.5) {
                         ui.add_space(2.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("[i] Near VRAM capacity").size(10.5).color(AMBER));
-                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB)", est_vram, gpu_vram)).size(10.5).color(DIM));
+                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB{})", est_vram, gpu_vram, lora_note)).size(10.5).color(DIM));
                         });
                     } else {
                         ui.add_space(2.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("[OK] Within VRAM budget").size(10.5).color(GREEN));
-                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB)", est_vram, gpu_vram)).size(10.5).color(DIM));
+                            ui.label(RichText::new(format!("(Est. {:.1} GB / {} GB{})", est_vram, gpu_vram, lora_note)).size(10.5).color(DIM));
                         });
                     }
                 } else if est_vram >= 14.0 {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!("[!] Heavy load (Est. {:.1} GB VRAM required). May cause RAM swapping on GPUs with <16GB.", est_vram)).size(10.5).color(AMBER));
+                    ui.label(RichText::new(format!("[!] Heavy load (Est. {:.1} GB VRAM required{}). May cause RAM swapping on GPUs with <16GB.", est_vram, lora_note)).size(10.5).color(AMBER));
                 }
             });
 
             ui.add_space(6.0);
 
             card(ui, |ui| {
-                heading(ui, "DURATION & FRAMERATE");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Duration:").size(11.5).color(TEXT));
-                    ui.add(egui::Slider::new(&mut self.video_duration, 1..=15).suffix("s"));
-                });
+                let edit_mode = self.is_edit_video_mode();
+                heading(ui, if edit_mode { "CLIP TRIM & FRAMERATE" } else { "DURATION & FRAMERATE" });
+                if !edit_mode {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Duration:").size(11.5).color(TEXT));
+                        ui.add(egui::Slider::new(&mut self.video_duration, 1..=15).suffix("s"));
+                    });
+                }
 
                 if is_h3 {
                     self.video_fps = 24;
@@ -3160,7 +4401,9 @@ fn is_win_ctrl_v() -> bool {
                     let snapped = raw_frames + rem;
                     ui.label(RichText::new(format!("Output grid: {} frames ({}s @ 24 fps)", snapped, self.video_duration)).size(11.0).color(DIM));
                 } else {
-                    ui.add_space(4.0);
+                    if !edit_mode {
+                        ui.add_space(4.0);
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Framerate:").size(11.5).color(TEXT));
                         for fps_opt in [24, 25, 30] {
@@ -3171,9 +4414,33 @@ fn is_win_ctrl_v() -> bool {
                         }
                     });
 
-                    let total_frames = self.video_duration * self.video_fps;
                     ui.add_space(2.0);
-                    ui.label(RichText::new(format!("Total frames: {} frames ({}s @ {} fps)", total_frames, self.video_duration, self.video_fps)).size(11.0).color(DIM));
+                    if edit_mode {
+                        if let Some(ref vp) = self.video_player {
+                            let ts = vp.trim_start();
+                            let te = vp.trim_end();
+                            let tdur = (te - ts).max(0.2);
+                            let raw_frames = (tdur * self.video_fps as f64).round() as u32;
+                            let snapped = ((raw_frames.saturating_sub(1)) / 8).max(1) * 8 + 1;
+                            ui.label(
+                                RichText::new(format!(
+                                    "Editing trim: {:.2}s ({:.2}s – {:.2}s) · {} frames @ {} fps",
+                                    tdur, ts, te, snapped, self.video_fps
+                                ))
+                                .size(11.0)
+                                .color(DIM),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Uses loaded clip length (set trim markers on timeline)")
+                                    .size(11.0)
+                                    .color(DIM),
+                            );
+                        }
+                    } else {
+                        let total_frames = self.video_duration * self.video_fps;
+                        ui.label(RichText::new(format!("Total frames: {} frames ({}s @ {} fps)", total_frames, self.video_duration, self.video_fps)).size(11.0).color(DIM));
+                    }
                 }
             });
 
@@ -3195,61 +4462,69 @@ fn is_win_ctrl_v() -> bool {
             ui.add_space(6.0);
 
             card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    heading(ui, "VIDEO LORA");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Refresh").on_hover_text("Rescan models/loras and ComfyUI LoRA browser thumbnails").clicked() {
-                            self.lora_browser.items = crate::lora::scan_local_loras(&self.sh);
-                            self.lora_browser.thumbs.clear();
-                            self.lora_browser.loading_thumbs.clear();
-                            self.lora_browser.remote_fetched = false;
-                            crate::lora::fetch_comfy_lora_browser_async(&mut self.lora_browser, ui.ctx());
-                        }
-                    });
-                });
-                let ctx = ui.ctx().clone();
-                crate::lora::render_lora_carousel(
-                    ui,
-                    &ctx,
-                    &mut self.lora_browser,
-                    &mut self.video_lora,
-                    &mut self.video_lora_strength,
-                    lora_family,
-                    vprof.default_steps,
-                    &mut self.video_steps,
-                );
-            });
-
-            ui.add_space(6.0);
-
-            card(ui, |ui| {
                 heading(ui, "SAMPLING & SEED");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Sampler:").size(11.0).color(TEXT));
-                    egui::ComboBox::from_id_salt("video_sampler_combo")
-                        .selected_text(&self.video_sampler)
-                        .show_ui(ui, |ui| {
-                            for s in ["er_sde", "euler", "res_multistep", "euler_ancestral", "dpmpp_2m_sde"] {
-                                ui.selectable_value(&mut self.video_sampler, s.to_string(), s);
-                            }
-                        });
-                });
                 if is_h3 {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Scheduler:").size(11.0).color(TEXT));
-                        egui::ComboBox::from_id_salt("video_scheduler_combo")
-                            .selected_text(&self.video_scheduler)
-                            .show_ui(ui, |ui| {
-                                for sc in ["sgm_uniform", "simple", "beta", "normal"] {
-                                    ui.selectable_value(&mut self.video_scheduler, sc.to_string(), sc);
-                                }
-                            });
-                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Steps:").size(11.0).color(TEXT));
                         ui.add(egui::Slider::new(&mut self.video_steps, 4..=40));
                     });
+                    let (step_note, step_color) = match self.video_steps {
+                        ..=7 => ("Quality starts to be compromised at 7 steps or below.", AMBER),
+                        8..=13 => ("Faster", DIM),
+                        14..=20 => ("Quality", DIM),
+                        _ => ("Diminishing returns kick in at 21 steps or above.", AMBER),
+                    };
+                    ui.label(RichText::new(step_note).size(10.5).color(step_color));
+                    ui.add_space(2.0);
+                    egui::CollapsingHeader::new(RichText::new("Advanced").size(11.0).color(DIM))
+                        .id_salt("h3_sampling_advanced")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Sampler:").size(11.0).color(TEXT));
+                                egui::ComboBox::from_id_salt("video_sampler_combo")
+                                    .selected_text(&self.video_sampler)
+                                    .show_ui(ui, |ui| {
+                                        for s in ["er_sde", "seeds_2", "euler", "res_multistep", "euler_ancestral", "dpmpp_2m_sde"] {
+                                            ui.selectable_value(&mut self.video_sampler, s.to_string(), s);
+                                        }
+                                    });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Scheduler:").size(11.0).color(TEXT));
+                                egui::ComboBox::from_id_salt("video_scheduler_combo")
+                                    .selected_text(&self.video_scheduler)
+                                    .show_ui(ui, |ui| {
+                                        for sc in ["sgm_uniform", "ddim_uniform", "simple", "beta", "normal"] {
+                                            ui.selectable_value(&mut self.video_scheduler, sc.to_string(), sc);
+                                        }
+                                    });
+                            });
+                            if ui.small_button("Return to default").clicked() {
+                                let eff = self.effective_video_profile();
+                                self.video_sampler = eff
+                                    .as_ref()
+                                    .map(|p| p.sampler.clone())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "er_sde".to_string());
+                                self.video_scheduler = eff
+                                    .as_ref()
+                                    .map(|p| p.scheduler.clone())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "sgm_uniform".to_string());
+                            }
+                        });
                 } else {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Sampler:").size(11.0).color(TEXT));
+                        egui::ComboBox::from_id_salt("video_sampler_combo")
+                            .selected_text(&self.video_sampler)
+                            .show_ui(ui, |ui| {
+                                for s in ["er_sde", "euler", "res_multistep", "euler_ancestral", "dpmpp_2m_sde"] {
+                                    ui.selectable_value(&mut self.video_sampler, s.to_string(), s);
+                                }
+                            });
+                    });
                     ui.label(RichText::new("Distilled 2-stage schedule (8 + 3 steps @ CFG 1.0)").size(10.5).color(DIM));
                 }
                 ui.add_space(2.0);
@@ -3633,8 +4908,10 @@ fn is_win_ctrl_v() -> bool {
                         ui.label(RichText::new(format!("{:.2}x ({:.0}%)", self.scale, self.scale * 100.0)).size(11.5).strong());
                     });
                 });
-                let slider = egui::Slider::new(&mut self.scale, 0.10..=2.00)
-                    .step_by(0.05)
+                let base_w = if self.ref_w > 0 { self.ref_w } else { self.custom_w.max(ABS_MIN_RES) };
+                let base_h = if self.ref_h > 0 { self.ref_h } else { self.custom_h.max(ABS_MIN_RES) };
+                let (i_min, i_max) = absolute_scale_range(base_w, base_h, ABS_MIN_RES, ABS_MAX_RES);
+                let slider = egui::Slider::new(&mut self.scale, i_min..=i_max)
                     .show_value(false);
                 let resp = ui.add(slider);
                 if resp.changed() {
@@ -3770,12 +5047,35 @@ fn is_win_ctrl_v() -> bool {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.history_dock != HistoryDock::Floating {
-                    let drag_resp = ui.add(
-                        egui::Label::new(RichText::new("⠿ Drag to undock").size(10.5).color(DIM))
-                            .sense(egui::Sense::drag())
-                    );
-                    if drag_resp.hovered() {
+                    let font_id = egui::FontId::proportional(10.5);
+                    let galley = ui.painter().layout_no_wrap("Drag to undock".to_string(), font_id.clone(), DIM);
+                    let grip_w = 10.0;
+                    let gap = 4.0;
+                    let total_size = vec2(grip_w + gap + galley.size().x, galley.size().y.max(14.0));
+                    let (drag_rect, drag_resp) = ui.allocate_exact_size(total_size, egui::Sense::drag());
+                    if drag_resp.hovered() || drag_resp.dragged() {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    }
+                    if ui.is_rect_visible(drag_rect) {
+                        let p = ui.painter();
+                        let col = if drag_resp.hovered() || drag_resp.dragged() { TEXT } else { DIM };
+                        let grip_cx = drag_rect.left() + grip_w * 0.5;
+                        let grip_cy = drag_rect.center().y;
+                        for col_idx in [-1.0_f32, 0.0, 1.0] {
+                            for row_idx in [-0.5_f32, 0.5] {
+                                p.circle_filled(
+                                    pos2(grip_cx + col_idx * 3.2, grip_cy + row_idx * 3.5),
+                                    1.05,
+                                    col,
+                                );
+                            }
+                        }
+                        let text_galley = p.layout_no_wrap("Drag to undock".to_string(), font_id, col);
+                        p.galley(
+                            pos2(drag_rect.left() + grip_w + gap, drag_rect.center().y - text_galley.size().y * 0.5),
+                            text_galley,
+                            col,
+                        );
                     }
                     if drag_resp.drag_started() {
                         self.history_dock = HistoryDock::Floating;
@@ -3802,16 +5102,13 @@ fn is_win_ctrl_v() -> bool {
                 self.redo();
             }
 
-            if self.nodes.len() > 1 {
+            if !self.nodes.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Clear").on_hover_text("Reset history and delete generated files").clicked() {
-                        let to_remove: Vec<usize> = self.nodes.iter().skip(1).map(|n| n.id).collect();
-                        for id in to_remove {
-                            self.delete_history_node(id);
-                        }
-                        if !self.nodes.is_empty() {
-                            self.select_node(self.nodes[0].id);
-                        }
+                    if ui.small_button("Clear").on_hover_text("Clear all entries from history (keeps files on disk)").clicked() {
+                        self.nodes.clear();
+                        self.active_node_id = None;
+                        self.video_player = None;
+                        self.compare_mode = false;
                     }
                 });
             }
@@ -3847,6 +5144,7 @@ fn is_win_ctrl_v() -> bool {
 
         let active_thread = self.active_thread_ids();
         let mut to_select = None;
+        let mut to_remove = None;
         let mut to_delete = None;
 
         egui::ScrollArea::vertical().id_salt("history_scroll").show(ui, |ui| {
@@ -3862,16 +5160,21 @@ fn is_win_ctrl_v() -> bool {
                         let card_w = ui.available_width();
                         let (card_rect, card_resp) = ui.allocate_exact_size(vec2(card_w, 38.0), Sense::click());
                         
-                        let del_btn_rect = Rect::from_center_size(pos2(card_rect.max.x - 14.0, card_rect.center().y), vec2(18.0, 18.0));
+                        let rm_btn_rect = Rect::from_center_size(pos2(card_rect.max.x - 13.0, card_rect.center().y), vec2(18.0, 18.0));
+                        let del_btn_rect = Rect::from_center_size(pos2(card_rect.max.x - 33.0, card_rect.center().y), vec2(18.0, 18.0));
+                        let rm_resp = ui.allocate_rect(rm_btn_rect, Sense::click());
                         let del_resp = ui.allocate_rect(del_btn_rect, Sense::click());
+                        let rm_hovered = rm_resp.hovered();
                         let del_hovered = del_resp.hovered();
 
-                        if del_resp.on_hover_text("Delete from history & disk").clicked() {
+                        if rm_resp.on_hover_text("Remove from history (keeps files on disk)").clicked() {
+                            to_remove = Some(node.id);
+                        } else if del_resp.on_hover_text("Move file to Recycle Bin and remove from history").clicked() {
                             to_delete = Some(node.id);
                         } else if card_resp.clicked() {
                             to_select = Some(node.id);
                         }
-                        if card_resp.hovered() && !del_hovered {
+                        if rm_hovered || del_hovered || card_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
 
@@ -3915,7 +5218,7 @@ fn is_win_ctrl_v() -> bool {
                         );
                         p.galley(pos2(text_left, card_rect.min.y + 5.0), title_galley, Color32::WHITE);
 
-                        let sub = if node.mp4_bytes.is_some() {
+                        let sub = if node.mp4_bytes.is_some() || node.source_video_path.is_some() {
                             format!("Video | {}x{}", node.width, node.height)
                         } else {
                             format!("Step {} | {}x{}", node.step_num, node.width, node.height)
@@ -3936,16 +5239,23 @@ fn is_win_ctrl_v() -> bool {
                             p.galley(fork_pos, fork_g, AMBER);
                         }
 
-                        // Render Delete Button
+                        // Render Delete Bin SVG & Remove (x) Buttons
                         if del_hovered {
                             p.rect_filled(del_btn_rect, 3, Color32::from_rgb(180, 45, 45));
-                            p.text(del_btn_rect.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), Color32::WHITE);
+                            draw_trash_icon(&p, del_btn_rect.center(), Color32::WHITE);
                         } else {
                             p.rect_filled(del_btn_rect, 3, Color32::from_white_alpha(15));
-                            p.text(del_btn_rect.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(12.0), DIM);
+                            draw_trash_icon(&p, del_btn_rect.center(), DIM);
+                        }
+                        if rm_hovered {
+                            p.rect_filled(rm_btn_rect, 3, Color32::from_rgb(72, 78, 96));
+                            p.text(rm_btn_rect.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), Color32::WHITE);
+                        } else {
+                            p.rect_filled(rm_btn_rect, 3, Color32::from_white_alpha(15));
+                            p.text(rm_btn_rect.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(12.0), DIM);
                         }
 
-                        if !node.prompt.is_empty() && !del_hovered {
+                        if !node.prompt.is_empty() && !del_hovered && !rm_hovered {
                             card_resp.on_hover_text(&node.prompt);
                         }
 
@@ -3955,8 +5265,10 @@ fn is_win_ctrl_v() -> bool {
             }
         });
 
-        if let Some(id) = to_delete {
-            self.delete_history_node(id);
+        if let Some(id) = to_remove {
+            self.remove_history_node(id);
+        } else if let Some(id) = to_delete {
+            self.request_delete_history_node(id);
         } else if let Some(id) = to_select {
             self.select_node(id);
         }
@@ -4086,9 +5398,12 @@ fn is_win_ctrl_v() -> bool {
         let mut pending_undo_snapshot: Option<TrimStateSnapshot> = None;
         let mut close_video = false;
         let mut save_video = false;
+        let is_edit_mode = self.is_edit_video_mode();
+        let mut toggle_work_mode: Option<VideoWorkMode> = None;
         let mut extract_frame = false;
         let mut trigger_trim = false;
         let mut interacted_with_trim = false;
+        let video_canvas_rect;
 
         {
             let player = match self.video_player.as_mut() {
@@ -4107,7 +5422,7 @@ fn is_win_ctrl_v() -> bool {
             if right_pressed {
                 player.step_frames(1);
             }
-            if i_pressed {
+            if is_edit_mode && i_pressed {
                 let snap = TrimStateSnapshot {
                     start: player.trim_start_sec,
                     end: player.trim_end_sec,
@@ -4118,7 +5433,7 @@ fn is_win_ctrl_v() -> bool {
                     interacted_with_trim = true;
                 }
             }
-            if o_pressed {
+            if is_edit_mode && o_pressed {
                 let snap = TrimStateSnapshot {
                     start: player.trim_start_sec,
                     end: player.trim_end_sec,
@@ -4146,42 +5461,64 @@ fn is_win_ctrl_v() -> bool {
                     if ui.button("Save MP4 as...").on_hover_text("Export raw video file").clicked() {
                         save_video = true;
                     }
-                    if ui.button("Use Frame as Base Image").on_hover_text("Extract current video frame as base image and switch to Image mode").clicked() {
-                        extract_frame = true;
+                    if self.mode == StudioMode::Video {
+                        if ui.button("Use Frame as Base Image").on_hover_text("Switch to Image mode while keeping this video scrubber to edit frames").clicked() {
+                            extract_frame = true;
+                        }
                     }
 
-                    // Drawn Scissors SVG + Trim & Compress button
-                    let trim_btn_label = if self.compress_enabled {
-                        "Trim & Compress"
-                    } else {
-                        "Trim / Export"
-                    };
-                    let (trim_rect, trim_resp) = ui.allocate_exact_size(vec2(132.0, 24.0), Sense::click());
-                    if trim_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if is_edit_mode {
+                        // Drawn Scissors SVG + Trim & Compress button
+                        let trim_btn_label = if self.compress_enabled {
+                            "Trim & Compress"
+                        } else {
+                            "Trim / Export"
+                        };
+                        let (trim_rect, trim_resp) = ui.allocate_exact_size(vec2(132.0, 24.0), Sense::click());
+                        if trim_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if trim_resp.clicked() {
+                            trigger_trim = true;
+                        }
+                        let trim_bg = if trim_resp.is_pointer_button_down_on() {
+                            Color32::from_rgb(109, 40, 217)
+                        } else if trim_resp.hovered() {
+                            Color32::from_rgb(139, 92, 246)
+                        } else {
+                            ACCENT
+                        };
+                        let tp = ui.painter();
+                        tp.rect_filled(trim_rect, 5.0, trim_bg);
+                        tp.rect_stroke(trim_rect, 5.0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Inside);
+                        draw_scissors_icon(tp, Pos2::new(trim_rect.left() + 14.0, trim_rect.center().y), Color32::WHITE);
+                        tp.text(
+                            Pos2::new(trim_rect.left() + 26.0, trim_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            trim_btn_label,
+                            egui::FontId::proportional(11.5),
+                            Color32::WHITE,
+                        );
+                        let _ = trim_resp.on_hover_text("Render trimmed & compressed MP4 to Trim History");
                     }
-                    if trim_resp.clicked() {
-                        trigger_trim = true;
+
+                    if self.mode == StudioMode::Video {
+                        if is_edit_mode {
+                            if ui
+                                .button("Use First Frame for Generation")
+                                .on_hover_text("Switch to Generate mode and use the current scrubbed frame as the first frame for I2V")
+                                .clicked()
+                            {
+                                toggle_work_mode = Some(VideoWorkMode::Generate);
+                            }
+                        } else if ui
+                            .button("Back to Edit Mode")
+                            .on_hover_text("Switch back to Edit mode with trim markers and LTX IC-LoRAs")
+                            .clicked()
+                        {
+                            toggle_work_mode = Some(VideoWorkMode::Edit);
+                        }
                     }
-                    let trim_bg = if trim_resp.is_pointer_button_down_on() {
-                        Color32::from_rgb(109, 40, 217)
-                    } else if trim_resp.hovered() {
-                        Color32::from_rgb(139, 92, 246)
-                    } else {
-                        ACCENT
-                    };
-                    let tp = ui.painter();
-                    tp.rect_filled(trim_rect, 5.0, trim_bg);
-                    tp.rect_stroke(trim_rect, 5.0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Inside);
-                    draw_scissors_icon(tp, Pos2::new(trim_rect.left() + 14.0, trim_rect.center().y), Color32::WHITE);
-                    tp.text(
-                        Pos2::new(trim_rect.left() + 26.0, trim_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        trim_btn_label,
-                        egui::FontId::proportional(11.5),
-                        Color32::WHITE,
-                    );
-                    let _ = trim_resp.on_hover_text("Render trimmed & compressed MP4 to Trim History");
 
                     let zoom_txt = format!("{:.0}%", self.canvas_zoom * 100.0);
                     if ui.button(zoom_txt).on_hover_text("Click to reset zoom and center video").clicked() {
@@ -4191,12 +5528,33 @@ fn is_win_ctrl_v() -> bool {
                 });
             });
 
-            let canvas_area = max_size - vec2(0.0, 128.0);
-            let (canvas_rect, resp) = ui.allocate_exact_size(canvas_area, Sense::click_and_drag());
+            if self.canvas_zoom < 1.0 {
+                self.canvas_zoom = 1.0;
+                self.canvas_pan = vec2(0.0, 0.0);
+                self.video_pan_drag_active = false;
+            }
 
-            let target_size = vec2(p_w as f32, p_h as f32);
+            let canvas_area = max_size - vec2(0.0, 128.0);
+            let canvas_sense = if self.canvas_zoom > 1.001 {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            };
+            let (canvas_rect, resp) = ui.allocate_exact_size(canvas_area, canvas_sense);
+            video_canvas_rect = canvas_rect;
+
+            let target_size = if self.generating {
+                if let Some((gw, gh)) = self.generating_dims {
+                    vec2(gw as f32, gh as f32)
+                } else {
+                    vec2(p_w as f32, p_h as f32)
+                }
+            } else {
+                vec2(p_w as f32, p_h as f32)
+            };
             let fit_size = fit(target_size, canvas_area);
 
+            // Zoom with mouse scroll (Min 100%, no zooming out below 100%)
             if resp.hovered() {
                 let (scroll_steps, pinch_delta) = ctx.input(|i| {
                     let mut steps = 0.0f32;
@@ -4223,25 +5581,53 @@ fn is_win_ctrl_v() -> bool {
 
                 if (zoom_factor - 1.0).abs() > 0.0005 {
                     let old_zoom = self.canvas_zoom;
-                    let new_zoom = (old_zoom * zoom_factor).clamp(0.15, 25.0);
-
-                    if let Some(mouse) = resp.hover_pos() {
-                        let center = canvas_rect.center();
-                        let mouse_rel = mouse - (center + self.canvas_pan);
-                        self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
+                    let new_zoom = (old_zoom * zoom_factor).clamp(1.0, 10.0);
+                    if new_zoom <= 1.001 {
+                        self.canvas_zoom = 1.0;
+                        self.canvas_pan = vec2(0.0, 0.0);
+                        self.video_pan_drag_active = false;
+                    } else {
+                        if let Some(mouse) = resp.hover_pos() {
+                            let center = canvas_rect.center();
+                            let mouse_rel = mouse - (center + self.canvas_pan);
+                            self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
+                        }
+                        self.canvas_zoom = new_zoom;
                     }
-                    self.canvas_zoom = new_zoom;
                 }
             }
 
-            if resp.dragged() {
-                self.canvas_pan += resp.drag_delta();
-            }
-            if resp.double_clicked() {
+            // Lock center to default position at 100% zoom (no dragging/panning);
+            // when zoomed in, require a 6px drag deadzone before panning so clicks cleanly play/pause.
+            if self.canvas_zoom > 1.001 {
+                let primary_down = ctx.input(|i| i.pointer.primary_down());
+                if resp.is_pointer_button_down_on() {
+                    if let (Some(origin), Some(pos)) = ctx.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos())) {
+                        if (pos - origin).length() > 6.0 {
+                            self.video_pan_drag_active = true;
+                        }
+                    }
+                }
+                if self.video_pan_drag_active && resp.dragged() {
+                    self.canvas_pan += resp.drag_delta();
+                }
+                if resp.double_clicked() {
+                    self.canvas_zoom = 1.0;
+                    self.canvas_pan = vec2(0.0, 0.0);
+                    self.video_pan_drag_active = false;
+                } else if !self.generating && !self.video_pan_drag_active && resp.hovered() && ctx.input(|i| i.pointer.primary_released()) {
+                    player.toggle_play();
+                }
+                if !primary_down {
+                    self.video_pan_drag_active = false;
+                }
+            } else {
                 self.canvas_zoom = 1.0;
                 self.canvas_pan = vec2(0.0, 0.0);
-            } else if resp.clicked() {
-                player.toggle_play();
+                self.video_pan_drag_active = false;
+                if !self.generating && !resp.double_clicked() && resp.clicked() {
+                    player.toggle_play();
+                }
             }
 
             let cur_size = fit_size * self.canvas_zoom;
@@ -4252,7 +5638,16 @@ fn is_win_ctrl_v() -> bool {
             p.rect_filled(canvas_rect, 8, Color32::from_rgb(14, 16, 22));
             p.rect_stroke(canvas_rect, 8, Stroke::new(1.0, LINE), StrokeKind::Inside);
 
-            if let Some(tex) = player.current_texture(ctx) {
+            if self.generating {
+                if let Some(ref prev) = self.preview_tex {
+                    p.image(prev.id(), image_rect, FULL_UV, Color32::WHITE);
+                } else if let Some(tex) = player.current_texture(ctx) {
+                    p.image(tex.id(), image_rect, FULL_UV, Color32::from_white_alpha(140));
+                } else {
+                    p.rect_filled(image_rect, 6, Color32::from_rgb(18, 20, 28));
+                }
+                draw_generating_overlay(&p, image_rect, self.progress, self.is_swapping_detected, self.step_duration_ema);
+            } else if let Some(tex) = player.current_texture(ctx) {
                 p.image(tex.id(), image_rect, FULL_UV, Color32::WHITE);
                 p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(30)), StrokeKind::Outside);
             }
@@ -4263,9 +5658,13 @@ fn is_win_ctrl_v() -> bool {
             card(ui, |ui| {
                 ui.vertical(|ui| {
                     let full_w = ui.available_width();
-                    let show_hint = !self.has_seen_trim_hint;
-                    let top_margin = if show_hint { 20.0 } else { 10.0 };
-                    let total_h = top_margin + 28.0;
+                    let show_hint = is_edit_mode && !self.has_seen_trim_hint;
+                    let top_margin = if is_edit_mode {
+                        if show_hint { 20.0 } else { 10.0 }
+                    } else {
+                        4.0
+                    };
+                    let total_h = if is_edit_mode { top_margin + 28.0 } else { 24.0 };
                     let (track_rect, scrub_resp) = ui.allocate_exact_size(vec2(full_w, total_h), Sense::click_and_drag());
                     let p = ui.painter();
 
@@ -4279,8 +5678,8 @@ fn is_win_ctrl_v() -> bool {
 
                     let trim_track_y = track_rect.top() + top_margin;
                     let trim_zone_bottom = trim_track_y + 4.0;
-                    let play_bar_top = trim_zone_bottom + 3.0;
-                    let split_y = trim_zone_bottom + 1.0;
+                    let play_bar_top = if is_edit_mode { trim_zone_bottom + 3.0 } else { track_rect.top() };
+                    let split_y = if is_edit_mode { trim_zone_bottom + 1.0 } else { track_rect.top() };
 
                     // 1. Playback Bar
                     let play_track_h = 15.0;
@@ -4289,17 +5688,22 @@ fn is_win_ctrl_v() -> bool {
                         Pos2::new(track_rect.center().x, play_track_y),
                         vec2(track_rect.width(), play_track_h),
                     );
-                    let scrub_trimmed_color = Color32::from_rgb(82, 86, 98);
-                    let scrub_stroke_color = Color32::from_rgb(125, 131, 148);
-                    p.rect_filled(play_track_bg, 4.0, scrub_trimmed_color);
-                    p.rect_stroke(play_track_bg, 4.0, Stroke::new(1.0, scrub_stroke_color), StrokeKind::Inside);
+                    if is_edit_mode {
+                        let scrub_trimmed_color = Color32::from_rgb(82, 86, 98);
+                        let scrub_stroke_color = Color32::from_rgb(125, 131, 148);
+                        p.rect_filled(play_track_bg, 4.0, scrub_trimmed_color);
+                        p.rect_stroke(play_track_bg, 4.0, Stroke::new(1.0, scrub_stroke_color), StrokeKind::Inside);
 
-                    let play_trim_rect = Rect::from_min_max(
-                        Pos2::new(trim_x_min, play_track_y - play_track_h * 0.5),
-                        Pos2::new(trim_x_max, play_track_y + play_track_h * 0.5),
-                    );
-                    p.rect_filled(play_trim_rect, 3.0, Color32::from_rgb(37, 99, 235));
-                    p.rect_stroke(play_trim_rect, 3.0, Stroke::new(1.0, Color32::from_rgb(96, 165, 250)), StrokeKind::Inside);
+                        let play_trim_rect = Rect::from_min_max(
+                            Pos2::new(trim_x_min, play_track_y - play_track_h * 0.5),
+                            Pos2::new(trim_x_max, play_track_y + play_track_h * 0.5),
+                        );
+                        p.rect_filled(play_trim_rect, 3.0, Color32::from_rgb(37, 99, 235));
+                        p.rect_stroke(play_trim_rect, 3.0, Stroke::new(1.0, Color32::from_rgb(96, 165, 250)), StrokeKind::Inside);
+                    } else {
+                        p.rect_filled(play_track_bg, 4.0, Color32::from_rgb(37, 99, 235));
+                        p.rect_stroke(play_track_bg, 4.0, Stroke::new(1.0, Color32::from_rgb(96, 165, 250)), StrokeKind::Inside);
+                    }
 
                     if scrub_resp.hovered() {
                         if let Some(pos) = scrub_resp.hover_pos() {
@@ -4313,52 +5717,54 @@ fn is_win_ctrl_v() -> bool {
                     }
 
                     // 2. Trim Bar
-                    p.line_segment(
-                        [Pos2::new(track_rect.left(), trim_track_y), Pos2::new(track_rect.right(), trim_track_y)],
-                        Stroke::new(1.0, Color32::from_rgb(46, 46, 52)),
-                    );
-                    p.line_segment(
-                        [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_max, trim_track_y)],
-                        Stroke::new(3.0, ACCENT),
-                    );
+                    if is_edit_mode {
+                        p.line_segment(
+                            [Pos2::new(track_rect.left(), trim_track_y), Pos2::new(track_rect.right(), trim_track_y)],
+                            Stroke::new(1.0, Color32::from_rgb(46, 46, 52)),
+                        );
+                        p.line_segment(
+                            [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_max, trim_track_y)],
+                            Stroke::new(3.0, ACCENT),
+                        );
 
-                    let tab_size = 6.0;
-                    let start_tri = vec![
-                        Pos2::new(trim_x_min - tab_size, trim_track_y - 7.0),
-                        Pos2::new(trim_x_min + tab_size, trim_track_y - 7.0),
-                        Pos2::new(trim_x_min, trim_track_y),
-                    ];
-                    p.add(egui::Shape::convex_polygon(start_tri, BLUE, Stroke::new(1.0, Color32::WHITE)));
-                    p.line_segment(
-                        [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_min, track_rect.bottom())],
-                        Stroke::new(1.5, BLUE),
-                    );
+                        let tab_size = 6.0;
+                        let start_tri = vec![
+                            Pos2::new(trim_x_min - tab_size, trim_track_y - 7.0),
+                            Pos2::new(trim_x_min + tab_size, trim_track_y - 7.0),
+                            Pos2::new(trim_x_min, trim_track_y),
+                        ];
+                        p.add(egui::Shape::convex_polygon(start_tri, BLUE, Stroke::new(1.0, Color32::WHITE)));
+                        p.line_segment(
+                            [Pos2::new(trim_x_min, trim_track_y), Pos2::new(trim_x_min, track_rect.bottom())],
+                            Stroke::new(1.5, BLUE),
+                        );
 
-                    let (is_end_trim_flashing_red, should_repaint) =
-                        is_end_trim_flashing_red_at(self.end_trim_error_flash_start, Instant::now());
-                    if should_repaint {
-                        ui.ctx().request_repaint();
-                    } else if self.end_trim_error_flash_start.is_some() {
-                        self.end_trim_error_flash_start = None;
+                        let (is_end_trim_flashing_red, should_repaint) =
+                            is_end_trim_flashing_red_at(self.end_trim_error_flash_start, Instant::now());
+                        if should_repaint {
+                            ui.ctx().request_repaint();
+                        } else if self.end_trim_error_flash_start.is_some() {
+                            self.end_trim_error_flash_start = None;
+                        }
+
+                        let end_tri = vec![
+                            Pos2::new(trim_x_max - tab_size, trim_track_y - 7.0),
+                            Pos2::new(trim_x_max + tab_size, trim_track_y - 7.0),
+                            Pos2::new(trim_x_max, trim_track_y),
+                        ];
+                        let end_marker_color = if is_end_trim_flashing_red { Color32::from_rgb(255, 60, 60) } else { AMBER };
+                        let end_tab_stroke = Stroke::new(if is_end_trim_flashing_red { 1.5 } else { 1.0 }, Color32::WHITE);
+                        let end_line_stroke = if is_end_trim_flashing_red {
+                            Stroke::new(2.5, Color32::from_rgb(255, 60, 60))
+                        } else {
+                            Stroke::new(1.5, AMBER)
+                        };
+                        p.add(egui::Shape::convex_polygon(end_tri, end_marker_color, end_tab_stroke));
+                        p.line_segment(
+                            [Pos2::new(trim_x_max, trim_track_y), Pos2::new(trim_x_max, track_rect.bottom())],
+                            end_line_stroke,
+                        );
                     }
-
-                    let end_tri = vec![
-                        Pos2::new(trim_x_max - tab_size, trim_track_y - 7.0),
-                        Pos2::new(trim_x_max + tab_size, trim_track_y - 7.0),
-                        Pos2::new(trim_x_max, trim_track_y),
-                    ];
-                    let end_marker_color = if is_end_trim_flashing_red { Color32::from_rgb(255, 60, 60) } else { AMBER };
-                    let end_tab_stroke = Stroke::new(if is_end_trim_flashing_red { 1.5 } else { 1.0 }, Color32::WHITE);
-                    let end_line_stroke = if is_end_trim_flashing_red {
-                        Stroke::new(2.5, Color32::from_rgb(255, 60, 60))
-                    } else {
-                        Stroke::new(1.5, AMBER)
-                    };
-                    p.add(egui::Shape::convex_polygon(end_tri, end_marker_color, end_tab_stroke));
-                    p.line_segment(
-                        [Pos2::new(trim_x_max, trim_track_y), Pos2::new(trim_x_max, track_rect.bottom())],
-                        end_line_stroke,
-                    );
 
                     // 3. Playhead
                     let cur_ratio = (cur_s / dur).clamp(0.0, 1.0) as f32;
@@ -4427,9 +5833,10 @@ fn is_win_ctrl_v() -> bool {
                         self.timeline_drag_occurred = false;
                     }
 
-                    let right_clicked = scrub_resp.secondary_clicked()
-                        || scrub_resp.drag_started_by(egui::PointerButton::Secondary)
-                        || (scrub_resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary) || i.pointer.button_clicked(egui::PointerButton::Secondary)));
+                    let right_clicked = is_edit_mode
+                        && (scrub_resp.secondary_clicked()
+                            || scrub_resp.drag_started_by(egui::PointerButton::Secondary)
+                            || (scrub_resp.hovered() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary) || i.pointer.button_clicked(egui::PointerButton::Secondary))));
 
                     if right_clicked {
                         let origin_pos = ui.input(|i| i.pointer.press_origin())
@@ -4607,37 +6014,39 @@ fn is_win_ctrl_v() -> bool {
                             player.step_frames(1);
                         }
 
-                        ui.add_space(4.0);
-                        if ui.button("[ Set Start (I)").clicked() {
-                            let snap = TrimStateSnapshot {
-                                start: player.trim_start_sec,
-                                end: player.trim_end_sec,
-                            };
-                            player.set_trim_start_to_current();
-                            if player.trim_start_sec != snap.start {
-                                pending_undo_snapshot = Some(snap);
-                                interacted_with_trim = true;
+                        if is_edit_mode {
+                            ui.add_space(4.0);
+                            if ui.button("[ Set Start (I)").clicked() {
+                                let snap = TrimStateSnapshot {
+                                    start: player.trim_start_sec,
+                                    end: player.trim_end_sec,
+                                };
+                                player.set_trim_start_to_current();
+                                if player.trim_start_sec != snap.start {
+                                    pending_undo_snapshot = Some(snap);
+                                    interacted_with_trim = true;
+                                }
                             }
-                        }
-                        if ui.button("Set End (O) ]").clicked() {
-                            let snap = TrimStateSnapshot {
-                                start: player.trim_start_sec,
-                                end: player.trim_end_sec,
-                            };
-                            player.set_trim_end_to_current();
-                            if player.trim_end_sec != snap.end {
-                                pending_undo_snapshot = Some(snap);
-                                interacted_with_trim = true;
+                            if ui.button("Set End (O) ]").clicked() {
+                                let snap = TrimStateSnapshot {
+                                    start: player.trim_start_sec,
+                                    end: player.trim_end_sec,
+                                };
+                                player.set_trim_end_to_current();
+                                if player.trim_end_sec != snap.end {
+                                    pending_undo_snapshot = Some(snap);
+                                    interacted_with_trim = true;
+                                }
                             }
-                        }
-                        if player.has_custom_trim() && ui.button("Reset Trim").clicked() {
-                            let snap = TrimStateSnapshot {
-                                start: player.trim_start_sec,
-                                end: player.trim_end_sec,
-                            };
-                            player.reset_trim();
-                            pending_undo_snapshot = Some(snap);
-                            self.end_trim_error_flash_start = None;
+                            if player.has_custom_trim() && ui.button("Reset Trim").clicked() {
+                                let snap = TrimStateSnapshot {
+                                    start: player.trim_start_sec,
+                                    end: player.trim_end_sec,
+                                };
+                                player.reset_trim();
+                                pending_undo_snapshot = Some(snap);
+                                self.end_trim_error_flash_start = None;
+                            }
                         }
 
                         ui.add_space(6.0);
@@ -4648,11 +6057,29 @@ fn is_win_ctrl_v() -> bool {
                         );
                         ui.label(RichText::new(time_str).size(12.0).monospace().color(TEXT));
 
-                        if player.has_custom_trim() {
-                            let trimmed_len = player.trimmed_duration();
-                            let pct_saved = ((1.0 - (trimmed_len / dur)) * 100.0).clamp(0.0, 100.0);
-                            let cut_info = format!("Trim: {:.1}s (-{:.0}%)", trimmed_len, pct_saved);
-                            ui.label(RichText::new(cut_info).size(11.0).color(GREEN));
+                        if is_edit_mode {
+                            if player.has_custom_trim() {
+                                let trimmed_len = player.trimmed_duration();
+                                let pct_saved = ((1.0 - (trimmed_len / dur)) * 100.0).clamp(0.0, 100.0);
+                                let cut_info = format!("Trim: {:.1}s (-{:.0}%)", trimmed_len, pct_saved);
+                                ui.label(RichText::new(cut_info).size(11.0).color(GREEN));
+                            }
+                        } else if self.mode == StudioMode::Image {
+                            ui.label(
+                                RichText::new("Scrubbed frame used as input image")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(96, 165, 250)),
+                            )
+                            .on_hover_text("Scrub to any frame — it will be used as the input image when you click Generate in Image mode");
+                        } else {
+                            ui.label(
+                                RichText::new("First frame for generated video")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(Color32::from_rgb(96, 165, 250)),
+                            )
+                            .on_hover_text("Scrub to any frame — it will be used as the first frame in the I2V workflow");
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4690,6 +6117,10 @@ fn is_win_ctrl_v() -> bool {
             });
         }
 
+        if let Some(new_mode) = toggle_work_mode {
+            self.set_video_work_mode(new_mode);
+        }
+
         if let Some(snap) = pending_undo_snapshot {
             self.record_trim_undo(snap);
         }
@@ -4701,6 +6132,8 @@ fn is_win_ctrl_v() -> bool {
             self.video_player = None;
             return;
         }
+
+        self.render_floating_generation_status(ctx, video_canvas_rect);
 
         if trigger_trim {
             self.trigger_trim_and_compress();
@@ -4725,40 +6158,7 @@ fn is_win_ctrl_v() -> bool {
         }
 
         if extract_frame {
-            let extracted = self
-                .video_player
-                .as_ref()
-                .and_then(|p| p.current_image.as_ref().map(|ci| (ci.clone(), p.current_sec)));
-            if let Some((cur_img, cur_sec)) = extracted {
-                let [f_w, f_h] = cur_img.size;
-                let mut png_bytes = Vec::new();
-                if let Some(rgba) = image::RgbaImage::from_raw(f_w as u32, f_h as u32, cur_img.as_raw().to_vec()) {
-                    let _ = image::DynamicImage::ImageRgba8(rgba)
-                        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png);
-                }
-                let id = self.next_node_id;
-                self.next_node_id += 1;
-                let tex = ctx.load_texture(format!("extracted_frame_{id}"), cur_img, egui::TextureOptions::LINEAR);
-                let node = HistoryNode {
-                    id,
-                    parent_id: self.active_node_id,
-                    label: format!("Video Frame {:.1}s", cur_sec),
-                    prompt: self.prompt.clone(),
-                    png: png_bytes,
-                    tex,
-                    width: f_w as u32,
-                    height: f_h as u32,
-                    step_num: self.active_node().map(|n| n.step_num + 1).unwrap_or(0),
-                    output_filename: String::new(),
-                    output_subfolder: String::new(),
-                    temp_files: Vec::new(),
-                    mp4_bytes: None,
-                };
-                self.nodes.push(node);
-                self.select_node(id);
-                self.mode = StudioMode::Image;
-                self.video_player = None;
-            }
+            self.mode = StudioMode::Image;
         }
     }
 
@@ -4858,10 +6258,6 @@ fn is_win_ctrl_v() -> bool {
             });
 
             if do_clear {
-                let ids: Vec<usize> = self.nodes.iter().map(|n| n.id).collect();
-                for id in ids {
-                    self.delete_history_node(id);
-                }
                 self.nodes.clear();
                 self.active_node_id = None;
                 self.video_player = None;
@@ -4900,6 +6296,12 @@ fn is_win_ctrl_v() -> bool {
 
             let fit_size = fit(target_size, canvas_area);
 
+            let is_video_canvas = self.mode == StudioMode::Video;
+            if is_video_canvas && self.canvas_zoom < 1.0 {
+                self.canvas_zoom = 1.0;
+                self.canvas_pan = vec2(0.0, 0.0);
+            }
+
             // Zoom into cursor position with mouse wheel & trackpad pinch
             if resp.hovered() {
                 let (scroll_steps, pinch_delta) = ctx.input(|i| {
@@ -4927,20 +6329,29 @@ fn is_win_ctrl_v() -> bool {
 
                 if (zoom_factor - 1.0).abs() > 0.0005 {
                     let old_zoom = self.canvas_zoom;
-                    let new_zoom = (old_zoom * zoom_factor).clamp(0.15, 25.0);
+                    let min_zoom = if is_video_canvas { 1.0 } else { 0.15 };
+                    let new_zoom = (old_zoom * zoom_factor).clamp(min_zoom, 25.0);
 
-                    if let Some(mouse) = resp.hover_pos() {
-                        let center = canvas_rect.center();
-                        let mouse_rel = mouse - (center + self.canvas_pan);
-                        self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
+                    if is_video_canvas && new_zoom <= 1.001 {
+                        self.canvas_zoom = 1.0;
+                        self.canvas_pan = vec2(0.0, 0.0);
+                    } else {
+                        if let Some(mouse) = resp.hover_pos() {
+                            let center = canvas_rect.center();
+                            let mouse_rel = mouse - (center + self.canvas_pan);
+                            self.canvas_pan -= mouse_rel * (new_zoom / old_zoom - 1.0);
+                        }
+                        self.canvas_zoom = new_zoom;
                     }
-                    self.canvas_zoom = new_zoom;
                 }
             }
 
-            // Pan by dragging (when not dragging compare split)
-            if !self.compare_mode && resp.dragged() {
+            // Pan by dragging (when not dragging compare split; locked at 100% in video mode)
+            if !self.compare_mode && resp.dragged() && (!is_video_canvas || self.canvas_zoom > 1.001) {
                 self.canvas_pan += resp.drag_delta();
+            }
+            if is_video_canvas && self.canvas_zoom <= 1.001 {
+                self.canvas_pan = vec2(0.0, 0.0);
             }
             if resp.double_clicked() {
                 self.canvas_zoom = 1.0;
@@ -5001,25 +6412,7 @@ fn is_win_ctrl_v() -> bool {
                     p.rect_filled(image_rect, 6, Color32::from_rgb(18, 20, 28));
                 }
 
-                p.rect_stroke(image_rect, 0, Stroke::new(1.0, ACCENT_GLOW), StrokeKind::Outside);
-
-                let badge_text = if self.is_swapping_detected {
-                    if let Some((v, max)) = self.progress {
-                        format!("[!] VRAM SWAPPING SLOWDOWN ({}/{} • {:.1}s/step)", v, max, self.step_duration_ema)
-                    } else {
-                        "[!] VRAM SWAPPING SLOWDOWN".to_string()
-                    }
-                } else if let Some((v, max)) = self.progress {
-                    format!("GENERATING (Step {}/{})", v, max)
-                } else {
-                    "GENERATING...".to_string()
-                };
-                let g = p.layout_no_wrap(badge_text, egui::FontId::proportional(11.0), Color32::WHITE);
-                let badge_pos = image_rect.left_top() + vec2(10.0, 10.0);
-                let r = egui::Align2::LEFT_TOP.anchor_size(badge_pos, g.size()).expand2(vec2(8.0, 4.0));
-                p.rect_filled(r, 4, Color32::from_black_alpha(190));
-                p.rect_stroke(r, 4, Stroke::new(1.0, if self.is_swapping_detected { AMBER } else { ACCENT }), StrokeKind::Inside);
-                p.galley(r.shrink2(vec2(8.0, 4.0)).min, g, Color32::WHITE);
+                draw_generating_overlay(&p, image_rect, self.progress, self.is_swapping_detected, self.step_duration_ema);
             } else if let Some(ref a_tex) = active_tex_opt {
                 p.image(a_tex.id(), image_rect, FULL_UV, Color32::WHITE);
                 p.rect_stroke(image_rect, 0, Stroke::new(1.0, Color32::from_white_alpha(20)), StrokeKind::Outside);
@@ -5155,6 +6548,10 @@ fn is_win_ctrl_v() -> bool {
             }
         }
 
+        self.render_floating_generation_status(ctx, ui.max_rect());
+    }
+
+    fn render_floating_generation_status(&mut self, ctx: &egui::Context, anchor_rect: Rect) {
         if self.generating {
             let status_txt = if self.is_swapping_detected {
                 if let Some((v, max)) = self.progress {
@@ -5173,13 +6570,12 @@ fn is_win_ctrl_v() -> bool {
             };
             let status_col = if self.is_swapping_detected { AMBER } else { TEXT };
 
-            let canvas_rect = ui.max_rect();
             let margin = 14.0;
             egui::Area::new(egui::Id::new("floating_canvas_generation_status"))
-                .fixed_pos(pos2(canvas_rect.right() - margin, canvas_rect.bottom() - margin))
+                .fixed_pos(pos2(anchor_rect.right() - margin, anchor_rect.bottom() - margin))
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .order(egui::Order::Foreground)
-                .interactable(false)
+                .interactable(true)
                 .show(ctx, |ui| {
                     egui::Frame::new()
                         .fill(CARD_HI)
@@ -5196,7 +6592,50 @@ fn is_win_ctrl_v() -> bool {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label(RichText::new(status_txt).size(12.0).color(status_col).strong());
+                                ui.add_space(8.0);
+                                let cancel_btn = egui::Button::new(RichText::new("Cancel").size(12.0).strong().color(RED))
+                                    .fill(CARD)
+                                    .stroke(Stroke::new(1.0, RED.linear_multiply(0.45)))
+                                    .corner_radius(6)
+                                    .min_size(vec2(66.0, 24.0));
+                                if ui.add(cancel_btn).clicked() {
+                                    self.cancel.store(true, Ordering::SeqCst);
+                                    self.queue.clear();
+                                    self.generation_retries = 0;
+                                    self.status = "Cancelling...".into();
+                                    if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
+                                        self.prompt = crate::lora::strip_prompt_tags(self.active_prompt_tags(), &self.generating_prompt);
+                                    }
+                                    std::thread::spawn(move || {
+                                        let client = reqwest::blocking::Client::builder()
+                                            .timeout(Duration::from_secs(2))
+                                            .build();
+                                        if let Ok(c) = client {
+                                            let base = engine::base_url();
+                                            let _ = c.post(format!("{base}/interrupt")).send();
+                                            let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
+                                        }
+                                    });
+                                }
                             });
+                            if self.stall_prompt.load(Ordering::Relaxed) {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Slow step (>3m, VRAM swapping) — auto-cancels after 20m")
+                                            .size(10.5)
+                                            .color(AMBER),
+                                    );
+                                    let keep_btn = egui::Button::new(RichText::new("Continue Waiting").size(11.0).strong().color(DISCORD_GREEN))
+                                        .fill(CARD)
+                                        .stroke(Stroke::new(1.0, DISCORD_GREEN.linear_multiply(0.5)))
+                                        .corner_radius(6);
+                                    if ui.add(keep_btn).clicked() {
+                                        self.stall_keep_waiting.store(true, Ordering::SeqCst);
+                                        self.stall_prompt.store(false, Ordering::SeqCst);
+                                    }
+                                });
+                            }
                         });
                 });
         }
@@ -5276,7 +6715,11 @@ fn is_win_ctrl_v() -> bool {
 
                     let prompt_id = egui::Id::new("main_prompt_text_edit");
                     let hint = if self.mode == StudioMode::Video {
-                        if self.active_node().is_some() {
+                        if self.is_edit_video_mode() {
+                            "Optional: add extra details for this edit... Enter to edit"
+                        } else if self.video_player.is_some() {
+                            "Describe motion, camera action, or animation from this frame... Enter to generate"
+                        } else if self.active_node().is_some() {
                             "Describe motion, camera action, or animation for this image... Enter to generate"
                         } else {
                             "Describe a video scene, camera motion, and action... Enter to generate"
@@ -5299,10 +6742,18 @@ fn is_win_ctrl_v() -> bool {
                                 } else {
                                     "LTX 2.3"
                                 };
-                                let tip = format!(
-                                    "Using {} (best available downloaded model) while {} finishes downloading.",
-                                    eff.name, active_vprof.name
-                                );
+                                let vdir = self.active_video_models_dir();
+                                let tip = if !vdir.as_os_str().is_empty() && active_vprof.missing_in_dir(&vdir).is_empty() {
+                                    format!(
+                                        "Using {} for video edit / LTX LoRA (active model {} is ready).",
+                                        eff.name, active_vprof.name
+                                    )
+                                } else {
+                                    format!(
+                                        "Using {} (best available downloaded model) while {} finishes downloading.",
+                                        eff.name, active_vprof.name
+                                    )
+                                };
                                 Some((format!("Using fallback {short}"), tip))
                             } else {
                                 None
@@ -5312,12 +6763,21 @@ fn is_win_ctrl_v() -> bool {
                         None
                     };
                     let controls_w = if fallback_info.is_some() { 304.0 } else { 266.0 };
-                    let text_edit = egui::TextEdit::multiline(&mut self.prompt)
-                        .id(prompt_id)
-                        .desired_rows(2)
-                        .desired_width((ui.available_width() - controls_w).max(80.0))
-                        .hint_text(hint);
-                    let text_resp = ui.add(text_edit);
+                    let prompt_w = (ui.available_width() - controls_w).max(80.0);
+                    let text_resp = ui.vertical(|ui| {
+                        ui.set_max_width(prompt_w);
+                        if self.mode == StudioMode::Video {
+                            crate::lora::render_prompt_tags_bar(ui, ctx, &mut self.video_prompt_tags);
+                        } else {
+                            crate::lora::render_prompt_tags_bar(ui, ctx, &mut self.image_prompt_tags);
+                        }
+                        let text_edit = egui::TextEdit::multiline(&mut self.prompt)
+                            .id(prompt_id)
+                            .desired_rows(2)
+                            .desired_width(prompt_w)
+                            .hint_text(hint);
+                        ui.add(text_edit)
+                    }).inner;
 
                     if self.focus_prompt {
                         self.focus_prompt = false;
@@ -5358,8 +6818,8 @@ fn is_win_ctrl_v() -> bool {
                                     .collect::<String>();
                             }
                         }
-                        let p_text = self.prompt.trim().to_string();
-                        if !p_text.is_empty() {
+                        let p_text = self.composed_prompt();
+                        if !p_text.is_empty() || self.is_edit_video_mode() {
                             if should_queue {
                                 if self.can_queue().is_ok() {
                                     self.queue.push(QueuedItem { prompt: p_text });
@@ -5376,19 +6836,21 @@ fn is_win_ctrl_v() -> bool {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 
+                        let edit_mode = self.is_edit_video_mode();
                         let (is_ok, btn_text, tip) = if self.generating {
                             let q_can = self.can_queue();
-                            let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
+                            let ok = q_can.is_ok() && (self.has_prompt_content() || edit_mode);
                             (ok, "Queue", q_can.err().map(|s| s.to_string()))
                         } else if !is_ready {
                             let q_can = self.can_queue();
-                            let ok = q_can.is_ok() && !self.prompt.trim().is_empty();
+                            let ok = q_can.is_ok() && (self.has_prompt_content() || edit_mode);
                             (ok, "Queue", Some("Engine setup in progress; prompt will be queued and will generate automatically once ready.".to_string()))
                         } else {
                             let g_can = self.can_generate();
-                            let ok = g_can.is_ok() && !self.prompt.trim().is_empty();
+                            let ok = g_can.is_ok() && (self.has_prompt_content() || edit_mode);
                             let fallback_tip = fallback_info.as_ref().map(|(_, t)| t.clone());
-                            (ok, "Generate", g_can.err().map(|s| s.to_string()).or(fallback_tip))
+                            let label = if edit_mode { "Edit Video" } else { "Generate" };
+                            (ok, label, g_can.err().map(|s| s.to_string()).or(fallback_tip))
                         };
 
                         let btn_w = if fallback_info.is_some() { 138.0 } else { 100.0 };
@@ -5460,8 +6922,8 @@ fn is_win_ctrl_v() -> bool {
                         }
 
                         if is_ok && resp.clicked() {
-                            let p_text = self.prompt.trim().to_string();
-                            if !p_text.is_empty() {
+                            let p_text = self.composed_prompt();
+                            if !p_text.is_empty() || edit_mode {
                                 if should_queue {
                                     if self.can_queue().is_ok() {
                                         self.queue.push(QueuedItem { prompt: p_text });
@@ -5535,36 +6997,9 @@ fn is_win_ctrl_v() -> bool {
                                 });
                             });
 
-                        if self.generating {
+                        if self.generating && !self.queue.is_empty() {
                             ui.add_space(6.0);
-                            let cancel_btn = egui::Button::new(RichText::new("Cancel").size(13.0).strong().color(RED))
-                                .fill(CARD)
-                                .stroke(Stroke::new(1.0, RED.linear_multiply(0.4)))
-                                .corner_radius(8)
-                                .min_size(vec2(75.0, 36.0));
-                            if ui.add(cancel_btn).clicked() {
-                                self.cancel.store(true, Ordering::SeqCst);
-                                self.queue.clear();
-                                self.generation_retries = 0;
-                                self.status = "Cancelling...".into();
-                                if self.prompt.trim().is_empty() && !self.generating_prompt.trim().is_empty() {
-                                    self.prompt = self.generating_prompt.clone();
-                                }
-                                std::thread::spawn(move || {
-                                    let client = reqwest::blocking::Client::builder()
-                                        .timeout(Duration::from_secs(2))
-                                        .build();
-                                    if let Ok(c) = client {
-                                        let base = engine::base_url();
-                                        let _ = c.post(format!("{base}/interrupt")).send();
-                                        let _ = c.post(format!("{base}/queue")).json(&serde_json::json!({"clear": true})).send();
-                                    }
-                                });
-                            }
-                            ui.add_space(4.0);
-
-                            if !self.queue.is_empty() {
-                                let queue_btn = egui::Button::new(
+                            let queue_btn = egui::Button::new(
                                     RichText::new(format!("{} queued", self.queue.len()))
                                         .size(11.5)
                                         .color(AMBER)
@@ -5583,7 +7018,6 @@ fn is_win_ctrl_v() -> bool {
                                 }
                                 ui.add_space(4.0);
                             }
-                        }
                     });
                 });
 
@@ -5622,24 +7056,125 @@ fn is_win_ctrl_v() -> bool {
         drop(cfg);
         *self.sh.active_profile.lock().unwrap() = p.clone();
         self.profile = p.clone();
-        engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
+        let models_dir = self.sh.paths.lock().unwrap().models.clone();
+        if models_dir.as_os_str().is_empty() || !p.missing_in_dir(&models_dir).is_empty() {
+            engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
+        }
+    }
+
+    fn sync_effective_video_profile(&mut self) {
+        let eff = self
+            .effective_video_profile()
+            .unwrap_or_else(|| self.sh.active_video_profile.lock().unwrap().clone());
+        if eff.id != self.last_effective_video_profile_id {
+            let prev_is_h3 = self.last_effective_video_profile_id.starts_with("minimax_h3");
+            let prev_is_ltx25 = self.last_effective_video_profile_id.starts_with("ltx_2.5");
+            if prev_is_h3 != eff.is_minimax_h3() || prev_is_ltx25 != eff.is_ltx25() {
+                let eff_family = crate::lora::LoraModelFamily::from_video_profile(&eff);
+                let items = &self.lora_browser.items;
+                self.video_loras.retain(|active| {
+                    items
+                        .iter()
+                        .find(|it| it.filename == active.filename)
+                        .map(|it| it.is_compatible_with(eff_family))
+                        .unwrap_or(true)
+                });
+                self.video_prompt_tags.retain(|t| {
+                    self.video_loras.iter().any(|l| l.filename == t.lora_filename)
+                });
+            }
+            self.video_steps = eff.default_steps.max(4);
+            if !eff.sampler.is_empty() {
+                self.video_sampler = eff.sampler.clone();
+            }
+            if !eff.scheduler.is_empty() {
+                self.video_scheduler = eff.scheduler.clone();
+            }
+            self.last_effective_video_profile_id = eff.id;
+        }
     }
 
     fn apply_video_profile(&mut self, vp: &Profile, ctx: &egui::Context) {
+        if !vp.is_minimax_h3() {
+            self.last_ltx_video_profile_id = Some(vp.id.clone());
+        }
         {
             let mut cfg = self.sh.cfg.lock().unwrap();
             cfg.active_video_profile = Some(vp.id.clone());
             cfg.save();
         }
         *self.sh.active_video_profile.lock().unwrap() = vp.clone();
-        self.video_steps = vp.default_steps.max(4);
-        if !vp.sampler.is_empty() {
-            self.video_sampler = vp.sampler.clone();
+        self.sync_effective_video_profile();
+        let models_dir = self.active_video_models_dir();
+        if models_dir.as_os_str().is_empty() || !vp.missing_in_dir(&models_dir).is_empty() {
+            engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
         }
-        if !vp.scheduler.is_empty() {
-            self.video_scheduler = vp.scheduler.clone();
+    }
+
+    fn handle_models_deleted(&mut self) {
+        let models_dir = self.sh.paths.lock().unwrap().models.clone();
+        if models_dir.as_os_str().is_empty() {
+            return;
         }
-        engine::restart_model_downloads_for_profile_change(&self.sh, ctx);
+        let vram = engine::detect_gpu_vram_gb();
+
+        // Fallback for image profile only if the currently active image profile was deleted
+        if !self.profile.missing_in_dir(&models_dir).is_empty() {
+            let all_img = Profile::all();
+            let rec_id = crate::model_picker::recommended_image_profile_id(vram);
+            let fallback = all_img
+                .iter()
+                .find(|p| p.id == rec_id && p.missing_in_dir(&models_dir).is_empty())
+                .or_else(|| all_img.iter().find(|p| p.missing_in_dir(&models_dir).is_empty()))
+                .cloned();
+            if let Some(p) = fallback {
+                let mut cfg = self.sh.cfg.lock().unwrap();
+                cfg.active_profile = Some(p.id.clone());
+                cfg.save();
+                drop(cfg);
+                *self.sh.active_profile.lock().unwrap() = p.clone();
+                self.profile = p;
+            }
+        }
+
+        // Fallback for video profile only if the currently active video profile was deleted
+        let active_vid = self.sh.active_video_profile.lock().unwrap().clone();
+        if !active_vid.missing_in_dir(&models_dir).is_empty() {
+            let vdir = self.active_video_models_dir();
+            if !vdir.as_os_str().is_empty() {
+                if let Some(vp) = Profile::find_downloaded_video_profile(&vdir) {
+                    {
+                        let mut cfg = self.sh.cfg.lock().unwrap();
+                        cfg.active_video_profile = Some(vp.id.clone());
+                        cfg.save();
+                    }
+                    *self.sh.active_video_profile.lock().unwrap() = vp.clone();
+                    self.sync_effective_video_profile();
+                    self.model_picker.record_active_video(&vp);
+                }
+            }
+        }
+    }
+
+    fn handle_picker_action(&mut self, action: crate::model_picker::PickerAction, ctx: &egui::Context) {
+        match action {
+            crate::model_picker::PickerAction::SwitchImage(p) => {
+                self.apply_image_profile(&p, ctx);
+            }
+            crate::model_picker::PickerAction::SwitchVideo(vp) => {
+                self.apply_video_profile(&vp, ctx);
+            }
+            crate::model_picker::PickerAction::DownloadProfile(p) => {
+                engine::start_profile_download(&self.sh, &p, ctx);
+            }
+            crate::model_picker::PickerAction::ToggleDownloadPause(pid) => {
+                engine::toggle_profile_download_pause(&self.sh, &pid, ctx);
+            }
+            crate::model_picker::PickerAction::ModelsDeleted => {
+                self.handle_models_deleted();
+            }
+            crate::model_picker::PickerAction::None => {}
+        }
     }
 
     fn setup_window(&mut self, ctx: &egui::Context) {
@@ -5745,21 +7280,13 @@ fn is_win_ctrl_v() -> bool {
                         let picker_action = crate::model_picker::render_model_picker(
                             ui,
                             &mut self.model_picker,
+                            &self.sh,
                             &cur_img_prof,
                             &cur_vid_prof,
                             vram_detected,
                             &paths.models,
                         );
-                        match picker_action {
-                            crate::model_picker::PickerAction::SwitchImage(p) => {
-                                self.apply_image_profile(&p, ctx);
-                            }
-                            crate::model_picker::PickerAction::SwitchVideo(vp) => {
-                                self.apply_video_profile(&vp, ctx);
-                            }
-                            crate::model_picker::PickerAction::ModelsDeleted
-                            | crate::model_picker::PickerAction::None => {}
-                        }
+                        self.handle_picker_action(picker_action, ctx);
 
                         let active_vid_after = self.sh.active_video_profile.lock().unwrap().clone();
                         if let Some(gpu_vram) = vram_detected {
@@ -5835,6 +7362,79 @@ fn is_win_ctrl_v() -> bool {
                         ui.separator();
                         heading(ui, "MODEL DOWNLOAD SELECTION");
                         self.render_model_checkboxes(ui);
+                        ui.add_space(4.0);
+
+                        ui.separator();
+                        heading(ui, "WORKSPACE & BEHAVIOR");
+                        {
+                            let mut auto_switch = self.sh.cfg.lock().unwrap().auto_switch_mode_on_input;
+                            if ui
+                                .checkbox(&mut auto_switch, "Auto-switch to Image or Video mode depending on input")
+                                .on_hover_text("When disabled, loading a video in Image mode keeps you in Image mode to edit frames, and loading an image in Video mode keeps you in Video mode for I2V.")
+                                .changed()
+                            {
+                                let mut c = self.sh.cfg.lock().unwrap();
+                                c.auto_switch_mode_on_input = auto_switch;
+                                c.save();
+                            }
+
+                            let mut remember_mode = self.sh.cfg.lock().unwrap().remember_last_mode;
+                            if ui
+                                .checkbox(&mut remember_mode, "Remember last Image/Video mode on startup")
+                                .on_hover_text("Re-open the app in whichever mode (Image or Video) it was closed in.")
+                                .changed()
+                            {
+                                let mut c = self.sh.cfg.lock().unwrap();
+                                c.remember_last_mode = remember_mode;
+                                if remember_mode {
+                                    c.last_studio_mode = Some(
+                                        if self.mode == StudioMode::Video { "video" } else { "image" }.to_string(),
+                                    );
+                                } else {
+                                    c.last_studio_mode = None;
+                                }
+                                c.save();
+                            }
+
+                            let mut keep_project = self.sh.cfg.lock().unwrap().keep_last_project_loaded;
+                            if ui
+                                .checkbox(&mut keep_project, "Keep last project loaded")
+                                .on_hover_text("Automatically save and restore your loaded inputs, history, references, and scrubbed video state when closing and reopening the app.")
+                                .changed()
+                            {
+                                let mut c = self.sh.cfg.lock().unwrap();
+                                c.keep_last_project_loaded = keep_project;
+                                c.save();
+                                if !keep_project {
+                                    Self::clear_last_project();
+                                }
+                            }
+                        }
+                        ui.add_space(4.0);
+
+                        ui.separator();
+                        heading(ui, "VIDEO LORA SETTINGS");
+                        let mut allow_multi_vid = self.sh.cfg.lock().unwrap().allow_multi_video_loras;
+                        if ui
+                            .checkbox(&mut allow_multi_vid, "Allow multiple video LoRAs simultaneously")
+                            .changed()
+                        {
+                            let mut c = self.sh.cfg.lock().unwrap();
+                            c.allow_multi_video_loras = allow_multi_vid;
+                            c.save();
+                            if !allow_multi_vid && self.video_loras.len() > 1 {
+                                self.video_loras.truncate(1);
+                                let keep = self.video_loras[0].filename.clone();
+                                self.video_prompt_tags.retain(|t| t.lora_filename == keep);
+                            }
+                        }
+                        if allow_multi_vid {
+                            ui.label(
+                                RichText::new("[!] Warning: Stacking multiple video LoRAs increases VRAM usage, slows generation, and may degrade quality or cause OOM. Stacking is still blocked if estimated VRAM would approach your GPU limit.")
+                                    .size(11.0)
+                                    .color(AMBER),
+                            );
+                        }
                         ui.add_space(4.0);
 
                         ui.separator();
@@ -5933,16 +7533,8 @@ fn is_win_ctrl_v() -> bool {
             self.model_picker.pending_warning = None;
             self.model_picker.pending_delete = None;
         } else {
-            match crate::model_picker::render_warning_modal(ctx, &mut self.model_picker) {
-                crate::model_picker::PickerAction::SwitchImage(p) => {
-                    self.apply_image_profile(&p, ctx);
-                }
-                crate::model_picker::PickerAction::SwitchVideo(vp) => {
-                    self.apply_video_profile(&vp, ctx);
-                }
-                crate::model_picker::PickerAction::ModelsDeleted
-                | crate::model_picker::PickerAction::None => {}
-            }
+            let modal_action = crate::model_picker::render_warning_modal(ctx, &mut self.model_picker, &self.sh);
+            self.handle_picker_action(modal_action, ctx);
         }
     }
 
@@ -6050,6 +7642,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
+        self.sync_effective_video_profile();
         self.update_taskbar_progress();
         self.handle_input(&ctx);
 
@@ -6082,10 +7675,12 @@ impl eframe::App for App {
         egui::Panel::top("header").frame(egui::Frame::new()).show(ui, |ui| self.header(ui));
 
         // Left Panel: Compact References Strip (+ Docked History if Left)
+        // Minimum width ensures 2 LoRA tiles per row inside the panel (10px panel margin + 10px card margin per side + 4px stroke/rounding buffer).
+        const LEFT_PANEL_MIN_W: f32 = crate::lora::LORA_TWO_COL_MIN_INNER_W + 44.0;
         egui::Panel::left("refs_panel")
-            .default_size(230.0)
-            .min_size(170.0)
-            .max_size(360.0)
+            .default_size(LEFT_PANEL_MIN_W)
+            .min_size(LEFT_PANEL_MIN_W)
+            .max_size(400.0)
             .resizable(true)
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(10)))
             .show(ui, |ui| {
@@ -6111,11 +7706,12 @@ impl eframe::App for App {
             });
 
         // Center Hero Canvas: centered, zoomable, pannable
-        egui::CentralPanel::default()
+        let central_resp = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
                 self.center_canvas(ui, &ctx);
             });
+        self.canvas_drop_rect = Some(central_resp.response.rect);
 
         // Floating Windows: Setup and Floating History (if undocked)
         self.setup_window(&ctx);
@@ -6124,20 +7720,417 @@ impl eframe::App for App {
             self.video_dl_window(&ctx);
         }
         self.new_video_preset_modal(&ctx);
+        self.history_delete_confirm_modal(&ctx);
         self.download_pane.show_combined(&ctx, &self.sh, &self.updater);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
-            let r = ctx.content_rect();
-            painter.rect_filled(r, 0, Color32::from_rgba_unmultiplied(12, 14, 19, 215));
-            painter.rect_stroke(r.shrink(18.0), 16, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
-            let msg = if self.active_node().is_none() || self.mode == StudioMode::Video {
-                "Drop image or video here to load"
+            let full_r = ctx.content_rect();
+            painter.rect_filled(full_r, 0, Color32::from_rgba_unmultiplied(12, 14, 19, 175));
+
+            let hover_pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()));
+            let over_refs = hover_pos.is_some_and(|pos| {
+                self.refs_drop_rect
+                    .is_some_and(|r| r.expand(6.0).contains(pos))
+            });
+            let over_canvas = !over_refs;
+
+            if let Some(refs_r) = self.refs_drop_rect {
+                let target_r = refs_r.expand(4.0);
+                let fill = if over_refs {
+                    ACCENT.linear_multiply(0.22)
+                } else {
+                    Color32::from_rgba_unmultiplied(20, 24, 36, 210)
+                };
+                let stroke = Stroke::new(
+                    if over_refs { 3.0 } else { 1.5 },
+                    if over_refs { ACCENT_GLOW } else { ACCENT.linear_multiply(0.6) },
+                );
+                painter.rect_filled(target_r, 10, fill);
+                painter.rect_stroke(target_r, 10, stroke, StrokeKind::Inside);
+                let refs_msg = if self.refs.len() >= MAX_REFS {
+                    "References Full"
+                } else {
+                    "Drop here\nAdd Reference(s)"
+                };
+                painter.text(
+                    target_r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    refs_msg,
+                    egui::FontId::proportional(14.5),
+                    if over_refs { Color32::WHITE } else { TEXT },
+                );
+            }
+
+            let canvas_r = self
+                .canvas_drop_rect
+                .map(|r| r.shrink(10.0))
+                .unwrap_or_else(|| full_r.shrink(18.0));
+            let c_fill = if over_canvas {
+                ACCENT.linear_multiply(0.16)
             } else {
-                "Drop images to add as references (or drop a video to play)"
+                Color32::from_rgba_unmultiplied(16, 19, 28, 190)
             };
-            painter.text(r.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(22.0), TEXT);
+            let c_stroke = Stroke::new(
+                if over_canvas { 3.0 } else { 1.5 },
+                if over_canvas { ACCENT_GLOW } else { LINE },
+            );
+            painter.rect_filled(canvas_r, 14, c_fill);
+            painter.rect_stroke(canvas_r, 14, c_stroke, StrokeKind::Inside);
+            let canvas_msg = if self.mode == StudioMode::Video {
+                "Drop image or video here\nLoad into Video Canvas"
+            } else {
+                "Drop image or video here\nLoad as Base Input"
+            };
+            painter.text(
+                canvas_r.center(),
+                egui::Align2::CENTER_CENTER,
+                canvas_msg,
+                egui::FontId::proportional(20.0),
+                if over_canvas { Color32::WHITE } else { DIM },
+            );
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let (remember_mode, keep_project) = {
+            let c = self.sh.cfg.lock().unwrap();
+            (c.remember_last_mode, c.keep_last_project_loaded)
+        };
+        if remember_mode {
+            let mut c = self.sh.cfg.lock().unwrap();
+            c.last_studio_mode = Some(if self.mode == StudioMode::Video { "video" } else { "image" }.to_string());
+            c.save();
+        }
+        if keep_project {
+            self.save_last_project();
+        } else {
+            Self::clear_last_project();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedHistoryNode {
+    id: usize,
+    parent_id: Option<usize>,
+    label: String,
+    prompt: String,
+    width: u32,
+    height: u32,
+    step_num: usize,
+    output_filename: String,
+    output_subfolder: String,
+    temp_files: Vec<String>,
+    png_file: Option<String>,
+    mp4_file: Option<String>,
+    source_video_path: Option<PathBuf>,
+    video_last_sec: Option<f64>,
+    video_trim_start: Option<f64>,
+    video_trim_end: Option<f64>,
+    video_work_mode: Option<VideoWorkMode>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRefItem {
+    name: String,
+    width: u32,
+    height: u32,
+    png_file: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedProjectState {
+    #[serde(default)]
+    studio_mode: Option<String>,
+    video_work_mode: VideoWorkMode,
+    prompt: String,
+    negative: String,
+    video_negative: String,
+    active_node_id: Option<usize>,
+    next_node_id: usize,
+    nodes: Vec<PersistedHistoryNode>,
+    refs: Vec<PersistedRefItem>,
+    video_player_active: bool,
+    video_player_sec: Option<f64>,
+    video_player_trim_start: Option<f64>,
+    video_player_trim_end: Option<f64>,
+    video_duration: u32,
+    video_fps: u32,
+    video_width: u32,
+    video_height: u32,
+    video_scale: f32,
+    video_orientation: VideoOrientation,
+    custom_w: u32,
+    custom_h: u32,
+    ref_w: u32,
+    ref_h: u32,
+    scale: f32,
+    steps: u32,
+    cfg: f32,
+    video_steps: u32,
+    video_prompt_enhance: bool,
+    image_loras: Vec<crate::lora::ActiveLora>,
+    image_prompt_tags: Vec<crate::lora::PromptTag>,
+    video_loras: Vec<crate::lora::ActiveLora>,
+    video_prompt_tags: Vec<crate::lora::PromptTag>,
+}
+
+impl App {
+    fn last_project_json_path() -> PathBuf {
+        engine::data_dir().join("last_project.json")
+    }
+
+    fn last_project_assets_dir() -> PathBuf {
+        engine::data_dir().join("last_project_assets")
+    }
+
+    fn clear_last_project() {
+        let _ = std::fs::remove_file(Self::last_project_json_path());
+        let _ = std::fs::remove_dir_all(Self::last_project_assets_dir());
+    }
+
+    fn save_last_project(&self) {
+        let assets_dir = Self::last_project_assets_dir();
+        let _ = std::fs::remove_dir_all(&assets_dir);
+        if std::fs::create_dir_all(&assets_dir).is_err() {
+            return;
+        }
+
+        let cur_player_sec = self.video_player.as_ref().map(|p| p.current_sec);
+        let cur_player_trim_s = self.video_player.as_ref().and_then(|p| p.trim_start_sec);
+        let cur_player_trim_e = self.video_player.as_ref().and_then(|p| p.trim_end_sec);
+
+        let mut persisted_nodes = Vec::with_capacity(self.nodes.len());
+        for n in &self.nodes {
+            let png_file = if !n.png.is_empty() {
+                let fname = format!("node_{}.png", n.id);
+                if std::fs::write(assets_dir.join(&fname), &n.png).is_ok() {
+                    Some(fname)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mp4_file = if let Some(ref mp4) = n.mp4_bytes {
+                // If source_video_path exists on disk, no need to duplicate huge bytes unless missing
+                if n.source_video_path.as_ref().is_some_and(|p| p.is_file()) {
+                    None
+                } else {
+                    let fname = format!("node_{}.mp4", n.id);
+                    if std::fs::write(assets_dir.join(&fname), mp4).is_ok() {
+                        Some(fname)
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let is_active = self.active_node_id == Some(n.id);
+            persisted_nodes.push(PersistedHistoryNode {
+                id: n.id,
+                parent_id: n.parent_id,
+                label: n.label.clone(),
+                prompt: n.prompt.clone(),
+                width: n.width,
+                height: n.height,
+                step_num: n.step_num,
+                output_filename: n.output_filename.clone(),
+                output_subfolder: n.output_subfolder.clone(),
+                temp_files: n.temp_files.clone(),
+                png_file,
+                mp4_file,
+                source_video_path: n.source_video_path.clone(),
+                video_last_sec: if is_active { cur_player_sec.or(n.video_last_sec) } else { n.video_last_sec },
+                video_trim_start: if is_active && self.video_player.is_some() { cur_player_trim_s } else { n.video_trim_start },
+                video_trim_end: if is_active && self.video_player.is_some() { cur_player_trim_e } else { n.video_trim_end },
+                video_work_mode: if is_active { Some(self.video_work_mode) } else { n.video_work_mode },
+            });
+        }
+
+        let mut persisted_refs = Vec::with_capacity(self.refs.len());
+        for (idx, r) in self.refs.iter().enumerate() {
+            let fname = format!("ref_{idx}.png");
+            if std::fs::write(assets_dir.join(&fname), &r.png).is_ok() {
+                persisted_refs.push(PersistedRefItem {
+                    name: r.name.clone(),
+                    width: r.width,
+                    height: r.height,
+                    png_file: fname,
+                });
+            }
+        }
+
+        let state = PersistedProjectState {
+            studio_mode: Some(if self.mode == StudioMode::Video { "video" } else { "image" }.to_string()),
+            video_work_mode: self.video_work_mode,
+            prompt: self.prompt.clone(),
+            negative: self.negative.clone(),
+            video_negative: self.video_negative.clone(),
+            active_node_id: self.active_node_id,
+            next_node_id: self.next_node_id,
+            nodes: persisted_nodes,
+            refs: persisted_refs,
+            video_player_active: self.video_player.is_some(),
+            video_player_sec: cur_player_sec,
+            video_player_trim_start: cur_player_trim_s,
+            video_player_trim_end: cur_player_trim_e,
+            video_duration: self.video_duration,
+            video_fps: self.video_fps,
+            video_width: self.video_width,
+            video_height: self.video_height,
+            video_scale: self.video_scale,
+            video_orientation: self.video_orientation,
+            custom_w: self.custom_w,
+            custom_h: self.custom_h,
+            ref_w: self.ref_w,
+            ref_h: self.ref_h,
+            scale: self.scale,
+            steps: self.steps,
+            cfg: self.cfg,
+            video_steps: self.video_steps,
+            video_prompt_enhance: self.video_prompt_enhance,
+            image_loras: self.image_loras.clone(),
+            image_prompt_tags: self.image_prompt_tags.clone(),
+            video_loras: self.video_loras.clone(),
+            video_prompt_tags: self.video_prompt_tags.clone(),
+        };
+
+        if let Ok(json) = serde_json::to_string(&state) {
+            let _ = std::fs::write(Self::last_project_json_path(), json);
+        }
+    }
+
+    fn restore_last_project(&mut self, ctx: &egui::Context) {
+        let Ok(json) = std::fs::read_to_string(Self::last_project_json_path()) else {
+            return;
+        };
+        let Ok(state) = serde_json::from_str::<PersistedProjectState>(&json) else {
+            return;
+        };
+        let assets_dir = Self::last_project_assets_dir();
+
+        let load_png_tex = |fname: &str, tex_id: &str| -> Option<(Vec<u8>, TextureHandle)> {
+            let png = std::fs::read(assets_dir.join(fname)).ok()?;
+            let img = image::load_from_memory(&png).ok()?;
+            let rgba = img.to_rgba8();
+            let ci = ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
+            let tex = ctx.load_texture(tex_id, ci, egui::TextureOptions::LINEAR);
+            Some((png, tex))
+        };
+
+        let mut restored_nodes = Vec::new();
+        for pn in state.nodes {
+            let Some(ref png_file) = pn.png_file else {
+                continue;
+            };
+            let Some((png, tex)) = load_png_tex(png_file, &format!("restored_node_{}", pn.id)) else {
+                continue;
+            };
+            let mp4_bytes = pn
+                .mp4_file
+                .as_ref()
+                .and_then(|f| std::fs::read(assets_dir.join(f)).ok());
+            restored_nodes.push(HistoryNode {
+                id: pn.id,
+                parent_id: pn.parent_id,
+                label: pn.label,
+                prompt: pn.prompt,
+                png,
+                tex,
+                width: pn.width,
+                height: pn.height,
+                step_num: pn.step_num,
+                output_filename: pn.output_filename,
+                output_subfolder: pn.output_subfolder,
+                temp_files: pn.temp_files,
+                mp4_bytes,
+                source_video_path: pn.source_video_path,
+                video_last_sec: pn.video_last_sec,
+                video_trim_start: pn.video_trim_start,
+                video_trim_end: pn.video_trim_end,
+                video_work_mode: pn.video_work_mode,
+            });
+        }
+
+        let mut restored_refs = Vec::new();
+        for (idx, pr) in state.refs.into_iter().enumerate() {
+            if let Some((png, tex)) = load_png_tex(&pr.png_file, &format!("restored_ref_{idx}")) {
+                restored_refs.push(Item {
+                    name: pr.name,
+                    png,
+                    tex,
+                    width: pr.width,
+                    height: pr.height,
+                });
+            }
+        }
+
+        self.nodes = restored_nodes;
+        self.refs = restored_refs;
+        self.next_node_id = state.next_node_id.max(self.nodes.iter().map(|n| n.id + 1).max().unwrap_or(1));
+        self.prompt = state.prompt;
+        self.negative = state.negative;
+        self.video_negative = state.video_negative;
+        self.video_duration = state.video_duration;
+        self.video_fps = state.video_fps;
+        self.video_width = state.video_width;
+        self.video_height = state.video_height;
+        self.video_scale = state.video_scale;
+        self.video_orientation = state.video_orientation;
+        self.custom_w = state.custom_w;
+        self.custom_h = state.custom_h;
+        self.ref_w = state.ref_w;
+        self.ref_h = state.ref_h;
+        self.scale = state.scale;
+        self.steps = state.steps;
+        self.cfg = state.cfg;
+        self.video_steps = state.video_steps;
+        self.video_prompt_enhance = state.video_prompt_enhance;
+        self.image_loras = state.image_loras;
+        self.image_prompt_tags = state.image_prompt_tags;
+        self.video_loras = state.video_loras;
+        self.video_prompt_tags = state.video_prompt_tags;
+        self.video_work_mode = state.video_work_mode;
+
+        if let Some(aid) = state.active_node_id {
+            if self.nodes.iter().any(|n| n.id == aid) {
+                let allow_video_player = self.mode == StudioMode::Video
+                    || state.studio_mode.as_deref() == Some("image");
+                let saved_vw = self.video_width;
+                let saved_vh = self.video_height;
+                let saved_vbw = self.video_base_w;
+                let saved_vbh = self.video_base_h;
+                let saved_vscale = self.video_scale;
+                let saved_vorient = self.video_orientation;
+                if state.video_player_active && allow_video_player {
+                    let saved_prompt = self.prompt.clone();
+                    self.select_node(aid);
+                    self.prompt = saved_prompt;
+                    if let Some(ref mut player) = self.video_player {
+                        player.trim_start_sec = state.video_player_trim_start;
+                        player.trim_end_sec = state.video_player_trim_end;
+                        if let Some(sec) = state.video_player_sec {
+                            if sec > 0.001 {
+                                player.seek_to_time(sec);
+                            }
+                        }
+                    }
+                } else {
+                    self.active_node_id = Some(aid);
+                    self.update_dimensions_from_active_node();
+                }
+                self.video_width = saved_vw;
+                self.video_height = saved_vh;
+                self.video_base_w = saved_vbw;
+                self.video_base_h = saved_vbh;
+                self.video_scale = saved_vscale;
+                self.video_orientation = saved_vorient;
+            }
+        }
+        self.sync_effective_video_profile();
     }
 }
 
@@ -6161,7 +8154,7 @@ mod tests {
 
     #[test]
     fn test_estimate_video_vram_gb() {
-        use super::estimate_video_vram_gb;
+        let estimate_video_vram_gb = |w, h, d, f| super::estimate_video_vram_gb_with_lora(w, h, d, f, 0.0);
         let vram_720p_5s = estimate_video_vram_gb(1280, 720, 5, 24);
         assert!(vram_720p_5s <= 12.5, "720p 5s should fit within ~12GB VRAM");
 
@@ -6173,5 +8166,36 @@ mod tests {
 
         let vram_4k_5s = estimate_video_vram_gb(3840, 2160, 5, 24);
         assert!(vram_4k_5s > 30.0, "4K 5s should require >30GB VRAM");
+
+        let vram_with_lora = super::estimate_video_vram_gb_with_lora(1280, 720, 5, 24, 0.8);
+        assert!((vram_with_lora - (vram_720p_5s + 0.8)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_absolute_resolution_scale_range() {
+        use super::{absolute_scale_range, scale_dimensions_stepped, ABS_MAX_RES, ABS_MIN_RES};
+
+        // 1440p landscape video: 2560x1440 -> min height 256 (448x256), max width 4096 (4096x2304)
+        let (k_min, k_max) = absolute_scale_range(2560, 1440, ABS_MIN_RES, ABS_MAX_RES);
+        assert!(k_min < 1.0 && 1.0 < k_max);
+        assert_eq!(scale_dimensions_stepped(2560, 1440, k_min, 32, ABS_MIN_RES, ABS_MAX_RES), (448, 256));
+        assert_eq!(scale_dimensions_stepped(2560, 1440, k_max, 32, ABS_MIN_RES, ABS_MAX_RES), (4096, 2304));
+
+        // Small square image: 512x512 -> min 256x256, max 4096x4096
+        let (k_min, k_max) = absolute_scale_range(512, 512, ABS_MIN_RES, ABS_MAX_RES);
+        assert_eq!(scale_dimensions_stepped(512, 512, k_min, 16, ABS_MIN_RES, ABS_MAX_RES), (256, 256));
+        assert_eq!(scale_dimensions_stepped(512, 512, k_max, 16, ABS_MIN_RES, ABS_MAX_RES), (4096, 4096));
+
+        // Portrait 9:16 video: 1440x2560 -> min width 256 (256x448), max height 4096 (2304x4096)
+        let (k_min, k_max) = absolute_scale_range(1440, 2560, ABS_MIN_RES, ABS_MAX_RES);
+        assert_eq!(scale_dimensions_stepped(1440, 2560, k_min, 32, ABS_MIN_RES, ABS_MAX_RES), (256, 448));
+        assert_eq!(scale_dimensions_stepped(1440, 2560, k_max, 32, ABS_MIN_RES, ABS_MAX_RES), (2304, 4096));
+
+        // Extreme aspect ratio (>16:1): k_min <= k_max and dimensions stay within bounds
+        let (k_min, k_max) = absolute_scale_range(4096, 128, ABS_MIN_RES, ABS_MAX_RES);
+        assert!(k_min <= k_max);
+        let (w, h) = scale_dimensions_stepped(4096, 128, k_min, 16, ABS_MIN_RES, ABS_MAX_RES);
+        assert!((ABS_MIN_RES..=ABS_MAX_RES).contains(&w));
+        assert!((ABS_MIN_RES..=ABS_MAX_RES).contains(&h));
     }
 }
