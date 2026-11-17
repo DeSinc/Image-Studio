@@ -6504,11 +6504,10 @@ fn is_win_ctrl_v() -> bool {
             }
 
         } else {
-            let (rect, resp) = ui.allocate_exact_size(max_size, Sense::click());
-            let hover = resp.hovered();
+            let (rect, _resp) = ui.allocate_exact_size(max_size, Sense::hover());
             let p = ui.painter_at(rect);
             p.rect_filled(rect, 10, Color32::from_rgb(15, 17, 24));
-            p.rect_stroke(rect, 10, Stroke::new(1.5, if hover { ACCENT } else { LINE }), StrokeKind::Inside);
+            p.rect_stroke(rect, 10, Stroke::new(1.5, LINE), StrokeKind::Inside);
 
             let c = rect.center();
             if self.mode == StudioMode::Video {
@@ -6521,51 +6520,87 @@ fn is_win_ctrl_v() -> bool {
                     "Video Generation Mode (LTX-Video 2.3)"
                 };
                 p.text(
-                    c - vec2(0.0, 36.0),
+                    c - vec2(0.0, 46.0),
                     egui::Align2::CENTER_CENTER,
                     vid_title,
                     egui::FontId::proportional(19.0),
                     TEXT,
                 );
                 p.text(
-                    c - vec2(0.0, 10.0),
+                    c - vec2(0.0, 20.0),
                     egui::Align2::CENTER_CENTER,
-                    "Enter a prompt below for Text-to-Video, or paste an image for Image-to-Video.",
+                    "Enter a prompt below for Text-to-Video, or load an image/video to edit.",
                     egui::FontId::proportional(13.0),
                     ACCENT_GLOW,
                 );
             } else {
                 p.text(
-                    c - vec2(0.0, 36.0),
+                    c - vec2(0.0, 46.0),
                     egui::Align2::CENTER_CENTER,
-                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image" },
+                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image or Video" },
                     egui::FontId::proportional(19.0),
                     TEXT,
                 );
                 p.text(
-                    c - vec2(0.0, 10.0),
+                    c - vec2(0.0, 20.0),
                     egui::Align2::CENTER_CENTER,
-                    "Or enter a prompt below to generate an image from scratch.",
+                    "Or enter a prompt below to generate from scratch.",
                     egui::FontId::proportional(13.0),
                     ACCENT_GLOW,
                 );
             }
 
-            let btn_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0));
-            let paste_hover = btn_rect.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or_default()));
-            p.rect_filled(btn_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
-            p.rect_stroke(btn_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
+            let browse_rect = Rect::from_center_size(c + vec2(0.0, 18.0), vec2(260.0, 34.0));
+            let browse_resp = ui.allocate_rect(browse_rect, Sense::click());
+            let browse_hover = browse_resp.hovered();
+            p.rect_filled(browse_rect, 6, if browse_hover { ACCENT } else { CARD_HI });
+            p.rect_stroke(browse_rect, 6, Stroke::new(1.0, if browse_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
+            p.text(
+                browse_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Browse Image or Video...",
+                egui::FontId::proportional(12.5),
+                Color32::WHITE,
+            );
+
+            let paste_rect = Rect::from_center_size(
+                c + vec2(0.0, 60.0),
+                vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0),
+            );
+            let paste_resp = ui.allocate_rect(paste_rect, Sense::click());
+            let paste_hover = paste_resp.hovered();
+            p.rect_filled(paste_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
+            p.rect_stroke(paste_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
             let btn_label = if self.mode == StudioMode::Video {
                 "Paste Image for Image-to-Video (Ctrl+V)"
             } else {
                 "Paste Image from Clipboard (Ctrl+V)"
             };
-            p.text(btn_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
+            p.text(paste_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
 
-            if paste_hover && ui.ctx().input(|i| i.pointer.any_pressed()) {
+            if browse_hover || paste_hover {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            if paste_resp.clicked() {
                 let _ = self.paste_from_clipboard(ctx);
-            } else if resp.clicked() {
-                self.pick_images(ctx, Target::Base, false);
+            } else if browse_resp.clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images & Videos", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "mp4", "mov", "mkv", "webm", "avi"])
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
+                    .add_filter("Videos", &["mp4", "mov", "mkv", "webm", "avi"])
+                    .pick_file()
+                {
+                    let is_vid = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi"));
+                    if is_vid {
+                        self.load_video_file(ctx, path);
+                    } else {
+                        self.load(ctx, Target::Base, Src::Path(path));
+                    }
+                }
             }
         }
 
