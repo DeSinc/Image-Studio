@@ -6520,29 +6520,29 @@ fn is_win_ctrl_v() -> bool {
                     "Video Generation Mode (LTX-Video 2.3)"
                 };
                 p.text(
-                    c - vec2(0.0, 46.0),
+                    c - vec2(0.0, 36.0),
                     egui::Align2::CENTER_CENTER,
                     vid_title,
                     egui::FontId::proportional(19.0),
                     TEXT,
                 );
                 p.text(
-                    c - vec2(0.0, 20.0),
+                    c - vec2(0.0, 10.0),
                     egui::Align2::CENTER_CENTER,
-                    "Enter a prompt below for Text-to-Video, or load an image/video to edit.",
+                    "Enter a prompt below for Text-to-Video, or paste (Ctrl+V) / drop an image or video.",
                     egui::FontId::proportional(13.0),
                     ACCENT_GLOW,
                 );
             } else {
                 p.text(
-                    c - vec2(0.0, 46.0),
+                    c - vec2(0.0, 36.0),
                     egui::Align2::CENTER_CENTER,
-                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting or Dropping an Image or Video" },
+                    if self.loading > 0 { "Loading image..." } else { "Start by Pasting (Ctrl+V) or Dropping an Image or Video" },
                     egui::FontId::proportional(19.0),
                     TEXT,
                 );
                 p.text(
-                    c - vec2(0.0, 20.0),
+                    c - vec2(0.0, 10.0),
                     egui::Align2::CENTER_CENTER,
                     "Or enter a prompt below to generate from scratch.",
                     egui::FontId::proportional(13.0),
@@ -6550,7 +6550,7 @@ fn is_win_ctrl_v() -> bool {
                 );
             }
 
-            let browse_rect = Rect::from_center_size(c + vec2(0.0, 18.0), vec2(260.0, 34.0));
+            let browse_rect = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(260.0, 34.0));
             let browse_resp = ui.allocate_rect(browse_rect, Sense::click());
             let browse_hover = browse_resp.hovered();
             p.rect_filled(browse_rect, 6, if browse_hover { ACCENT } else { CARD_HI });
@@ -6563,28 +6563,11 @@ fn is_win_ctrl_v() -> bool {
                 Color32::WHITE,
             );
 
-            let paste_rect = Rect::from_center_size(
-                c + vec2(0.0, 60.0),
-                vec2(if self.mode == StudioMode::Video { 340.0 } else { 270.0 }, 34.0),
-            );
-            let paste_resp = ui.allocate_rect(paste_rect, Sense::click());
-            let paste_hover = paste_resp.hovered();
-            p.rect_filled(paste_rect, 6, if paste_hover { ACCENT } else { CARD_HI });
-            p.rect_stroke(paste_rect, 6, Stroke::new(1.0, if paste_hover { ACCENT_GLOW } else { LINE }), StrokeKind::Inside);
-            let btn_label = if self.mode == StudioMode::Video {
-                "Paste Image for Image-to-Video (Ctrl+V)"
-            } else {
-                "Paste Image from Clipboard (Ctrl+V)"
-            };
-            p.text(paste_rect.center(), egui::Align2::CENTER_CENTER, btn_label, egui::FontId::proportional(12.5), Color32::WHITE);
-
-            if browse_hover || paste_hover {
+            if browse_hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
-            if paste_resp.clicked() {
-                let _ = self.paste_from_clipboard(ctx);
-            } else if browse_resp.clicked() {
+            if browse_resp.clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Images & Videos", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "mp4", "mov", "mkv", "webm", "avi"])
                     .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
